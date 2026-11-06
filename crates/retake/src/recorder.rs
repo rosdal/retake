@@ -19,7 +19,7 @@ use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tr
 
 use crate::background::SharedGate;
 use crate::child::ChildJob;
-use crate::clock::wall_ms;
+use crate::clock::now_ms;
 use crate::drive::warn_if_low_space;
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
 use crate::procs::processes;
@@ -159,7 +159,7 @@ impl Loop {
                             .quiet
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .on_game(running, wall_ms());
+                            .on_game(running, now_ms());
                         match changed {
                             Some(true) => tracing::info!("quiet mode on: game running"),
                             Some(false) => {
@@ -227,6 +227,16 @@ impl Loop {
                         f.stop(GRACE);
                     }
                     self.speed.reset();
+                    // The segments stay saveable, but nothing is written any more.
+                    if let Some(s) = self
+                        .s
+                        .session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        s.live = false;
+                    }
                     (self.s.on_session_end)();
                 }
                 Command::GiveUp => tracing::error!(
@@ -332,7 +342,7 @@ impl Loop {
         let args = capture_args(&setup);
         tracing::info!(args = %args.join(" "), "ffmpeg command");
         self.current = Some(setup);
-        let start = wall_ms();
+        let start = now_ms();
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), "ffmpeg recording");
@@ -341,6 +351,7 @@ impl Loop {
                     start,
                     buffer_dir: self.s.capture.buffer_dir.clone(),
                     wrap: segment_count(self.s.capture.buffer_secs),
+                    live: true,
                 });
                 self.ffmpeg = Some(f);
                 None

@@ -1,16 +1,23 @@
-//! Wall-clock time for presses and sessions, and the local time a clip is named after.
+//! Time for presses, sessions and quiet mode, and the local time a clip is named after.
+//!
+//! Timing uses a monotonic clock, so an NTP sync or a manual clock change can't move a clip's
+//! window or its post-roll deadline. Local time is only for file names.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use retake_core::Ms;
 use retake_core::clip::Stamp;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
-/// Milliseconds since the Unix epoch.
-pub fn wall_ms() -> Ms {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as Ms)
+/// Where [`now_ms`] starts, so `now_ms() - x` for any interval Retake uses (minutes at most)
+/// can't underflow early in a run.
+pub const BASE: Ms = 24 * 60 * 60 * 1000;
+
+/// Milliseconds on a monotonic clock: [`BASE`] plus the time since first use.
+pub fn now_ms() -> Ms {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    BASE + EPOCH.get_or_init(Instant::now).elapsed().as_millis() as Ms
 }
 
 /// The local date and time now.
@@ -32,8 +39,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wall_clock_is_after_2026() {
-        assert!(wall_ms() > 1_767_225_600_000); // 2026-01-01
+    fn clock_is_monotonic_and_starts_high() {
+        let a = now_ms();
+        assert!(a >= BASE);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = now_ms();
+        assert!((50..1_000).contains(&(b - a)), "{a} -> {b}");
     }
 
     #[test]

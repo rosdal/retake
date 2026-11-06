@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use retake_core::quiet::QuietGate;
 
-use crate::clock::wall_ms;
+use crate::clock::now_ms;
 
 /// The quiet-mode gate, shared by the recorder (which updates it) and the runner.
 pub type SharedGate = Arc<Mutex<QuietGate>>;
@@ -21,7 +21,7 @@ pub type SharedGate = Arc<Mutex<QuietGate>>;
 pub fn gate_open(gate: &SharedGate) -> bool {
     gate.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .may_start(wall_ms())
+        .may_start(now_ms())
 }
 
 type Job = (String, Box<dyn FnOnce() + Send>);
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn jobs_wait_for_the_gate_and_run_in_order() {
         let gate: SharedGate = Arc::default();
-        gate.lock().unwrap().on_game(true, wall_ms());
+        gate.lock().unwrap().on_game(true, now_ms());
         let bg = Background::start(gate.clone()).unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let ran = Arc::new(AtomicU32::new(0));
@@ -155,9 +155,7 @@ mod tests {
             0,
             "ran while the game was running"
         );
-        gate.lock()
-            .unwrap()
-            .on_game(false, wall_ms() - RESUME_AFTER);
+        gate.lock().unwrap().on_game(false, now_ms() - RESUME_AFTER);
         assert!(wait_for(
             || ran.load(Ordering::SeqCst) == 2,
             Duration::from_secs(3)

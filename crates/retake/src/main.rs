@@ -243,15 +243,23 @@ fn main() -> ExitCode {
     let (press_tx, press_rx) = mpsc::channel();
     let cue = config.clips.sound_cue;
     let hotkey_tx = press_tx.clone();
+    let hotkey_session = session.clone();
     let on_hotkey = move |i: usize| {
         let Some(&kind) = kinds.get(i) else { return };
         let p = Press {
-            at: clock::wall_ms(),
+            at: clock::now_ms(),
             stamp: clock::local_stamp(),
             kind,
         };
+        // Still sent when not recording: a press just after the game closed can save its end.
         if hotkey_tx.send(SaverMsg::Press(p)).is_err() {
             tracing::warn!("saver is not running; press ignored");
+            return;
+        }
+        // The cue promises a clip, so it only plays while something is being recorded.
+        let live = saver::current(&hotkey_session).is_some_and(|s| s.live);
+        if !live {
+            tracing::info!("clip hotkey while not recording");
         } else if cue {
             sound::play_press();
         }

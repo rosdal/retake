@@ -7,7 +7,7 @@ use crate::Ms;
 /// How long after Siege closes background work waits before starting.
 pub const RESUME_AFTER: Ms = 30_000;
 
-/// Whether background work may start. Times are wall-clock ms.
+/// Whether background work may start. Times are monotonic clock ms.
 #[derive(Debug, Default, Clone)]
 pub struct QuietGate {
     running: bool,

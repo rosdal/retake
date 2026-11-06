@@ -19,18 +19,21 @@ use retake_core::ffmpeg_args::INDEX_FILE;
 use retake_core::segments::{SEGMENT_MS, Segment, parse_index, select, still_intact, writing_file};
 
 use crate::child::ChildJob;
-use crate::clock::wall_ms;
+use crate::clock::now_ms;
 
 /// The ffmpeg run whose segments are in the buffer now.
 #[derive(Debug, Clone)]
 pub struct Session {
     /// The recorder's run counter; changes whenever ffmpeg is restarted and the buffer emptied.
     pub run: u64,
-    /// Wall-clock ms when this ffmpeg run was spawned: `index.csv` time 0.
+    /// Clock ms (`clock::now_ms`) when this ffmpeg run was spawned: `index.csv` time 0.
     pub start: Ms,
     pub buffer_dir: PathBuf,
     /// Number of ring slots.
     pub wrap: u32,
+    /// ffmpeg is still writing this run. False once the game closed: no more segments come,
+    /// and no slot is being overwritten.
+    pub live: bool,
 }
 
 /// Written by the recorder, read by the saver. `None` while no run's segments are usable.
@@ -136,16 +139,22 @@ impl Drop for WorkDir {
 }
 
 /// Writes `job` as an `.mkv` in `dirs.raw` and returns its path. `concat(list, out)` joins the
-/// listed files into `out` (ffmpeg in the app, a stand-in in tests).
+/// listed files into `out` (ffmpeg in the app, a stand-in in tests). `cancelled` is checked
+/// between steps so quitting doesn't wait for a long copy.
 pub fn save(
     job: &ClipJob,
     slot: &SessionSlot,
     dirs: &ClipDirs,
     concat: &dyn Fn(&Path, &Path) -> Result<()>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf> {
     let s = current(slot).context("not recording; no clip saved")?;
     let listed = read_index(&s.buffer_dir, s.start);
-    let writing = writing_file(&listed, s.wrap);
+    let writing = if s.live {
+        writing_file(&listed, s.wrap)
+    } else {
+        None
+    };
     let picked = select(&listed, job.press, job.from, job.to, writing.as_deref());
     if picked.is_empty() {
         bail!("no buffered video covers the press");
@@ -155,6 +164,9 @@ pub fn save(
     fs::create_dir_all(&work.0).with_context(|| format!("creating {}", work.0.display()))?;
     let names: Vec<String> = (0..picked.len()).map(|i| format!("{i:03}.ts")).collect();
     for (seg, name) in picked.iter().zip(&names) {
+        if cancelled() {
+            bail!("quitting; clip not saved");
+        }
         copy_shared(&s.buffer_dir.join(&seg.file), &work.0.join(name))
             .with_context(|| format!("copying {}", seg.file))?;
     }
@@ -162,8 +174,12 @@ pub fn save(
     if current(slot).map(|x| x.run) != Some(s.run) {
         bail!("recording restarted during the save");
     }
-    let after = read_index(&s.buffer_dir, s.start);
-    let ok = still_intact(&picked, &after, s.wrap);
+    // A stopped run can't overwrite anything, so only a live one is re-checked.
+    let ok = if s.live {
+        still_intact(&picked, &read_index(&s.buffer_dir, s.start), s.wrap)
+    } else {
+        vec![true; picked.len()]
+    };
     let intact: Vec<Segment> = picked
         .iter()
         .zip(&ok)
@@ -180,16 +196,17 @@ pub fn save(
             "segments overwritten while copying were left out"
         );
     }
+    // Each kept segment came from `picked`; find its copy by position, without panicking.
     let kept_names: Vec<String> = keep
         .iter()
-        .map(|k| {
-            names[picked
-                .iter()
-                .position(|p| p == k)
-                .expect("kept from picked")]
-            .clone()
-        })
+        .filter_map(|k| picked.iter().position(|p| p == k).map(|i| names[i].clone()))
         .collect();
+    if kept_names.len() != keep.len() {
+        bail!("kept segments don't match the copies");
+    }
+    if cancelled() {
+        bail!("quitting; clip not saved");
+    }
     let list = work.0.join("list.txt");
     fs::write(&list, concat_list(&kept_names)).context("writing concat list")?;
 
@@ -317,13 +334,14 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
             let merged = sched.press(p);
             tracing::info!(kind = ?p.kind, merged, "clip hotkey");
         }
-        for job in sched.due(wall_ms()) {
+        for job in sched.due(now_ms()) {
             if stop.load(Ordering::Relaxed) {
                 tracing::info!(id = job.id, "quitting; clip dropped");
                 continue;
             }
             wait_for_segments(&s.session, job.to, stop);
-            match save(&job, &s.session, &s.dirs, &concat) {
+            let cancelled = || stop.load(Ordering::Relaxed);
+            match save(&job, &s.session, &s.dirs, &concat, &cancelled) {
                 Ok(path) => (s.on_saved)(&path),
                 Err(e) => tracing::warn!(id = job.id, "clip not saved: {e:#}"),
             }
@@ -339,11 +357,11 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
 fn wait_for_segments(slot: &SessionSlot, to: Ms, stop: &AtomicBool) {
     let give_up = to + 2 * SEGMENT_MS + 1_000;
     while let Some(s) = current(slot) {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || !s.live {
             return;
         }
         let segs = read_index(&s.buffer_dir, s.start);
-        if segs.last().is_some_and(|x| x.end >= to) || wall_ms() >= give_up {
+        if segs.last().is_some_and(|x| x.end >= to) || now_ms() >= give_up {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -388,6 +406,7 @@ mod tests {
             start: START,
             buffer_dir: buf,
             wrap: 30,
+            live: true,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -418,10 +437,50 @@ mod tests {
         }
     }
 
+    fn never() -> bool {
+        false
+    }
+
+    #[test]
+    fn stopped_run_keeps_its_oldest_segment() {
+        let (_t, slot, dirs) = setup();
+        slot.lock().unwrap().as_mut().unwrap().live = false;
+        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
+        let text = fs::read_to_string(&out).unwrap();
+        assert!(
+            text.starts_with("[0][2]") && text.ends_with("[58]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cancelled_save_stops_and_cleans_up() {
+        let (_t, slot, dirs) = setup();
+        let e = save(
+            &job_at(Kind::Normal, 40, 25, 43),
+            &slot,
+            &dirs,
+            &cat,
+            &|| true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("quitting"), "{e}");
+        assert_eq!(fs::read_dir(&dirs.raw).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&dirs.tmp).unwrap().count(), 0);
+    }
+
     #[test]
     fn saves_the_window_in_order_and_cleans_up() {
         let (_t, slot, dirs) = setup();
-        let out = save(&job_at(Kind::Normal, 40, 25, 43), &slot, &dirs, &cat).unwrap();
+        let out = save(
+            &job_at(Kind::Normal, 40, 25, 43),
+            &slot,
+            &dirs,
+            &cat,
+            &never,
+        )
+        .unwrap();
         assert_eq!(out, dirs.raw.join("2026-11-06_201533.mkv"));
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
@@ -434,7 +493,7 @@ mod tests {
     #[test]
     fn full_save_skips_the_segment_being_written() {
         let (_t, slot, dirs) = setup();
-        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat).unwrap();
+        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
         assert!(out.ends_with("2026-11-06_201533_full.mkv"));
         let text = fs::read_to_string(&out).unwrap();
         assert!(
@@ -447,7 +506,14 @@ mod tests {
     fn taken_name_gets_a_number() {
         let (_t, slot, dirs) = setup();
         fs::write(dirs.raw.join("2026-11-06_201533.mkv"), "older").unwrap();
-        let out = save(&job_at(Kind::Normal, 40, 25, 43), &slot, &dirs, &cat).unwrap();
+        let out = save(
+            &job_at(Kind::Normal, 40, 25, 43),
+            &slot,
+            &dirs,
+            &cat,
+            &never,
+        )
+        .unwrap();
         assert!(out.ends_with("2026-11-06_201533_2.mkv"));
     }
 
@@ -458,7 +524,14 @@ mod tests {
             fs::write(out, "half")?;
             anyhow::bail!("boom")
         };
-        let e = save(&job_at(Kind::Normal, 40, 25, 43), &slot, &dirs, &fail).unwrap_err();
+        let e = save(
+            &job_at(Kind::Normal, 40, 25, 43),
+            &slot,
+            &dirs,
+            &fail,
+            &never,
+        )
+        .unwrap_err();
         assert!(format!("{e:#}").contains("boom"));
         assert_eq!(fs::read_dir(&dirs.raw).unwrap().count(), 0);
         assert_eq!(fs::read_dir(&dirs.tmp).unwrap().count(), 0);
@@ -468,12 +541,20 @@ mod tests {
     fn no_session_or_no_video_is_an_error() {
         let (_t, slot, dirs) = setup();
         let late = job_at(Kind::Normal, 500, 485, 503);
-        let e = save(&late, &slot, &dirs, &cat).unwrap_err().to_string();
-        assert!(e.contains("no buffered video"), "{e}");
-        *slot.lock().unwrap() = None;
-        let e = save(&job_at(Kind::Normal, 40, 25, 43), &slot, &dirs, &cat)
+        let e = save(&late, &slot, &dirs, &cat, &never)
             .unwrap_err()
             .to_string();
+        assert!(e.contains("no buffered video"), "{e}");
+        *slot.lock().unwrap() = None;
+        let e = save(
+            &job_at(Kind::Normal, 40, 25, 43),
+            &slot,
+            &dirs,
+            &cat,
+            &never,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("not recording"), "{e}");
     }
 
@@ -574,6 +655,7 @@ mod tests {
             start: START,
             buffer_dir: buf,
             wrap: 30,
+            live: true,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -599,11 +681,25 @@ mod tests {
                 .unwrap()
         };
 
-        let normal = save(&job_at(Kind::Normal, 50, 35, 53), &slot, &dirs, &concat).unwrap();
+        let normal = save(
+            &job_at(Kind::Normal, 50, 35, 53),
+            &slot,
+            &dirs,
+            &concat,
+            &never,
+        )
+        .unwrap();
         let d = probe(&normal);
         assert!((d - 20.0).abs() < 0.1, "normal clip {d} s");
 
-        let full = save(&job_at(Kind::Full, 69, 9, 72), &slot, &dirs, &concat).unwrap();
+        let full = save(
+            &job_at(Kind::Full, 69, 9, 72),
+            &slot,
+            &dirs,
+            &concat,
+            &never,
+        )
+        .unwrap();
         let d = probe(&full);
         assert!((d - 58.0).abs() < 0.1, "full clip {d} s");
     }

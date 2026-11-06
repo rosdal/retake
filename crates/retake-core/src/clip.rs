@@ -26,13 +26,13 @@ pub struct Stamp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Press {
-    /// Wall-clock ms since the Unix epoch.
+    /// Monotonic ms (the same clock as the session start).
     pub at: Ms,
     pub stamp: Stamp,
     pub kind: Kind,
 }
 
-/// One clip to write: wall-clock window `[from, to]`, named after its first press.
+/// One clip to write: window `[from, to]` in clock ms, named after its first press.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipJob {
     pub id: u64,
