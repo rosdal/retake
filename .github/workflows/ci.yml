@@ -21,6 +21,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      - name: Forbidden APIs (anti-cheat)
+        shell: pwsh
+        run: ./scripts/forbidden-apis.ps1
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

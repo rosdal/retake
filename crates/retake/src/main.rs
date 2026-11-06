@@ -6,6 +6,7 @@ mod drive;
 mod ffmpeg;
 mod instance;
 mod logging;
+mod procs;
 mod sysinfo;
 mod tray;
 
