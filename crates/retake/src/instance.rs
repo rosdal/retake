@@ -104,6 +104,10 @@ mod tests {
     #[test]
     fn save_signal_reaches_the_listener() {
         use std::sync::mpsc;
+        // A running Retake listens on the same auto-reset events and would take the signal.
+        let Some(_only) = SingleInstance::acquire() else {
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
         listen_for_saves(move |i| {

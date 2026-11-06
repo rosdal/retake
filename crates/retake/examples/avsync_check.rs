@@ -76,8 +76,10 @@ fn main() {
         .expect("running ffmpeg for audio");
     let samples: Vec<i16> = a
         .stdout
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
         .collect();
     let mut clicks = Vec::new();
     let mut quiet = 0usize;

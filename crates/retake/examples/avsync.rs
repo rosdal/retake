@@ -2,7 +2,9 @@
 //! Retake with `avsync.exe` in `game.processes`, save a clip, then measure it with
 //! `cargo run --example avsync_check -- <clip.mkv>`.
 //!
-//! `avsync [x y]` puts the 400x400 window at screen position x, y (default 100, 100).
+//! `avsync [x y [quiet_from quiet_secs]]` puts the 400x400 window at screen position x, y
+//! (default 100, 100) and, optionally, stays dark and silent from `quiet_from` seconds after
+//! start for `quiet_secs` seconds.
 //! The click is rendered into the very buffer written when the window is painted white, so the
 //! two leave the program within one 10 ms audio period of each other.
 
@@ -79,7 +81,7 @@ fn repaint() {
     }
 }
 
-fn audio(stop: Arc<AtomicBool>) -> windows::core::Result<()> {
+fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> {
     // SAFETY: COM and WASAPI calls with valid arguments; buffers are released after use.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
@@ -124,6 +126,10 @@ fn audio(stop: Arc<AtomicBool>) -> windows::core::Result<()> {
             }
             if start.elapsed() >= next_flash {
                 next_flash += Duration::from_secs(1);
+                let s = start.elapsed().as_secs();
+                if s >= quiet.0 && s < quiet.0 + quiet.1 {
+                    continue;
+                }
                 click_left = 480; // 10 ms
                 phase = 0.0;
                 WHITE.store(true, Ordering::Relaxed);
@@ -137,7 +143,7 @@ fn audio(stop: Arc<AtomicBool>) -> windows::core::Result<()> {
             }
             let buf = render.GetBuffer(n as u32)?.cast::<i16>();
             let out = std::slice::from_raw_parts_mut(buf, n * 2);
-            for f in out.chunks_exact_mut(2) {
+            for f in out.as_chunks_mut::<2>().0 {
                 let v = if click_left > 0 {
                     click_left -= 1;
                     phase += 2.0 * std::f32::consts::PI * 1_000.0 / 48_000.0;
@@ -163,6 +169,10 @@ fn main() {
     let (x, y) = (
         args.first().copied().unwrap_or(100),
         args.get(1).copied().unwrap_or(100),
+    );
+    let quiet = (
+        args.get(2).copied().unwrap_or(0).max(0) as u64,
+        args.get(3).copied().unwrap_or(0).max(0) as u64,
     );
     // SAFETY: plain window creation and a message loop on this thread.
     unsafe {
@@ -193,7 +203,7 @@ fn main() {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let t = std::thread::spawn(move || {
-            if let Err(e) = audio(s) {
+            if let Err(e) = audio(s, quiet) {
                 eprintln!("audio: {e}");
             }
         });
