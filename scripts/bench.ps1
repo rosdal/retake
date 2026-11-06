@@ -135,6 +135,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Report') {
 }
 
 # ---- Run mode ----
+# `pwsh -File bench.ps1 -Configs a,b` passes "a,b" as one string, so split on commas.
+$Configs = @($Configs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($c in $Configs) {
     if (-not $Overlays.Contains($c)) { throw "unknown config '$c'; known: $($Overlays.Keys -join ', ')" }
 }
