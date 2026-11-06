@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod child;
+mod clock;
 mod display;
 mod drive;
 mod ffmpeg;
@@ -9,6 +10,7 @@ mod instance;
 mod logging;
 mod procs;
 mod recorder;
+mod saver;
 mod sysinfo;
 mod tray;
 

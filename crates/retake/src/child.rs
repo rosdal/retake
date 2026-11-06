@@ -16,7 +16,9 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::System::Threading::{
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, PROCESS_CREATION_FLAGS,
+};
 use windows::core::PCWSTR;
 
 /// Receives a child's output, one line at a time.
@@ -54,7 +56,12 @@ impl ChildJob {
     /// Spawns `exe args…` with no window, assigns it to this job and forwards each line of
     /// its stdout and stderr to `tracing` under the target `ffmpeg`.
     pub fn spawn_logged<S: AsRef<OsStr>>(&self, exe: &Path, args: &[S]) -> Result<Child> {
-        self.spawn_inner(exe, args, Stdio::null(), None)
+        self.spawn_inner(exe, args, Stdio::null(), None, PROCESS_CREATION_FLAGS(0))
+    }
+
+    /// Like [`Self::spawn_logged`], at below-normal priority so it yields to the game.
+    pub fn spawn_logged_low<S: AsRef<OsStr>>(&self, exe: &Path, args: &[S]) -> Result<Child> {
+        self.spawn_inner(exe, args, Stdio::null(), None, BELOW_NORMAL_PRIORITY_CLASS)
     }
 
     /// Like [`Self::spawn_logged`], but stdin is piped (ffmpeg stops on `q`) and every stderr
@@ -65,7 +72,13 @@ impl ChildJob {
         args: &[S],
         on_stderr: impl FnMut(&str) + Send + 'static,
     ) -> Result<Child> {
-        self.spawn_inner(exe, args, Stdio::piped(), Some(Box::new(on_stderr)))
+        self.spawn_inner(
+            exe,
+            args,
+            Stdio::piped(),
+            Some(Box::new(on_stderr)),
+            PROCESS_CREATION_FLAGS(0),
+        )
     }
 
     fn spawn_inner<S: AsRef<OsStr>>(
@@ -74,13 +87,14 @@ impl ChildJob {
         args: &[S],
         stdin: Stdio,
         on_stderr: Option<LineSink>,
+        priority: PROCESS_CREATION_FLAGS,
     ) -> Result<Child> {
         let mut child = Command::new(exe)
             .args(args)
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW.0)
+            .creation_flags((CREATE_NO_WINDOW | priority).0)
             .spawn()
             .with_context(|| format!("spawning {}", exe.display()))?;
 
@@ -244,6 +258,20 @@ mod tests {
         let job = ChildJob::new().unwrap();
         let mut child = job.spawn_logged(&cmd(), &["/C", "exit 3"]).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    #[test]
+    fn low_priority_child_runs_below_normal() {
+        use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, GetPriorityClass};
+        let job = ChildJob::new().unwrap();
+        let mut child = job
+            .spawn_logged_low(Path::new("ping.exe"), &["-n", "3", "127.0.0.1"])
+            .unwrap();
+        // SAFETY: our own child's handle, valid until `child` is dropped.
+        let class = unsafe { GetPriorityClass(HANDLE(child.as_raw_handle())) };
+        assert_eq!(class, BELOW_NORMAL_PRIORITY_CLASS.0);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
