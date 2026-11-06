@@ -1,0 +1,6 @@
+target/
+third_party/ffmpeg/
+*.ts
+*.mkv
+/config.toml
+crates/*/config.toml

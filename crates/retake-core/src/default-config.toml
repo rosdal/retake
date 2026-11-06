@@ -1,0 +1,75 @@
+# Retake configuration.
+# Every key is optional: anything you leave out uses the value shown here.
+# Unknown keys are errors, so a typo like `pre_rol` fails loudly instead of being ignored.
+# Relative paths are resolved against the folder this file is in.
+
+[game]
+# Record only while one of these processes is running.
+processes     = ["RainbowSix.exe", "RainbowSix_Vulkan.exe"]
+
+[capture]
+# Monitor index for ddagrab (0 = primary).
+output        = 0
+# Capture frame rate: 60, 120, 144, 165 or 240.
+fps           = 120
+# "hevc" or "av1" (both on AMD AMF).
+codec         = "hevc"
+# Constant QP for I- and P-frames, 0–51, lower is better. qp_i must be <= qp_p.
+qp_i          = 16
+qp_p          = 18
+# Where the ring buffer segments go. Use a fast NVMe drive outside OneDrive,
+# excluded from Defender real-time scanning, e.g. "D:/Retake/buffer".
+buffer_dir    = "buffer"
+# Length of the ring buffer. Must be >= pre_roll + post_roll + 4.
+buffer_secs   = 60
+
+[audio]
+# Process loopback on Siege (track 1).
+game          = true
+# Microphone (track 2).
+mic           = true
+mic_device    = "default"
+# Mic noise gate threshold in dB; 0 turns it off.
+mic_gate_db   = -50
+# Discord as track 3.
+comms         = false
+
+[clips]
+# Where saved clips go, e.g. "D:/Retake/clips".
+out_dir       = "clips"
+# Seconds kept before and after the trigger.
+pre_roll      = 15
+post_roll     = 3
+# Standard clip and full-buffer hotkeys.
+hotkey        = "F9"
+hotkey_full   = "Ctrl+F9"
+# Play a short sound when a clip is saved.
+sound_cue     = true
+
+[autoclip]
+# Save a clip automatically on your own kills.
+enabled       = true
+# x, y, w, h of the kill feed (set by calibration; default assumes 2560x1440).
+region        = [1880, 120, 640, 260]
+# Template image of your name in the kill feed (set by calibration).
+template      = "name.png"
+# Match threshold for normalized cross-correlation, 0–1.
+threshold     = 0.82
+# Kills within this many seconds extend one clip.
+merge_window  = 10
+
+[grade]
+# 3D LUT applied on export.
+lut           = "luts/siege.cube"
+# Contrast-adaptive sharpening strength; keep it around 0.3–0.4.
+cas_strength  = 0.35
+
+[export]
+# Export saved clips automatically.
+auto          = true
+# "after_game", "immediately" or "manual".
+when          = "after_game"
+# Presets to run: "edit", "edit-smooth", "share", "vertical".
+presets       = ["edit"]
+# Keep the untouched raw clip after exporting.
+keep_raw      = true
