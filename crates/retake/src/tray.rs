@@ -61,7 +61,8 @@ fn status_from_wparam(w: usize) -> Option<TrayStatus> {
     STATUSES.get(w).copied()
 }
 
-/// Icon colour and tooltip for a status, plus a hotkey problem if there is one.
+/// Icon colour and tooltip for a status, plus a hotkey problem if there is one. The problem
+/// is a second tooltip line; it turns an idle icon yellow but never hides red (recording).
 fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
     const YELLOW: [u8; 3] = [234, 179, 8];
     let (rgb, tip) = match s {
@@ -71,7 +72,10 @@ fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
         TrayStatus::Failed => (YELLOW, "Retake — recording failed, see the log"),
     };
     match problem {
-        Some(p) => (YELLOW, format!("{tip}\n{p}")),
+        Some(p) => {
+            let rgb = if s == TrayStatus::Idle { YELLOW } else { rgb };
+            (rgb, format!("{tip}\n{p}"))
+        }
         None => (rgb, tip.to_owned()),
     }
 }
@@ -151,7 +155,6 @@ struct LoopState {
     on_hotkey: Box<dyn Fn(usize)>,
     /// Hotkeys that could not be registered, as a tooltip line.
     problem: Option<String>,
-    status: TrayStatus,
 }
 
 thread_local! {
@@ -185,12 +188,7 @@ fn open(path: &std::path::Path, fallback_notepad: bool) {
 }
 
 fn set_status(s: TrayStatus) {
-    let problem = STATE.with(|st| {
-        st.borrow_mut().as_mut().and_then(|st| {
-            st.status = s;
-            st.problem.clone()
-        })
-    });
+    let problem = STATE.with(|st| st.borrow().as_ref().and_then(|st| st.problem.clone()));
     let (rgb, tip) = look(s, problem.as_deref());
     TRAY.with(|t| {
         if let Some(tray) = t.borrow().as_ref() {
@@ -338,7 +336,6 @@ pub fn run(
             on_exit: Some(Box::new(on_exit)),
             on_hotkey: Box::new(on_hotkey),
             problem: None,
-            status: TrayStatus::Idle,
         })
     });
     let result = run_loop(&hotkeys, on_ready);
@@ -461,18 +458,15 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_problem_turns_yellow_and_adds_a_line() {
+    fn hotkey_problem_adds_a_line_and_keeps_recording_red() {
         let p = hotkey_problem(&["F9"]).unwrap();
         assert_eq!(p, "Hotkey F9 unavailable — another app may be using it");
         let (rgb, tip) = look(TrayStatus::Recording, Some(&p));
-        assert_eq!(rgb, [234, 179, 8]);
-        assert_eq!(
-            tip,
-            format!(
-                "Retake — recording
-{p}"
-            )
-        );
+        assert_eq!(rgb, [220, 38, 38], "recording must stay visible");
+        assert_eq!(tip, format!("Retake — recording\n{p}"));
+        let (rgb, tip) = look(TrayStatus::Idle, Some(&p));
+        assert_eq!(rgb, [234, 179, 8], "idle shows the warning");
+        assert_eq!(tip, format!("Retake — idle\n{p}"));
         assert_eq!(
             hotkey_problem(&["F9", "Ctrl+F9"]).unwrap(),
             "Hotkeys F9, Ctrl+F9 unavailable — another app may be using them"

@@ -43,6 +43,10 @@ pub struct ClipJob {
     pub to: Ms,
 }
 
+/// How much shorter than the buffer a merged clip must stay: the segment being written plus
+/// the wait for the last one to close (the same 4 s `config` requires beyond the rolls).
+pub const MERGE_MARGIN: Ms = 4_000;
+
 /// Pending clips, waiting out their post-roll.
 pub struct Scheduler {
     pre: Ms,
@@ -66,13 +70,17 @@ impl Scheduler {
     }
 
     /// Records a press. A normal press inside a pending normal clip's post-roll moves that
-    /// clip's end to `press + post_roll` and returns true; anything else starts a new clip.
+    /// clip's end to `press + post_roll` and returns true, unless the clip would then span more
+    /// than the buffer minus [`MERGE_MARGIN`] (its start would be overwritten before it is
+    /// saved); anything else starts a new clip.
     pub fn press(&mut self, p: Press) -> bool {
+        let max_span = self.full_pre.saturating_sub(MERGE_MARGIN);
+        let to = p.at + self.post;
         if p.kind == Kind::Normal
             && let Some(job) = self
                 .pending
                 .iter_mut()
-                .find(|j| j.kind == Kind::Normal && p.at < j.to)
+                .find(|j| j.kind == Kind::Normal && p.at < j.to && to - j.from <= max_span)
         {
             job.to = job.to.max(p.at + self.post);
             return true;
@@ -228,6 +236,24 @@ mod tests {
         assert_eq!(
             (jobs[0].kind, jobs[0].from, jobs[0].to),
             (Kind::Full, 40_000, 103_000)
+        );
+    }
+
+    #[test]
+    fn merging_stops_before_the_clip_outgrows_the_buffer() {
+        // 30 s buffer: a merged clip may span at most 26 s (buffer − 4 s), so its start is
+        // still in the ring when it is saved.
+        let mut s = Scheduler::new(15, 3, 30);
+        s.press(press(100_000, Kind::Normal)); // 85–103 s
+        for at in [102_000, 104_000, 106_000] {
+            assert!(s.press(press(at, Kind::Normal)));
+        }
+        assert!(s.press(press(108_000, Kind::Normal))); // 85–111 s = 26 s
+        assert!(!s.press(press(110_000, Kind::Normal))); // would be 28 s: a new clip
+        let jobs = s.due(200_000);
+        assert_eq!(
+            jobs.iter().map(|j| (j.from, j.to)).collect::<Vec<_>>(),
+            [(85_000, 111_000), (95_000, 113_000)]
         );
     }
 

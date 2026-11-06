@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -54,26 +55,63 @@ impl ClipDirs {
         }
     }
 
-    /// Creates both folders and deletes whatever an earlier run left in `tmp/`.
+    /// Creates both folders and removes what an earlier run left behind: its work folders in
+    /// `tmp/` (named by job number) and half-written `.mkv.part` files in `raw/`. Nothing else
+    /// is touched, since `out_dir` may be a folder the user also keeps other files in. A leftover
+    /// that can't be removed (a file held open) is logged, not fatal.
     pub fn prepare(&self) -> io::Result<()> {
         fs::create_dir_all(&self.raw)?;
-        if self.tmp.exists() {
-            fs::remove_dir_all(&self.tmp)?;
+        fs::create_dir_all(&self.tmp)?;
+        let leftovers = fs::read_dir(&self.tmp)?
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let ours = name
+                    .to_str()
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+                ours && e.path().is_dir()
+            })
+            .map(|e| (e.path(), true))
+            .chain(
+                fs::read_dir(&self.raw)?
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with(".mkv.part"))
+                    })
+                    .map(|e| (e.path(), false)),
+            );
+        for (path, is_dir) in leftovers {
+            let r = if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(e) = r {
+                tracing::warn!(path = %path.display(), "removing leftover from a past save: {e}");
+            }
         }
-        fs::create_dir_all(&self.tmp)
+        Ok(())
     }
 }
 
-/// Reads and parses `index.csv`, retrying briefly when it is caught mid-rewrite.
+/// Reads and parses `index.csv`. A read counts only once two in a row return the same text,
+/// so a list caught mid-rewrite (missing its newest rows) is never mistaken for the ring.
 pub fn read_index(dir: &Path, start: Ms) -> Vec<Segment> {
-    for _ in 0..5 {
-        if let Ok(text) = fs::read_to_string(dir.join(INDEX_FILE)) {
-            let segs = parse_index(&text, start);
-            if !segs.is_empty() {
-                return segs;
+    let path = dir.join(INDEX_FILE);
+    let mut last: Option<String> = None;
+    for _ in 0..10 {
+        if let Ok(text) = fs::read_to_string(&path) {
+            if last.as_deref() == Some(text.as_str()) {
+                let segs = parse_index(&text, start);
+                if !segs.is_empty() {
+                    return segs;
+                }
             }
+            last = Some(text);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     Vec::new()
 }
@@ -212,25 +250,32 @@ pub struct SaverSetup {
 /// time. Dropping it drops pending clips and waits for a save in progress.
 pub struct Saver {
     tx: Sender<SaverMsg>,
+    stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Saver {
     /// `tx` is the sending side of `rx`, kept to deliver `Shutdown`.
     pub fn start(setup: SaverSetup, tx: Sender<SaverMsg>, rx: Receiver<SaverMsg>) -> Result<Saver> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("saver".into())
-            .spawn(move || run(setup, rx))
+            .spawn(move || run(setup, rx, &flag))
             .context("spawning saver thread")?;
         Ok(Saver {
             tx,
+            stop,
             thread: Some(thread),
         })
     }
 }
 
 impl Drop for Saver {
+    /// Stops waiting for segments and starts no further saves, so quitting or logging off isn't
+    /// held up; a copy or concat already running finishes first.
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
         let _ = self.tx.send(SaverMsg::Shutdown);
         if let Some(t) = self.thread.take()
             && t.join().is_err()
@@ -240,20 +285,44 @@ impl Drop for Saver {
     }
 }
 
-fn run(s: SaverSetup, rx: Receiver<SaverMsg>) {
+/// Waits up to `timeout` for a message, then takes everything else already queued, so presses
+/// that piled up during a save are all seen before any clip is declared due. Returns the
+/// presses and whether to shut down.
+fn take_messages(rx: &Receiver<SaverMsg>, timeout: Duration) -> (Vec<Press>, bool) {
+    let first = match rx.recv_timeout(timeout) {
+        Ok(m) => Some(m),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => return (Vec::new(), true),
+    };
+    let mut presses = Vec::new();
+    let mut stop = false;
+    for m in first.into_iter().chain(rx.try_iter()) {
+        match m {
+            SaverMsg::Press(p) => presses.push(p),
+            SaverMsg::Shutdown => stop = true,
+        }
+    }
+    (presses, stop)
+}
+
+fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
     let mut sched = Scheduler::new(s.pre_roll, s.post_roll, s.buffer_secs);
     let concat = |list: &Path, out: &Path| run_concat(&s.ffmpeg, &s.job, list, out);
     loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(SaverMsg::Press(p)) => {
-                let merged = sched.press(p);
-                tracing::info!(kind = ?p.kind, merged, "clip hotkey");
-            }
-            Ok(SaverMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
+        let (presses, shutdown) = take_messages(&rx, Duration::from_millis(100));
+        if shutdown || stop.load(Ordering::Relaxed) {
+            break;
+        }
+        for p in presses {
+            let merged = sched.press(p);
+            tracing::info!(kind = ?p.kind, merged, "clip hotkey");
         }
         for job in sched.due(wall_ms()) {
-            wait_for_segments(&s.session, job.to);
+            if stop.load(Ordering::Relaxed) {
+                tracing::info!(id = job.id, "quitting; clip dropped");
+                continue;
+            }
+            wait_for_segments(&s.session, job.to, stop);
             match save(&job, &s.session, &s.dirs, &concat) {
                 Ok(path) => (s.on_saved)(&path),
                 Err(e) => tracing::warn!(id = job.id, "clip not saved: {e:#}"),
@@ -266,10 +335,13 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>) {
 }
 
 /// Waits until the index lists a segment ending at or after `to` (the one holding the end of
-/// the clip has closed), or until it can't be coming any more.
-fn wait_for_segments(slot: &SessionSlot, to: Ms) {
+/// the clip has closed), until it can't be coming any more, or until `stop` is set.
+fn wait_for_segments(slot: &SessionSlot, to: Ms, stop: &AtomicBool) {
     let give_up = to + 2 * SEGMENT_MS + 1_000;
     while let Some(s) = current(slot) {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         let segs = read_index(&s.buffer_dir, s.start);
         if segs.last().is_some_and(|x| x.end >= to) || wall_ms() >= give_up {
             return;
@@ -406,16 +478,47 @@ mod tests {
     }
 
     #[test]
+    fn queued_presses_are_taken_together() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = |at| Press {
+            at,
+            stamp: T,
+            kind: Kind::Normal,
+        };
+        for at in [1, 2, 3] {
+            tx.send(SaverMsg::Press(p(at))).unwrap();
+        }
+        let (got, stop) = take_messages(&rx, Duration::from_millis(10));
+        assert_eq!(got.iter().map(|p| p.at).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(!stop);
+        tx.send(SaverMsg::Press(p(4))).unwrap();
+        tx.send(SaverMsg::Shutdown).unwrap();
+        assert!(take_messages(&rx, Duration::from_millis(10)).1);
+        assert_eq!(take_messages(&rx, Duration::from_millis(10)).0.len(), 0);
+        drop(tx);
+        assert!(take_messages(&rx, Duration::from_millis(10)).1);
+    }
+
+    #[test]
     fn prepare_empties_tmp_and_keeps_raw() {
         let t = tempfile::tempdir().unwrap();
         let dirs = ClipDirs::new(t.path());
         dirs.prepare().unwrap();
         fs::create_dir(dirs.tmp.join("3")).unwrap();
         fs::write(dirs.tmp.join("3").join("000.ts"), "x").unwrap();
+        fs::create_dir(dirs.tmp.join("mine")).unwrap(); // not Retake's: kept
+        fs::write(dirs.tmp.join("notes.txt"), "x").unwrap();
         fs::write(dirs.raw.join("keep.mkv"), "x").unwrap();
+        fs::write(dirs.raw.join("crashed.mkv.part"), "x").unwrap();
         dirs.prepare().unwrap();
-        assert_eq!(fs::read_dir(&dirs.tmp).unwrap().count(), 0);
+        let mut tmp: Vec<_> = fs::read_dir(&dirs.tmp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        tmp.sort();
+        assert_eq!(tmp, ["mine", "notes.txt"]);
         assert!(dirs.raw.join("keep.mkv").exists());
+        assert!(!dirs.raw.join("crashed.mkv.part").exists());
     }
 
     /// The real segmenter (testsrc + libx265, so HEVC like AMF) fills a 60 s ring with 70 s of
