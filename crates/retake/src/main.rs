@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod child;
+mod display;
 mod ffmpeg;
 mod instance;
 mod logging;
@@ -12,6 +13,7 @@ use std::process::{Child, ExitCode};
 
 use anyhow::{Context, Result};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
+use retake_core::display::check_output;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
@@ -119,6 +121,18 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(e) => return fatal(&format!("{e:#}")),
     };
+
+    let outputs = match display::outputs() {
+        Ok(o) => o,
+        Err(e) => return fatal(&format!("Listing monitors: {e:#}")),
+    };
+    let warnings = match check_output(&outputs, config.capture.output, config.capture.fps) {
+        Ok(w) => w,
+        Err(e) => return fatal(&e),
+    };
+    for w in &warnings {
+        tracing::warn!("{w}");
+    }
 
     let job = match ChildJob::new() {
         Ok(j) => j,
