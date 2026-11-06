@@ -1,0 +1,11 @@
+[package]
+name = "retake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+retake-core = { path = "../retake-core" }
+
+[lints]
+workspace = true
