@@ -25,6 +25,10 @@ jobs:
         shell: pwsh
         run: ./scripts/forbidden-apis.ps1
 
+      - name: Bench stats tests
+        shell: pwsh
+        run: ./scripts/perf-stats.tests.ps1
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

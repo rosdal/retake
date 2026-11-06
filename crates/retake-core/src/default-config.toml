@@ -22,6 +22,10 @@ codec         = "hevc"
 # Constant QP for I- and P-frames, 0–51, lower is better. qp_i must be <= qp_p.
 qp_i          = 16
 qp_p          = 18
+# Encoder speed/quality trade-off: "speed", "balanced" or "quality".
+preset        = "speed"
+# CPU priority of the recording ffmpeg: "normal" or "below_normal".
+priority      = "normal"
 # Where the ring buffer segments go, or "auto": Retake/buffer on the fastest
 # local drive with at least 20 GB free. A folder of your own should be on a fast
 # NVMe drive outside OneDrive, excluded from Defender real-time scanning,

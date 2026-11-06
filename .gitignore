@@ -4,3 +4,5 @@ third_party/ffmpeg/
 *.mkv
 /config.toml
 crates/*/config.toml
+third_party/presentmon/
+/bench/

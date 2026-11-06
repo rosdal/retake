@@ -65,11 +65,14 @@ impl ChildJob {
     }
 
     /// Like [`Self::spawn_logged`], but stdin is piped (ffmpeg stops on `q`) and every stderr
-    /// line goes to `on_stderr` instead of the log.
+    /// line goes to `on_stderr` instead of the log. `priority` is a priority-class creation flag
+    /// (`NORMAL_PRIORITY_CLASS` for normal: with no class flag the child inherits a below-normal
+    /// or idle parent's class).
     pub fn spawn_supervised<S: AsRef<OsStr>>(
         &self,
         exe: &Path,
         args: &[S],
+        priority: PROCESS_CREATION_FLAGS,
         on_stderr: impl FnMut(&str) + Send + 'static,
     ) -> Result<Child> {
         self.spawn_inner(
@@ -77,7 +80,7 @@ impl ChildJob {
             args,
             Stdio::piped(),
             Some(Box::new(on_stderr)),
-            PROCESS_CREATION_FLAGS(0),
+            priority,
         )
     }
 
@@ -272,6 +275,32 @@ mod tests {
         assert_eq!(class, BELOW_NORMAL_PRIORITY_CLASS.0);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn supervised_child_takes_the_given_priority() {
+        use windows::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, GetPriorityClass, NORMAL_PRIORITY_CLASS,
+        };
+        let job = ChildJob::new().unwrap();
+        for (flag, want) in [
+            (BELOW_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS.0),
+            (NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS.0),
+        ] {
+            let mut child = job
+                .spawn_supervised(
+                    Path::new("ping.exe"),
+                    &["-n", "3", "127.0.0.1"],
+                    flag,
+                    |_| {},
+                )
+                .unwrap();
+            // SAFETY: our own child's handle, valid until `child` is dropped.
+            let class = unsafe { GetPriorityClass(HANDLE(child.as_raw_handle())) };
+            assert_eq!(class, want);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]

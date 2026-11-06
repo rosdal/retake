@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::autoconf::Encoder;
-use crate::config::Codec;
+use crate::config::{Codec, Preset};
 
 /// Length of one buffer segment, in seconds.
 pub const SEGMENT_SECS: u32 = 2;
@@ -23,6 +23,7 @@ pub struct CaptureSetup {
     pub codec: Codec,
     pub qp_i: u32,
     pub qp_p: u32,
+    pub preset: Preset,
     pub buffer_dir: PathBuf,
     pub buffer_secs: u32,
 }
@@ -79,7 +80,12 @@ pub fn encoder_args(c: &CaptureSetup) -> Vec<String> {
     let mut a = vec!["-c:v".to_owned(), format!("{codec}_{}", c.encoder)];
     match c.encoder {
         Encoder::Amf => {
-            a.extend(strs(&["-quality", "speed", "-rc", "cqp"]));
+            let quality = match c.preset {
+                Preset::Speed => "speed",
+                Preset::Balanced => "balanced",
+                Preset::Quality => "quality",
+            };
+            a.extend(strs(&["-quality", quality, "-rc", "cqp"]));
             a.extend([
                 "-qp_i".into(),
                 c.qp_i.to_string(),
@@ -90,7 +96,12 @@ pub fn encoder_args(c: &CaptureSetup) -> Vec<String> {
         Encoder::Qsv => {
             // QSV runs CQP by default; its P-frame QP is `-q:v` and its I-frame QP is
             // `q * i_qfactor + i_qoffset`.
-            a.extend(strs(&["-preset", "veryfast"]));
+            let preset = match c.preset {
+                Preset::Speed => "veryfast",
+                Preset::Balanced => "medium",
+                Preset::Quality => "veryslow",
+            };
+            a.extend(strs(&["-preset", preset]));
             a.extend([
                 "-q:v".into(),
                 c.qp_p.to_string(),
@@ -101,7 +112,12 @@ pub fn encoder_args(c: &CaptureSetup) -> Vec<String> {
             ]);
         }
         Encoder::Nvenc => {
-            a.extend(strs(&["-preset", "p1", "-tune", "ll", "-rc", "constqp"]));
+            let preset = match c.preset {
+                Preset::Speed => "p1",
+                Preset::Balanced => "p4",
+                Preset::Quality => "p7",
+            };
+            a.extend(strs(&["-preset", preset, "-tune", "ll", "-rc", "constqp"]));
             a.extend([
                 "-init_qpI".into(),
                 c.qp_i.to_string(),
@@ -161,7 +177,7 @@ pub fn capture_args(c: &CaptureSetup) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Codec;
+    use crate::config::{Codec, Preset};
 
     fn amf() -> CaptureSetup {
         CaptureSetup {
@@ -171,6 +187,7 @@ mod tests {
             codec: Codec::Hevc,
             qp_i: 16,
             qp_p: 18,
+            preset: Preset::Speed,
             buffer_dir: PathBuf::from(r"C:\buf"),
             buffer_secs: 60,
         }
@@ -330,6 +347,47 @@ mod tests {
         assert_eq!(a[g + 1], "120");
         assert!(a.windows(2).any(|w| w == ["-qp_i", "20"]));
         assert!(a.windows(2).any(|w| w == ["-qp_p", "22"]));
+    }
+
+    #[test]
+    fn preset_maps_per_encoder() {
+        let want = [
+            (
+                Encoder::Amf,
+                ["-quality", "speed"],
+                ["-quality", "balanced"],
+                ["-quality", "quality"],
+            ),
+            (
+                Encoder::Qsv,
+                ["-preset", "veryfast"],
+                ["-preset", "medium"],
+                ["-preset", "veryslow"],
+            ),
+            (
+                Encoder::Nvenc,
+                ["-preset", "p1"],
+                ["-preset", "p4"],
+                ["-preset", "p7"],
+            ),
+        ];
+        for (encoder, s, b, q) in want {
+            for (preset, pair) in [
+                (Preset::Speed, s),
+                (Preset::Balanced, b),
+                (Preset::Quality, q),
+            ] {
+                let a = encoder_args(&CaptureSetup {
+                    encoder,
+                    preset,
+                    ..amf()
+                });
+                assert!(
+                    a.windows(2).any(|w| w == pair),
+                    "{encoder} {preset:?}: {a:?}"
+                );
+            }
+        }
     }
 
     #[test]
