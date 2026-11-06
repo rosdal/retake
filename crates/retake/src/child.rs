@@ -90,16 +90,50 @@ impl Drop for ChildJob {
     }
 }
 
+/// Longest line forwarded in one piece; longer runs are split so a stream that never ends a
+/// line can't grow the buffer without bound.
+const MAX_LINE: usize = 4096;
+
+/// Calls `f` for every non-empty line in `reader`, treating `\r`, `\n` and `\r\n` as line ends
+/// (ffmpeg's progress output ends its lines with a bare `\r`).
+fn for_each_line(reader: impl Read, max: usize, mut f: impl FnMut(&str)) {
+    let mut reader = BufReader::new(reader);
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    let mut emit = |line: &mut Vec<u8>| {
+        if !line.is_empty() {
+            f(&String::from_utf8_lossy(line));
+            line.clear();
+        }
+    };
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok([]) | Err(_) => break,
+            Ok(buf) => buf,
+        };
+        for &b in buf {
+            match b {
+                b'\r' | b'\n' => emit(&mut line),
+                _ => {
+                    line.push(b);
+                    if line.len() >= max {
+                        emit(&mut line);
+                    }
+                }
+            }
+        }
+        let n = buf.len();
+        reader.consume(n);
+    }
+    emit(&mut line);
+}
+
 fn forward_lines(pipe: impl Read + Send + 'static, name: String, pid: u32, stream: &'static str) {
     std::thread::Builder::new()
         .name(format!("{name}-{stream}"))
         .spawn(move || {
-            for line in BufReader::new(pipe).lines() {
-                match line {
-                    Ok(line) => tracing::info!(target: "ffmpeg", pid, stream, "{line}"),
-                    Err(_) => break,
-                }
-            }
+            for_each_line(pipe, MAX_LINE, |line| {
+                tracing::info!(target: "ffmpeg", pid, stream, "{line}");
+            });
         })
         .expect("spawning log forwarder thread");
 }
@@ -128,6 +162,14 @@ pub fn run_capture<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> Result<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn splits_on_cr_and_lf_and_caps_length() {
+        let input = b"a\rb\r\nc\n\nd\rlong-line-here".to_vec();
+        let mut got = Vec::new();
+        for_each_line(&input[..], 8, |l| got.push(l.to_owned()));
+        assert_eq!(got, ["a", "b", "c", "d", "long-lin", "e-here"]);
+    }
 
     fn cmd() -> PathBuf {
         PathBuf::from(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()))

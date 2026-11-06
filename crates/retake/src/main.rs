@@ -44,7 +44,13 @@ fn fatal(msg: &str) -> ExitCode {
     tracing::error!("{msg}");
     let text = HSTRING::from(msg);
     // SAFETY: strings outlive the call.
-    unsafe { MessageBoxW(None, &text, w!("Retake"), MB_OK | MB_ICONERROR) };
+    let rc = unsafe { MessageBoxW(None, &text, w!("Retake"), MB_OK | MB_ICONERROR) };
+    if rc.0 == 0 {
+        tracing::warn!(
+            "MessageBoxW failed: {}",
+            windows::core::Error::from_thread()
+        );
+    }
     ExitCode::from(1)
 }
 
