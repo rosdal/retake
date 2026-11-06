@@ -19,6 +19,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::core::PCWSTR;
 
+/// Receives a child's output, one line at a time.
+type LineSink = Box<dyn FnMut(&str) + Send>;
+
 /// A Job Object with `KILL_ON_JOB_CLOSE`. Every process spawned through it dies when this
 /// value is dropped, or when the OS closes the handle because Retake exited or was killed.
 pub struct ChildJob {
@@ -51,9 +54,30 @@ impl ChildJob {
     /// Spawns `exe args…` with no window, assigns it to this job and forwards each line of
     /// its stdout and stderr to `tracing` under the target `ffmpeg`.
     pub fn spawn_logged<S: AsRef<OsStr>>(&self, exe: &Path, args: &[S]) -> Result<Child> {
+        self.spawn_inner(exe, args, Stdio::null(), None)
+    }
+
+    /// Like [`Self::spawn_logged`], but stdin is piped (ffmpeg stops on `q`) and every stderr
+    /// line goes to `on_stderr` instead of the log.
+    pub fn spawn_supervised<S: AsRef<OsStr>>(
+        &self,
+        exe: &Path,
+        args: &[S],
+        on_stderr: impl FnMut(&str) + Send + 'static,
+    ) -> Result<Child> {
+        self.spawn_inner(exe, args, Stdio::piped(), Some(Box::new(on_stderr)))
+    }
+
+    fn spawn_inner<S: AsRef<OsStr>>(
+        &self,
+        exe: &Path,
+        args: &[S],
+        stdin: Stdio,
+        on_stderr: Option<LineSink>,
+    ) -> Result<Child> {
         let mut child = Command::new(exe)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW.0)
@@ -76,10 +100,11 @@ impl ChildJob {
             .unwrap_or_default();
         let pid = child.id();
         if let Some(out) = child.stdout.take() {
-            forward_lines(out, name.clone(), pid, "stdout");
+            forward_lines(out, format!("{name}-stdout"), log_line(pid, "stdout"));
         }
         if let Some(err) = child.stderr.take() {
-            forward_lines(err, name, pid, "stderr");
+            let f = on_stderr.unwrap_or_else(|| Box::new(log_line(pid, "stderr")));
+            forward_lines(err, format!("{name}-stderr"), f);
         }
         tracing::info!(pid, exe = %exe.display(), "spawned child");
         Ok(child)
@@ -139,14 +164,18 @@ fn for_each_line(reader: impl Read, max: usize, mut f: impl FnMut(&str)) {
     emit(&mut line);
 }
 
-fn forward_lines(pipe: impl Read + Send + 'static, name: String, pid: u32, stream: &'static str) {
+fn log_line(pid: u32, stream: &'static str) -> impl FnMut(&str) + Send + 'static {
+    move |line| tracing::info!(target: "ffmpeg", pid, stream, "{line}")
+}
+
+fn forward_lines(
+    pipe: impl Read + Send + 'static,
+    thread: String,
+    f: impl FnMut(&str) + Send + 'static,
+) {
     std::thread::Builder::new()
-        .name(format!("{name}-{stream}"))
-        .spawn(move || {
-            for_each_line(pipe, MAX_LINE, |line| {
-                tracing::info!(target: "ffmpeg", pid, stream, "{line}");
-            });
-        })
+        .name(thread)
+        .spawn(move || for_each_line(pipe, MAX_LINE, f))
         .expect("spawning log forwarder thread");
 }
 

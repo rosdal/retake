@@ -186,6 +186,12 @@ pub fn validate(c: &Config) -> Vec<String> {
             cap.qp_i, cap.qp_p
         ));
     }
+    if cap.buffer_dir.to_string_lossy().contains('%') {
+        errs.push(format!(
+            "capture.buffer_dir = {}: must not contain '%'",
+            cap.buffer_dir.display()
+        ));
+    }
     // u64 so huge roll values can't overflow.
     let min_buffer = u64::from(c.clips.pre_roll) + u64::from(c.clips.post_roll) + 4;
     if u64::from(cap.buffer_secs) < min_buffer {
@@ -343,6 +349,17 @@ mod tests {
             ["capture.buffer_secs = 21: must be ≥ pre_roll + post_roll + 4 (22)"]
         );
         assert!(load_str("[capture]\nbuffer_secs = 22").is_ok());
+    }
+
+    #[test]
+    fn buffer_dir_must_not_contain_percent() {
+        assert_eq!(
+            errs(
+                "[capture]
+buffer_dir = 'D:/100%/buf'"
+            ),
+            ["capture.buffer_dir = D:/100%/buf: must not contain '%'"]
+        );
     }
 
     #[test]
