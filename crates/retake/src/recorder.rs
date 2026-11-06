@@ -11,17 +11,19 @@ use anyhow::{Context, Result};
 use retake_core::Ms;
 use retake_core::autoconf::{Auto, Encoder, MonitorChoice, follow_game, pick_fps, pick_monitor};
 use retake_core::buffer::clear_dir;
-use retake_core::config::Capture;
+use retake_core::config::{Audio, Capture, GameSource};
 use retake_core::display::OutputInfo;
-use retake_core::ffmpeg_args::{CaptureSetup, capture_args, segment_count};
+use retake_core::ffmpeg_args::{AudioInput, CaptureSetup, capture_args, segment_count};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
 
+use crate::audio_pump::{Pump, Track};
 use crate::background::SharedGate;
 use crate::child::ChildJob;
 use crate::clock::now_ms;
 use crate::drive::warn_if_low_space;
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
+use crate::pipe::{OutPipe, pipe_name};
 use crate::procs::processes;
 use crate::saver::{Session, SessionSlot};
 use crate::window::game_monitor;
@@ -36,6 +38,7 @@ pub struct Setup {
     pub ffmpeg: PathBuf,
     /// The capture settings as configured; `"auto"` values are decided per session.
     pub capture: Capture,
+    pub audio: Audio,
     pub encoder: Encoder,
     pub processes: Vec<String>,
     /// A startup warning (monitor refresh, HDR) keeps the icon yellow.
@@ -108,6 +111,10 @@ struct Loop {
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
+    /// Feeds the running ffmpeg's audio inputs.
+    pump: Option<Pump>,
+    /// The game process the game track captures, to notice a restarted game.
+    audio_pid: Option<u32>,
     /// Counts ffmpeg starts; tags stats so a previous run's late lines are ignored.
     run: u64,
     last_stats: Option<Stats>,
@@ -128,6 +135,8 @@ impl Loop {
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
+            pump: None,
+            audio_pid: None,
             run: 0,
             last_stats: None,
             shown: None,
@@ -175,6 +184,7 @@ impl Loop {
                         let cmd = self.watcher.on_game(now, running);
                         self.apply(cmd, now);
                         self.follow_game_window(now);
+                        self.follow_game_pid(now);
                     }
                     Err(e) => tracing::warn!("process snapshot failed: {e:#}"),
                 }
@@ -182,6 +192,7 @@ impl Loop {
             if let Some(status) = self.ffmpeg.as_mut().and_then(Ffmpeg::exited) {
                 tracing::warn!(%status, "ffmpeg exited unexpectedly");
                 self.ffmpeg = None;
+                self.pump = None;
                 self.speed.reset();
                 let cmd = self.watcher.on_ffmpeg_exit(now);
                 self.apply(cmd, now);
@@ -194,9 +205,7 @@ impl Loop {
             }
             self.publish();
         }
-        if let Some(f) = self.ffmpeg.take() {
-            f.stop(GRACE);
-        }
+        self.stop_ffmpeg();
     }
 
     fn on_stats(&mut self, run: u64, st: Stats) {
@@ -229,7 +238,7 @@ impl Loop {
                 Command::StopSession => {
                     tracing::info!("game closed; stopping recording");
                     // No ffmpeg here means it crashed earlier, mid-segment.
-                    let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
+                    let clean = self.stop_ffmpeg();
                     self.speed.reset();
                     // The segments stay saveable, but nothing is written any more.
                     if let Some(s) = self
@@ -283,17 +292,104 @@ impl Loop {
                 to,
                 "Siege is on another monitor; recording there"
             );
-            if let Some(f) = self.ffmpeg.take() {
-                f.stop(GRACE);
-            }
+            self.stop_ffmpeg();
             let cmd = self.spawn(now);
             self.apply(cmd, now);
         }
     }
 
+    /// Stops ffmpeg gracefully, then the audio pump. Returns whether ffmpeg was running and
+    /// stopped cleanly.
+    fn stop_ffmpeg(&mut self) -> bool {
+        let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
+        self.pump = None;
+        clean
+    }
+
+    /// A game restarted mid-session has a new process id; process loopback on the old one
+    /// would record silence, so the run restarts on the new one.
+    fn follow_game_pid(&mut self, now: Ms) {
+        let Some(pid) = self.audio_pid else { return };
+        if self.ffmpeg.is_none() || self.game_pids.is_empty() || self.game_pids.contains(&pid) {
+            return;
+        }
+        tracing::info!(
+            old = pid,
+            new = self.game_pids[0],
+            "game restarted; restarting the recording for its audio"
+        );
+        self.stop_ffmpeg();
+        let cmd = self.spawn(now);
+        self.apply(cmd, now);
+    }
+
+    /// The audio tracks for a run: their pipes (created here, before ffmpeg opens them) and
+    /// sources. A source that can't be resolved leaves its track silent or out, never the
+    /// recording stopped.
+    fn audio_tracks(&mut self, run: u64) -> Vec<Track> {
+        let a = &self.s.audio;
+        let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32)> = Vec::new();
+        self.audio_pid = None;
+        if a.game {
+            let source = match (a.game_source, self.game_pids.first()) {
+                (GameSource::Process, Some(&pid)) if process_loopback_supported() => {
+                    self.audio_pid = Some(pid);
+                    retake_audio::Source::ProcessLoopback { pid }
+                }
+                (GameSource::Process, Some(_)) => {
+                    tracing::warn!(
+                        "Windows is older than 10 2004: game audio is the whole output device"
+                    );
+                    retake_audio::Source::DeviceLoopback
+                }
+                _ => retake_audio::Source::DeviceLoopback,
+            };
+            want.push(("game", Some(source), 0.0));
+        }
+        if a.mic {
+            want.push((
+                "mic",
+                Some(retake_audio::Source::Mic {
+                    name: a.mic_device.clone(),
+                }),
+                a.mic_gate_db,
+            ));
+        }
+        if a.comms {
+            let discord = processes().ok().and_then(|p| {
+                p.into_iter()
+                    .find(|(_, n)| n.eq_ignore_ascii_case("Discord.exe"))
+                    .map(|(pid, _)| pid)
+            });
+            match discord {
+                Some(pid) => want.push((
+                    "comms",
+                    Some(retake_audio::Source::ProcessLoopback { pid }),
+                    0.0,
+                )),
+                None => tracing::info!(
+                    "audio.comms is on but Discord isn't running; no comms track this run"
+                ),
+            }
+        }
+        let mut tracks = Vec::new();
+        for (name, source, gate_db) in want {
+            match OutPipe::create(&pipe_name(name, run)) {
+                Ok(pipe) => tracks.push(Track {
+                    name,
+                    pipe,
+                    source,
+                    gate_db,
+                }),
+                Err(e) => tracing::error!("{e:#}; recording without the {name} track"),
+            }
+        }
+        tracks
+    }
+
     /// Decides this session's monitor and frame rate (following `"auto"`), logs the monitor's
     /// warnings and returns the setup to record with.
-    fn session_setup(&mut self) -> CaptureSetup {
+    fn session_setup(&mut self, audio: Vec<AudioInput>, origin_us: i64) -> CaptureSetup {
         match crate::display::adapter() {
             Ok((_, outputs)) => self.outputs = outputs,
             Err(e) => tracing::warn!("listing monitors: {e:#}"),
@@ -338,8 +434,8 @@ impl Loop {
             qp_p: cap.qp_p,
             buffer_dir: cap.buffer_dir.clone(),
             buffer_secs: cap.buffer_secs,
-            audio: Vec::new(),
-            origin_us: 0,
+            audio,
+            origin_us,
         }
     }
 
@@ -363,7 +459,21 @@ impl Loop {
         let on_stats = move |st| {
             let _ = tx.send(Event::Stats(run, st));
         };
-        let setup = self.session_setup();
+        let tracks = self.audio_tracks(self.run);
+        let inputs = tracks
+            .iter()
+            .map(|t| AudioInput {
+                pipe: t.pipe.name().to_owned(),
+                title: match t.name {
+                    "game" => "Game",
+                    "mic" => "Mic",
+                    _ => "Comms",
+                },
+            })
+            .collect();
+        // The run's origin: video timestamps and the audio pump both count from here.
+        let origin_us = retake_audio::unix_us();
+        let setup = self.session_setup(inputs, origin_us);
         let args = capture_args(&setup);
         tracing::info!(args = %args.join(" "), "ffmpeg command");
         self.current = Some(setup);
@@ -372,6 +482,12 @@ impl Loop {
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, priority, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), ?priority, "ffmpeg recording");
+                if !tracks.is_empty() {
+                    match Pump::start(tracks, origin_us) {
+                        Ok(p) => self.pump = Some(p),
+                        Err(e) => tracing::error!("starting the audio pump: {e:#}"),
+                    }
+                }
                 *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
                     run: self.run,
                     start,
@@ -412,4 +528,13 @@ impl Loop {
             self.shown = Some(s);
         }
     }
+}
+
+/// Process loopback needs Windows 10 2004 (build 19041) or later.
+fn process_loopback_supported() -> bool {
+    crate::sysinfo::windows_build()
+        .split('.')
+        .next()
+        .and_then(|b| b.parse::<u32>().ok())
+        .is_some_and(|b| b >= 19_041)
 }

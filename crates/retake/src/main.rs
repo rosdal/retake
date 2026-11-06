@@ -44,6 +44,8 @@ use crate::saver::{ClipDirs, Saver, SaverMsg, SaverSetup, SessionSlot};
 
 struct Args {
     console: bool,
+    /// `--save` / `--save-full`: ask the running Retake for a clip, then exit.
+    save: Option<bool>,
     dummy_child: bool,
     /// Logged once logging is up; a GUI-subsystem exe has nowhere to print them earlier.
     unknown: Vec<String>,
@@ -52,12 +54,15 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         console: false,
+        save: None,
         dummy_child: false,
         unknown: Vec::new(),
     };
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--console" => args.console = true,
+            "--save" => args.save = Some(false),
+            "--save-full" => args.save = Some(true),
             "--dummy-child" => args.dummy_child = true,
             _ => args.unknown.push(a),
         }
@@ -108,9 +113,21 @@ fn main() -> ExitCode {
 
     // Before logging, so a second launch doesn't write into the running instance's log.
     let Some(instance) = SingleInstance::acquire() else {
+        if let Some(full) = args.save {
+            return if instance::signal_save(full) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            };
+        }
         instance::toast("Retake is already running.");
         return ExitCode::SUCCESS;
     };
+    if args.save.is_some() {
+        // Nothing to save from: this is the only Retake, and it has only just started.
+        drop(instance);
+        return ExitCode::from(1);
+    }
 
     let guard = match logging::init(args.console) {
         Ok(g) => g,
@@ -292,6 +309,7 @@ fn main() -> ExitCode {
     let saver_slot = saver.clone();
     let setup_job = job.clone();
     let capture = config.capture.clone();
+    let audio = config.audio.clone();
     let processes = config.game.processes.clone();
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
@@ -319,6 +337,7 @@ fn main() -> ExitCode {
             ffmpeg,
             encoder,
             capture,
+            audio,
             processes,
             warning,
             job: setup_job,
@@ -356,7 +375,15 @@ fn main() -> ExitCode {
         drop(guard); // flushes the log file
     };
 
-    match tray::run(paths, specs, on_hotkey, on_ready, shutdown) {
+    let on_hotkey = Arc::new(on_hotkey);
+    let remote = on_hotkey.clone();
+    if let Err(e) = instance::listen_for_saves(move |i| {
+        tracing::info!(full = i == 1, "clip requested by retake.exe --save");
+        remote(i);
+    }) {
+        tracing::warn!("retake.exe --save won't work: {e}");
+    }
+    match tray::run(paths, specs, move |i| on_hotkey(i), on_ready, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         // Already logged by tray::run, whose exit hook has closed the log.
         Err(e) => error_box(&format!("{e:#}")),

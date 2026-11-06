@@ -145,7 +145,11 @@ fn run(t: Track, origin_us: i64, stop: &AtomicBool) {
             (tl.take_due(now), tl.late_frames())
         };
         if late > late_logged + 4_800 {
-            tracing::warn!(track = t.name, late_frames = late, "audio packets arrived too late");
+            tracing::warn!(
+                track = t.name,
+                late_frames = late,
+                "audio packets arrived too late"
+            );
             late_logged = late;
         }
         if due.is_empty() {

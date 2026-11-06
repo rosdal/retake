@@ -211,11 +211,14 @@ pub fn audio_input_args(c: &CaptureSetup) -> Vec<String> {
 
 /// Maps the video and each audio track, encodes audio as AAC and titles the tracks. Empty
 /// without audio: ffmpeg then maps the filter graph's only output by itself.
+///
+/// With audio the video keeps its wall-clock timestamps (`passthrough`): re-gridding them to
+/// a constant frame rate drifted the picture by about 100 ms over 20 s against the audio.
 pub fn map_args(c: &CaptureSetup) -> Vec<String> {
     if c.audio.is_empty() {
         return Vec::new();
     }
-    let mut a = strs(&["-map", "[v]"]);
+    let mut a = strs(&["-map", "[v]", "-fps_mode:v", "passthrough"]);
     for k in 0..c.audio.len() {
         a.extend(["-map".into(), format!("{k}:a")]);
     }
@@ -313,6 +316,8 @@ mod tests {
                 r"\\.\pipe\retake_1",
                 "-map",
                 "[v]",
+                "-fps_mode:v",
+                "passthrough",
                 "-map",
                 "0:a",
                 "-map",
