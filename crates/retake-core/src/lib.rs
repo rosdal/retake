@@ -1,5 +1,6 @@
 //! Pure, platform-independent logic for Retake. No Windows APIs here.
 pub mod buffer;
+pub mod clip;
 pub mod config;
 pub mod display;
 pub mod ffmpeg_args;
