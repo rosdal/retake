@@ -34,6 +34,10 @@ pub struct Session {
     /// ffmpeg is still writing this run. False once the game closed: no more segments come,
     /// and no slot is being overwritten.
     pub live: bool,
+    /// The run ended without ffmpeg finishing its segment (killed, or crashed earlier), so the
+    /// slot it was writing may hold part of a newer segment while `index.csv` still lists the
+    /// older one. Only meaningful once `live` is false.
+    pub torn: bool,
 }
 
 /// Written by the recorder, read by the saver. `None` while no run's segments are usable.
@@ -150,7 +154,8 @@ pub fn save(
 ) -> Result<PathBuf> {
     let s = current(slot).context("not recording; no clip saved")?;
     let listed = read_index(&s.buffer_dir, s.start);
-    let writing = if s.live {
+    // A torn stop leaves the slot after the newest half-written, like a live run.
+    let writing = if s.live || s.torn {
         writing_file(&listed, s.wrap)
     } else {
         None
@@ -407,6 +412,7 @@ mod tests {
             buffer_dir: buf,
             wrap: 30,
             live: true,
+            torn: false,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -449,6 +455,23 @@ mod tests {
         let text = fs::read_to_string(&out).unwrap();
         assert!(
             text.starts_with("[0][2]") && text.ends_with("[58]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn torn_stop_drops_the_half_written_slot() {
+        let (_t, slot, dirs) = setup();
+        {
+            let mut g = slot.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.live = false;
+            s.torn = true;
+        }
+        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
+        let text = fs::read_to_string(&out).unwrap();
+        assert!(
+            text.starts_with("[2][4]") && text.ends_with("[58]"),
             "{text}"
         );
     }
@@ -656,6 +679,7 @@ mod tests {
             buffer_dir: buf,
             wrap: 30,
             live: true,
+            torn: false,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();

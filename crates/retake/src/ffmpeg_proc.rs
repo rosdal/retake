@@ -47,8 +47,9 @@ impl Ffmpeg {
         self.child.try_wait().ok().flatten()
     }
 
-    /// Writes `q`, waits up to `grace` for a clean exit, then terminates it.
-    pub fn stop(mut self, grace: Duration) {
+    /// Writes `q`, waits up to `grace` for a clean exit, then terminates it. Returns whether
+    /// it exited by itself (and so finished the segment it was writing).
+    pub fn stop(mut self, grace: Duration) -> bool {
         if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.write_all(b"q").and_then(|()| stdin.flush());
         }
@@ -56,7 +57,7 @@ impl Ffmpeg {
         while start.elapsed() < grace {
             if let Some(status) = self.exited() {
                 tracing::info!(pid = self.pid(), %status, "ffmpeg stopped");
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -66,6 +67,7 @@ impl Ffmpeg {
         );
         let _ = self.child.kill();
         let _ = self.child.wait();
+        false
     }
 
     /// Current working set in bytes.

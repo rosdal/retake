@@ -238,6 +238,10 @@ fn notify(op: NOTIFY_ICON_MESSAGE, shown: &Shown) -> bool {
 fn set_status(s: TrayStatus) {
     let problem = STATE.with(|st| st.borrow().as_ref().and_then(|st| st.problem.clone()));
     let (rgb, tip) = look(s, problem.as_deref());
+    // After remove_icon there is nothing to update, and a new icon would leak.
+    if SHOWN.with(|sh| sh.borrow().is_none()) {
+        return;
+    }
     let icon = match icon(rgb) {
         Ok(i) => i,
         Err(e) => {

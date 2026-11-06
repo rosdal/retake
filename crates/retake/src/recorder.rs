@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use retake_core::Ms;
-use retake_core::autoconf::{Encoder, follow_game, pick_fps, pick_output};
+use retake_core::autoconf::{Auto, Encoder, MonitorChoice, follow_game, pick_fps, pick_monitor};
 use retake_core::buffer::clear_dir;
 use retake_core::config::Capture;
-use retake_core::display::{OutputInfo, check_output};
+use retake_core::display::OutputInfo;
 use retake_core::ffmpeg_args::{CaptureSetup, capture_args, segment_count};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
@@ -29,6 +29,8 @@ use crate::window::game_monitor;
 const TICK: Duration = Duration::from_millis(250);
 const POLL: Ms = 2_000;
 const SUMMARY_EVERY: Ms = 60_000;
+/// Polls in a row Siege's window must be on another monitor before the recording follows it.
+const FOLLOW_POLLS: u32 = 3;
 
 pub struct Setup {
     pub ffmpeg: PathBuf,
@@ -101,6 +103,8 @@ struct Loop {
     game_pids: Vec<u32>,
     /// The current session's monitor has a warning (refresh, HDR).
     session_warning: bool,
+    /// The monitor Siege's window has moved to, and on how many polls in a row.
+    move_to: Option<(u32, u32)>,
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
@@ -120,6 +124,7 @@ impl Loop {
             outputs: Vec::new(),
             game_pids: Vec::new(),
             session_warning: false,
+            move_to: None,
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
@@ -223,9 +228,8 @@ impl Loop {
                 }
                 Command::StopSession => {
                     tracing::info!("game closed; stopping recording");
-                    if let Some(f) = self.ffmpeg.take() {
-                        f.stop(GRACE);
-                    }
+                    // No ffmpeg here means it crashed earlier, mid-segment.
+                    let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
                     self.speed.reset();
                     // The segments stay saveable, but nothing is written any more.
                     if let Some(s) = self
@@ -236,6 +240,7 @@ impl Loop {
                         .as_mut()
                     {
                         s.live = false;
+                        s.torn = !clean;
                     }
                     (self.s.on_session_end)();
                 }
@@ -248,16 +253,31 @@ impl Loop {
     }
 
     /// With `output = "auto"`, restarts the recording on the monitor Siege's window is on once
-    /// that window shows up somewhere other than where ffmpeg is recording.
+    /// that window has stayed somewhere other than where ffmpeg is recording for
+    /// [`FOLLOW_POLLS`] polls in a row. A restart empties the buffer, so a window that
+    /// flickers between monitors must not trigger one each time.
     fn follow_game_window(&mut self, now: Ms) {
-        if self.ffmpeg.is_none() || self.watcher.phase() != Phase::Recording {
+        if self.s.capture.output != Auto::Auto
+            || self.ffmpeg.is_none()
+            || self.watcher.phase() != Phase::Recording
+        {
+            self.move_to = None;
             return;
         }
         let Some(current) = self.current.as_ref().map(|c| c.output) else {
             return;
         };
         let gm = game_monitor(&self.game_pids);
-        if let Some(to) = follow_game(current, self.s.capture.output, &self.outputs, gm) {
+        let target = follow_game(current, self.s.capture.output, &self.outputs, gm);
+        self.move_to = match (target, self.move_to) {
+            (Some(to), Some((seen, n))) if seen == to => Some((to, n + 1)),
+            (Some(to), _) => Some((to, 1)),
+            (None, _) => None,
+        };
+        if let Some((to, n)) = self.move_to
+            && n >= FOLLOW_POLLS
+        {
+            self.move_to = None;
             tracing::info!(
                 from = current,
                 to,
@@ -279,15 +299,17 @@ impl Loop {
             Err(e) => tracing::warn!("listing monitors: {e:#}"),
         }
         let cap = &self.s.capture;
-        let gm = game_monitor(&self.game_pids);
-        let output = pick_output(cap.output, &self.outputs, gm).unwrap_or(0);
-        let refresh = self
-            .outputs
-            .iter()
-            .find(|o| o.index == output)
-            .map_or(0, |o| o.refresh_hz);
-        let fps = pick_fps(cap.fps, refresh);
-        self.session_warning = match check_output(&self.outputs, output, fps) {
+        // Only "auto" follows the game, so only then are its windows looked up.
+        let gm = (cap.output == Auto::Auto)
+            .then(|| game_monitor(&self.game_pids))
+            .flatten();
+        let MonitorChoice { output, fps, check } =
+            pick_monitor(cap.output, cap.fps, &self.outputs, gm).unwrap_or(MonitorChoice {
+                output: 0,
+                fps: pick_fps(cap.fps, 0),
+                check: Err("no monitors found on the primary GPU".into()),
+            });
+        self.session_warning = match check {
             Ok(warnings) => {
                 for w in &warnings {
                     tracing::warn!("{w}");
@@ -352,6 +374,7 @@ impl Loop {
                     buffer_dir: self.s.capture.buffer_dir.clone(),
                     wrap: segment_count(self.s.capture.buffer_secs),
                     live: true,
+                    torn: false,
                 });
                 self.ffmpeg = Some(f);
                 None

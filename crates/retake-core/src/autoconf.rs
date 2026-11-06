@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, de};
 
 use crate::config::ALLOWED_FPS;
-use crate::display::OutputInfo;
+use crate::display::{OutputInfo, check_output};
 
 /// A config value that is either `"auto"` or given explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +124,36 @@ pub fn pick_encoder(setting: EncoderSetting, vendor: Vendor) -> Result<Encoder, 
     })
 }
 
+/// The monitor and rate one recording uses, and what [`check_output`] says about the monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorChoice {
+    pub output: u32,
+    pub fps: u32,
+    /// `Err` if the monitor can't be recorded; otherwise its warnings.
+    pub check: Result<Vec<String>, String>,
+}
+
+/// Picks the monitor ([`pick_output`]) and rate ([`pick_fps`] from its refresh rate) and
+/// checks the monitor. `None` if there are no monitors.
+pub fn pick_monitor(
+    output: Auto<u32>,
+    fps: Auto<u32>,
+    outputs: &[OutputInfo],
+    game_monitor: Option<isize>,
+) -> Option<MonitorChoice> {
+    let output = pick_output(output, outputs, game_monitor)?;
+    let refresh = outputs
+        .iter()
+        .find(|o| o.index == output)
+        .map_or(0, |o| o.refresh_hz);
+    let fps = pick_fps(fps, refresh);
+    Some(MonitorChoice {
+        output,
+        fps,
+        check: check_output(outputs, output, fps),
+    })
+}
+
 /// The capture rate for `setting`: an explicit value as is; `auto` is the fastest allowed rate
 /// the monitor shows (1 Hz of slack, since Windows reports 143.98 Hz as 143), at least 60.
 pub fn pick_fps(setting: Auto<u32>, refresh_hz: u32) -> u32 {
@@ -200,18 +230,26 @@ pub struct DriveInfo {
     /// Bytes free to this user.
     pub free: u64,
     pub speed: Speed,
+    /// It already holds a `Retake` folder from an earlier run.
+    pub used: bool,
 }
 
 /// Free space a drive needs to be preferred for the buffer and clips.
 pub const AUTO_DRIVE_MIN_FREE: u64 = 100 * 1024 * 1024 * 1024;
 
-/// The drive for `"auto"` folders: among drives with at least [`AUTO_DRIVE_MIN_FREE`], the
-/// fastest, then the one with most free space; if none has that much, the one with most free.
+/// The drive for `"auto"` folders. A drive Retake already uses keeps being used, so clips
+/// don't move to another drive as free space changes. Otherwise: among drives with at least
+/// [`AUTO_DRIVE_MIN_FREE`], the fastest, then the one with most free space; if none has that
+/// much, the one with most free.
 pub fn pick_drive(drives: &[DriveInfo]) -> Option<&DriveInfo> {
+    let fastest = |a: &&DriveInfo, b: &&DriveInfo| a.speed.cmp(&b.speed).then(b.free.cmp(&a.free));
+    if let Some(d) = drives.iter().filter(|d| d.used).min_by(fastest) {
+        return Some(d);
+    }
     let roomy = drives
         .iter()
         .filter(|d| d.free >= AUTO_DRIVE_MIN_FREE)
-        .min_by(|a, b| a.speed.cmp(&b.speed).then(b.free.cmp(&a.free)));
+        .min_by(fastest);
     roomy.or_else(|| drives.iter().max_by_key(|d| d.free))
 }
 
@@ -245,6 +283,7 @@ mod tests {
             root: PathBuf::from(root),
             free: free_gb * GB,
             speed,
+            used: false,
         }
     }
 
@@ -350,6 +389,17 @@ mod tests {
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
         assert_eq!(pick_drive(&[]), None);
+    }
+
+    #[test]
+    fn drive_already_used_stays_picked() {
+        let mut d = [
+            drive("C:\\", 90, Speed::Nvme),
+            drive("D:\\", 900, Speed::Hdd),
+        ];
+        assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
+        d[0].used = true;
+        assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("C:\\"));
     }
 
     #[test]

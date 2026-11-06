@@ -106,7 +106,10 @@ fn run(gate: &SharedGate, rx: &Receiver<Job>, stop: &AtomicBool) {
             && let Some((name, job)) = queue.pop_front()
         {
             tracing::info!(job = %name, "background job");
-            job();
+            // One bad job must not end background work for the rest of the run.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                tracing::error!(job = %name, "background job panicked");
+            }
         }
     }
     if !queue.is_empty() {
@@ -162,6 +165,23 @@ mod tests {
         ));
         assert_eq!(*order.lock().unwrap(), [0, 1]);
         drop(bg);
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_stop_later_ones() {
+        let gate: SharedGate = Arc::default();
+        gate.lock().unwrap().on_game(false, now_ms());
+        let bg = Background::start(gate).unwrap();
+        let ran = Arc::new(AtomicU32::new(0));
+        bg.submitter().submit("bad", || panic!("job failed"));
+        let r = ran.clone();
+        bg.submitter().submit("good", move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(wait_for(
+            || ran.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(3)
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use retake_core::autoconf::{DriveInfo, Speed};
+use retake_core::autoconf::{DriveInfo, Speed, auto_dirs};
 use retake_core::buffer::{DriveKind, low_space_warning};
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Storage::FileSystem::{
@@ -69,6 +69,7 @@ pub fn fixed_drives() -> Vec<DriveInfo> {
             let free = free_bytes(&root).ok()?;
             Some(DriveInfo {
                 speed: speed(letter),
+                used: auto_dirs(&root).0.parent().is_some_and(Path::is_dir),
                 root,
                 free,
             })

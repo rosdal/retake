@@ -239,15 +239,15 @@ fn is_auto(p: &Path) -> bool {
 
 /// Makes every relative path in the config absolute against `base` (the folder holding
 /// `config.toml`), so they don't depend on the working directory Retake was started from.
-/// `"auto"` folders are left for [`resolve_auto_dirs`].
+/// `"auto"` folders are left for [`resolve_auto_dirs`]; the other paths have no `"auto"`.
 pub fn resolve_paths(c: &mut Config, base: &Path) {
-    for p in [
-        &mut c.capture.buffer_dir,
-        &mut c.clips.out_dir,
-        &mut c.autoclip.template,
-        &mut c.grade.lut,
-    ] {
+    for p in [&mut c.capture.buffer_dir, &mut c.clips.out_dir] {
         if p.is_relative() && !is_auto(p) {
+            *p = base.join(&*p);
+        }
+    }
+    for p in [&mut c.autoclip.template, &mut c.grade.lut] {
+        if p.is_relative() {
             *p = base.join(&*p);
         }
     }

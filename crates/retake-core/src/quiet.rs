@@ -8,9 +8,13 @@ use crate::Ms;
 pub const RESUME_AFTER: Ms = 30_000;
 
 /// Whether background work may start. Times are monotonic clock ms.
+///
+/// The gate starts closed: until the first process poll it isn't known whether Siege is
+/// already running, and a job must not read its files while it might be.
 #[derive(Debug, Default, Clone)]
 pub struct QuietGate {
-    running: bool,
+    /// `None` until the first [`QuietGate::on_game`].
+    running: Option<bool>,
     closed_at: Option<Ms>,
 }
 
@@ -20,24 +24,26 @@ impl QuietGate {
     }
 
     /// Records whether the game is running now. Returns the new state when it changed.
+    /// A game that isn't running at the first call didn't just close: that opens the gate at
+    /// once and isn't reported as a change.
     pub fn on_game(&mut self, running: bool, now: Ms) -> Option<bool> {
-        if running == self.running {
+        let before = self.running.replace(running);
+        if before == Some(running) || (before.is_none() && !running) {
             return None;
         }
-        self.running = running;
-        if !running {
+        if before == Some(true) {
             self.closed_at = Some(now);
         }
         Some(running)
     }
 
     pub fn game_running(&self) -> bool {
-        self.running
+        self.running == Some(true)
     }
 
     /// Whether a background job may start at `now`.
     pub fn may_start(&self, now: Ms) -> bool {
-        !self.running && self.closed_at.is_none_or(|t| now >= t + RESUME_AFTER)
+        self.running == Some(false) && self.closed_at.is_none_or(|t| now >= t + RESUME_AFTER)
     }
 }
 
@@ -46,8 +52,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn closed_until_the_first_poll() {
+        let mut g = QuietGate::new();
+        assert!(!g.may_start(0));
+        assert!(!g.game_running());
+        assert_eq!(g.on_game(true, 0), Some(true));
+        assert!(!g.may_start(100_000));
+    }
+
+    #[test]
     fn open_until_the_game_starts() {
         let mut g = QuietGate::new();
+        assert_eq!(g.on_game(false, 0), None);
         assert!(g.may_start(0));
         assert_eq!(g.on_game(true, 1_000), Some(true));
         assert!(g.game_running());

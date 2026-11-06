@@ -25,11 +25,10 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
-use retake_core::autoconf::{pick_drive, pick_encoder, pick_fps, pick_output};
+use retake_core::autoconf::{Auto, pick_drive, pick_encoder, pick_monitor};
 use retake_core::buffer::{drive_problem, write_readme};
 use retake_core::clip::{Kind, Press};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
-use retake_core::display::check_output;
 use retake_core::watcher::TrayStatus;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
@@ -138,6 +137,7 @@ fn main() -> ExitCode {
             drive = %d.root.display(),
             speed = %d.speed,
             free_gb = d.free / (1024 * 1024 * 1024),
+            already_used = d.used,
             "auto: buffer and clips drive"
         );
         Some(d.root.clone())
@@ -164,17 +164,20 @@ fn main() -> ExitCode {
             Err(e) => return fatal(&format!("{e:#}")),
         };
 
-    // An explicit monitor must exist; with "auto" the recorder decides per session.
-    let Some(output) = pick_output(config.capture.output, &outputs, None) else {
+    let Some(choice) = pick_monitor(config.capture.output, config.capture.fps, &outputs, None)
+    else {
         return fatal("No monitors found on the primary GPU");
     };
-    let refresh = outputs
-        .iter()
-        .find(|o| o.index == output)
-        .map_or(0, |o| o.refresh_hz);
-    let warnings = match check_output(&outputs, output, pick_fps(config.capture.fps, refresh)) {
-        Ok(w) => w,
-        Err(e) => return fatal(&e),
+    // An explicit monitor must exist, and its warnings hold for every session. With "auto"
+    // the recorder picks and checks the monitor per session: the primary's warnings here
+    // could be about a monitor it never records.
+    let warnings = if config.capture.output == Auto::Auto {
+        Vec::new()
+    } else {
+        match choice.check {
+            Ok(w) => w,
+            Err(e) => return fatal(&e),
+        }
     };
     for w in &warnings {
         tracing::warn!("{w}");
