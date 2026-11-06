@@ -47,8 +47,9 @@ impl Ffmpeg {
         self.child.try_wait().ok().flatten()
     }
 
-    /// Writes `q`, waits up to `grace` for a clean exit, then terminates it.
-    pub fn stop(mut self, grace: Duration) {
+    /// Writes `q`, waits up to `grace` for a clean exit, then terminates it. Returns whether
+    /// it exited by itself (and so finished the segment it was writing).
+    pub fn stop(mut self, grace: Duration) -> bool {
         if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.write_all(b"q").and_then(|()| stdin.flush());
         }
@@ -56,7 +57,7 @@ impl Ffmpeg {
         while start.elapsed() < grace {
             if let Some(status) = self.exited() {
                 tracing::info!(pid = self.pid(), %status, "ffmpeg stopped");
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -66,6 +67,7 @@ impl Ffmpeg {
         );
         let _ = self.child.kill();
         let _ = self.child.wait();
+        false
     }
 
     /// Current working set in bytes.
@@ -171,14 +173,21 @@ mod tests {
     #[test]
     #[ignore]
     fn pinned_ffmpeg_ring_buffer_wraps_and_stops_on_q() {
-        use retake_core::config::load_str;
         use retake_core::ffmpeg_args::{INDEX_FILE, segment_args, segment_count};
         let exe =
             Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin\ffmpeg.exe");
         let t = tempfile::tempdir().unwrap();
-        let mut cap = load_str("").unwrap().capture;
-        cap.buffer_dir = t.path().to_path_buf();
-        cap.buffer_secs = 6; // 3 segments
+        // 6 s = 3 segments; only the segment arguments are used.
+        let cap = retake_core::ffmpeg_args::CaptureSetup {
+            output: 0,
+            fps: 60,
+            encoder: retake_core::autoconf::Encoder::Amf,
+            codec: retake_core::config::Codec::Hevc,
+            qp_i: 16,
+            qp_p: 18,
+            buffer_dir: t.path().to_path_buf(),
+            buffer_secs: 6,
+        };
         let mut a = args(&[
             "-hide_banner",
             "-loglevel",

@@ -9,26 +9,34 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use retake_core::Ms;
+use retake_core::autoconf::{Auto, Encoder, MonitorChoice, follow_game, pick_fps, pick_monitor};
 use retake_core::buffer::clear_dir;
 use retake_core::config::Capture;
-use retake_core::ffmpeg_args::{capture_args, segment_count};
+use retake_core::display::OutputInfo;
+use retake_core::ffmpeg_args::{CaptureSetup, capture_args, segment_count};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
-use retake_core::watcher::{Command, TrayStatus, Watcher, game_running, tray_status};
+use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
 
+use crate::background::SharedGate;
 use crate::child::ChildJob;
-use crate::clock::wall_ms;
+use crate::clock::now_ms;
 use crate::drive::warn_if_low_space;
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
-use crate::procs::process_names;
+use crate::procs::processes;
 use crate::saver::{Session, SessionSlot};
+use crate::window::game_monitor;
 
 const TICK: Duration = Duration::from_millis(250);
 const POLL: Ms = 2_000;
 const SUMMARY_EVERY: Ms = 60_000;
+/// Polls in a row Siege's window must be on another monitor before the recording follows it.
+const FOLLOW_POLLS: u32 = 3;
 
 pub struct Setup {
     pub ffmpeg: PathBuf,
+    /// The capture settings as configured; `"auto"` values are decided per session.
     pub capture: Capture,
+    pub encoder: Encoder,
     pub processes: Vec<String>,
     /// A startup warning (monitor refresh, HDR) keeps the icon yellow.
     pub warning: bool,
@@ -36,6 +44,10 @@ pub struct Setup {
     pub notify: Box<dyn Fn(TrayStatus) + Send>,
     /// The current ffmpeg run, for the saver.
     pub session: SessionSlot,
+    /// Game-time quiet mode, updated on every poll.
+    pub quiet: SharedGate,
+    /// Called when a recording session ends (the game closed).
+    pub on_session_end: Box<dyn Fn() + Send>,
 }
 
 enum Event {
@@ -82,8 +94,17 @@ impl Drop for Recorder {
 struct Loop {
     s: Setup,
     stats_tx: Sender<Event>,
-    args: Vec<String>,
     epoch: Instant,
+    /// What the running ffmpeg was started with.
+    current: Option<CaptureSetup>,
+    /// Monitors as of the last start.
+    outputs: Vec<OutputInfo>,
+    /// Siege's process ids at the last poll.
+    game_pids: Vec<u32>,
+    /// The current session's monitor has a warning (refresh, HDR).
+    session_warning: bool,
+    /// The monitor Siege's window has moved to, and on how many polls in a row.
+    move_to: Option<(u32, u32)>,
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
@@ -95,13 +116,15 @@ struct Loop {
 
 impl Loop {
     fn new(s: Setup, stats_tx: Sender<Event>) -> Loop {
-        let args = capture_args(&s.capture);
-        tracing::info!(args = %args.join(" "), "ffmpeg command");
         Loop {
             s,
             stats_tx,
-            args,
             epoch: Instant::now(),
+            current: None,
+            outputs: Vec::new(),
+            game_pids: Vec::new(),
+            session_warning: false,
+            move_to: None,
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
@@ -128,12 +151,30 @@ impl Loop {
             let now = self.now();
             if now >= next_poll {
                 next_poll = now + POLL;
-                match process_names() {
-                    Ok(names) => {
-                        let running =
-                            game_running(names.iter().map(String::as_str), &self.s.processes);
+                match processes() {
+                    Ok(procs) => {
+                        self.game_pids = procs
+                            .iter()
+                            .filter(|(_, n)| game_running([n.as_str()], &self.s.processes))
+                            .map(|(p, _)| *p)
+                            .collect();
+                        let running = !self.game_pids.is_empty();
+                        let changed = self
+                            .s
+                            .quiet
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .on_game(running, now_ms());
+                        match changed {
+                            Some(true) => tracing::info!("quiet mode on: game running"),
+                            Some(false) => {
+                                tracing::info!("game closed; background work may start in 30 s")
+                            }
+                            None => {}
+                        }
                         let cmd = self.watcher.on_game(now, running);
                         self.apply(cmd, now);
+                        self.follow_game_window(now);
                     }
                     Err(e) => tracing::warn!("process snapshot failed: {e:#}"),
                 }
@@ -187,16 +228,115 @@ impl Loop {
                 }
                 Command::StopSession => {
                     tracing::info!("game closed; stopping recording");
-                    if let Some(f) = self.ffmpeg.take() {
-                        f.stop(GRACE);
-                    }
+                    // No ffmpeg here means it crashed earlier, mid-segment.
+                    let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
                     self.speed.reset();
+                    // The segments stay saveable, but nothing is written any more.
+                    if let Some(s) = self
+                        .s
+                        .session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        s.live = false;
+                        s.torn = !clean;
+                    }
+                    (self.s.on_session_end)();
                 }
                 Command::GiveUp => tracing::error!(
                     "ffmpeg crashed too often (5 restarts in 10 minutes); \
                      not retrying until the game is next launched"
                 ),
             }
+        }
+    }
+
+    /// With `output = "auto"`, restarts the recording on the monitor Siege's window is on once
+    /// that window has stayed somewhere other than where ffmpeg is recording for
+    /// [`FOLLOW_POLLS`] polls in a row. A restart empties the buffer, so a window that
+    /// flickers between monitors must not trigger one each time.
+    fn follow_game_window(&mut self, now: Ms) {
+        if self.s.capture.output != Auto::Auto
+            || self.ffmpeg.is_none()
+            || self.watcher.phase() != Phase::Recording
+        {
+            self.move_to = None;
+            return;
+        }
+        let Some(current) = self.current.as_ref().map(|c| c.output) else {
+            return;
+        };
+        let gm = game_monitor(&self.game_pids);
+        let target = follow_game(current, self.s.capture.output, &self.outputs, gm);
+        self.move_to = match (target, self.move_to) {
+            (Some(to), Some((seen, n))) if seen == to => Some((to, n + 1)),
+            (Some(to), _) => Some((to, 1)),
+            (None, _) => None,
+        };
+        if let Some((to, n)) = self.move_to
+            && n >= FOLLOW_POLLS
+        {
+            self.move_to = None;
+            tracing::info!(
+                from = current,
+                to,
+                "Siege is on another monitor; recording there"
+            );
+            if let Some(f) = self.ffmpeg.take() {
+                f.stop(GRACE);
+            }
+            let cmd = self.spawn(now);
+            self.apply(cmd, now);
+        }
+    }
+
+    /// Decides this session's monitor and frame rate (following `"auto"`), logs the monitor's
+    /// warnings and returns the setup to record with.
+    fn session_setup(&mut self) -> CaptureSetup {
+        match crate::display::adapter() {
+            Ok((_, outputs)) => self.outputs = outputs,
+            Err(e) => tracing::warn!("listing monitors: {e:#}"),
+        }
+        let cap = &self.s.capture;
+        // Only "auto" follows the game, so only then are its windows looked up.
+        let gm = (cap.output == Auto::Auto)
+            .then(|| game_monitor(&self.game_pids))
+            .flatten();
+        let MonitorChoice { output, fps, check } =
+            pick_monitor(cap.output, cap.fps, &self.outputs, gm).unwrap_or(MonitorChoice {
+                output: 0,
+                fps: pick_fps(cap.fps, 0),
+                check: Err("no monitors found on the primary GPU".into()),
+            });
+        self.session_warning = match check {
+            Ok(warnings) => {
+                for w in &warnings {
+                    tracing::warn!("{w}");
+                }
+                !warnings.is_empty()
+            }
+            Err(e) => {
+                tracing::warn!("{e}");
+                true
+            }
+        };
+        tracing::info!(
+            output,
+            fps,
+            encoder = %self.s.encoder,
+            game_window = gm.is_some(),
+            "capture setup"
+        );
+        CaptureSetup {
+            output,
+            fps,
+            encoder: self.s.encoder,
+            codec: cap.codec,
+            qp_i: cap.qp_i,
+            qp_p: cap.qp_p,
+            buffer_dir: cap.buffer_dir.clone(),
+            buffer_secs: cap.buffer_secs,
         }
     }
 
@@ -220,8 +360,12 @@ impl Loop {
         let on_stats = move |st| {
             let _ = tx.send(Event::Stats(run, st));
         };
-        let start = wall_ms();
-        match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &self.args, on_stats) {
+        let setup = self.session_setup();
+        let args = capture_args(&setup);
+        tracing::info!(args = %args.join(" "), "ffmpeg command");
+        self.current = Some(setup);
+        let start = now_ms();
+        match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), "ffmpeg recording");
                 *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
@@ -229,6 +373,8 @@ impl Loop {
                     start,
                     buffer_dir: self.s.capture.buffer_dir.clone(),
                     wrap: segment_count(self.s.capture.buffer_secs),
+                    live: true,
+                    torn: false,
                 });
                 self.ffmpeg = Some(f);
                 None
@@ -254,7 +400,8 @@ impl Loop {
     }
 
     fn publish(&mut self) {
-        let s = tray_status(self.watcher.phase(), self.s.warning || self.speed.behind());
+        let warning = self.s.warning || self.session_warning || self.speed.behind();
+        let s = tray_status(self.watcher.phase(), warning);
         if self.shown != Some(s) {
             tracing::info!(phase = ?self.watcher.phase(), status = ?s, "status");
             (self.s.notify)(s);

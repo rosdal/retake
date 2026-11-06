@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod child;
 mod clock;
 mod display;
@@ -11,9 +12,11 @@ mod logging;
 mod procs;
 mod recorder;
 mod saver;
+mod setup_check;
 mod sound;
 mod sysinfo;
 mod tray;
+mod window;
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -22,15 +25,16 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
+use retake_core::autoconf::{Auto, pick_drive, pick_encoder, pick_monitor};
 use retake_core::buffer::{drive_problem, write_readme};
 use retake_core::clip::{Kind, Press};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
-use retake_core::display::check_output;
 use retake_core::watcher::TrayStatus;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
 
+use crate::background::{Background, SharedGate};
 use crate::child::ChildJob;
 use crate::instance::SingleInstance;
 use crate::recorder::Recorder;
@@ -126,24 +130,54 @@ fn main() -> ExitCode {
         Ok(false) => {}
         Err(e) => return fatal(&format!("{e:#}")),
     }
-    let config: Config = match config::load_file(&config_path) {
+    let pick_root = || {
+        let drives = drive::fixed_drives();
+        let d = pick_drive(&drives)?;
+        tracing::info!(
+            drive = %d.root.display(),
+            speed = %d.speed,
+            free_gb = d.free / (1024 * 1024 * 1024),
+            already_used = d.used,
+            "auto: buffer and clips drive"
+        );
+        Some(d.root.clone())
+    };
+    let config: Config = match config::load_file(&config_path, &pick_root) {
         Ok(c) => c,
         Err(e) => return fatal(&e.to_string()),
     };
     tracing::info!(path = %config_path.display(), "config loaded");
 
-    let ffmpeg = match ffmpeg::locate(&exe_dir).and_then(|p| ffmpeg::self_check(&p).map(|()| p)) {
-        Ok(p) => p,
-        Err(e) => return fatal(&format!("{e:#}")),
-    };
-
-    let outputs = match display::outputs() {
-        Ok(o) => o,
+    let (vendor, outputs) = match display::adapter() {
+        Ok(a) => a,
         Err(e) => return fatal(&format!("Listing monitors: {e:#}")),
     };
-    let warnings = match check_output(&outputs, config.capture.output, config.capture.fps) {
-        Ok(w) => w,
+    let encoder = match pick_encoder(config.capture.encoder, vendor) {
+        Ok(e) => e,
         Err(e) => return fatal(&e),
+    };
+    tracing::info!(%encoder, %vendor, setting = ?config.capture.encoder, "encoder");
+
+    let ffmpeg =
+        match ffmpeg::locate(&exe_dir).and_then(|p| ffmpeg::self_check(&p, encoder).map(|()| p)) {
+            Ok(p) => p,
+            Err(e) => return fatal(&format!("{e:#}")),
+        };
+
+    let Some(choice) = pick_monitor(config.capture.output, config.capture.fps, &outputs, None)
+    else {
+        return fatal("No monitors found on the primary GPU");
+    };
+    // An explicit monitor must exist, and its warnings hold for every session. With "auto"
+    // the recorder picks and checks the monitor per session: the primary's warnings here
+    // could be about a monitor it never records.
+    let warnings = if config.capture.output == Auto::Auto {
+        Vec::new()
+    } else {
+        match choice.check {
+            Ok(w) => w,
+            Err(e) => return fatal(&e),
+        }
     };
     for w in &warnings {
         tracing::warn!("{w}");
@@ -212,19 +246,38 @@ fn main() -> ExitCode {
     let (press_tx, press_rx) = mpsc::channel();
     let cue = config.clips.sound_cue;
     let hotkey_tx = press_tx.clone();
+    let hotkey_session = session.clone();
     let on_hotkey = move |i: usize| {
         let Some(&kind) = kinds.get(i) else { return };
         let p = Press {
-            at: clock::wall_ms(),
+            at: clock::now_ms(),
             stamp: clock::local_stamp(),
             kind,
         };
+        // Still sent when not recording: a press just after the game closed can save its end.
         if hotkey_tx.send(SaverMsg::Press(p)).is_err() {
             tracing::warn!("saver is not running; press ignored");
+            return;
+        }
+        // The cue promises a clip, so it only plays while something is being recorded.
+        let live = saver::current(&hotkey_session).is_some_and(|s| s.live);
+        if !live {
+            tracing::info!("clip hotkey while not recording");
         } else if cue {
             sound::play_press();
         }
     };
+
+    // Game-time quiet mode: background work (the setup check, later grading and exports)
+    // only runs while Siege is closed.
+    let quiet: SharedGate = Arc::default();
+    let background = match Background::start(quiet.clone()) {
+        Ok(b) => b,
+        Err(e) => return fatal(&format!("{e:#}")),
+    };
+    let jobs = background.submitter();
+    let check_gate = quiet.clone();
+    jobs.submit("setup check", move || setup_check::run(&check_gate));
 
     let paths = tray::TrayPaths {
         config: config_path,
@@ -262,12 +315,18 @@ fn main() -> ExitCode {
         }
         let setup = recorder::Setup {
             ffmpeg,
+            encoder,
             capture,
             processes,
             warning,
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),
             session,
+            quiet: quiet.clone(),
+            on_session_end: Box::new(move || {
+                let gate = quiet.clone();
+                jobs.submit("setup check", move || setup_check::run(&gate));
+            }),
         };
         match Recorder::start(setup) {
             Ok(r) => *slot.borrow_mut() = Some(r),
@@ -284,6 +343,7 @@ fn main() -> ExitCode {
         if let Some(r) = recorder.borrow_mut().take() {
             r.shutdown();
         }
+        drop(background);
         for mut c in children {
             let _ = c.kill();
             let _ = c.wait();

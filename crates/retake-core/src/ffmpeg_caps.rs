@@ -2,10 +2,19 @@
 
 use std::collections::BTreeSet;
 
-/// Encoders the pinned ffmpeg must provide.
-pub const REQUIRED_ENCODERS: [&str; 3] = ["hevc_amf", "av1_amf", "h264_amf"];
-/// Filters the pinned ffmpeg must provide.
+use crate::autoconf::Encoder;
+
+/// Filters every setup needs.
 pub const REQUIRED_FILTERS: [&str; 3] = ["ddagrab", "lut3d", "cas"];
+
+/// Encoders and extra filters the chosen encoder needs.
+fn required(enc: Encoder) -> (&'static [&'static str], &'static [&'static str]) {
+    match enc {
+        Encoder::Amf => (&["hevc_amf", "av1_amf", "h264_amf"], &[]),
+        Encoder::Qsv => (&["hevc_qsv", "av1_qsv"], &["hwmap"]),
+        Encoder::Nvenc => (&["hevc_nvenc", "av1_nvenc"], &[]),
+    }
+}
 
 /// Names listed by `ffmpeg -encoders` or `-filters`. A listing line is a column of flag
 /// characters followed by the name; legend lines (`V..... = Video`) and headers are skipped.
@@ -22,18 +31,23 @@ pub fn parse_names(listing: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Required encoders and filters absent from the given listings, encoders first.
-pub fn missing_features(encoders: &str, filters: &str) -> Vec<&'static str> {
+/// Encoders and filters `enc` needs that are absent from the given listings, encoders first.
+pub fn missing_features(encoders: &str, filters: &str, enc: Encoder) -> Vec<&'static str> {
     let have_enc = parse_names(encoders);
     let have_fil = parse_names(filters);
-    let missing_enc = REQUIRED_ENCODERS.iter().filter(|n| !have_enc.contains(**n));
-    let missing_fil = REQUIRED_FILTERS.iter().filter(|n| !have_fil.contains(**n));
+    let (encs, extra) = required(enc);
+    let missing_enc = encs.iter().filter(|n| !have_enc.contains(**n));
+    let missing_fil = REQUIRED_FILTERS
+        .iter()
+        .chain(extra)
+        .filter(|n| !have_fil.contains(**n));
     missing_enc.chain(missing_fil).copied().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autoconf::Encoder;
 
     // Real lines from `ffmpeg -hide_banner -encoders` / `-filters` (ffmpeg 8.0.1, gyan full).
     const ENC: &str = "Encoders:
@@ -54,14 +68,17 @@ mod tests {
 
     #[test]
     fn reports_missing() {
-        assert_eq!(missing_features(ENC, FIL), ["h264_amf", "cas"]);
+        assert_eq!(
+            missing_features(ENC, FIL, Encoder::Amf),
+            ["h264_amf", "cas"]
+        );
     }
 
     #[test]
     fn nothing_missing_when_all_present() {
         let enc = format!("{ENC} V....D h264_amf             AMD AMF H.264 Encoder\n");
         let fil = format!("{FIL} TS cas               V->V       Contrast Adaptive Sharpen.\n");
-        assert!(missing_features(&enc, &fil).is_empty());
+        assert!(missing_features(&enc, &fil, Encoder::Amf).is_empty());
     }
 
     #[test]
@@ -77,6 +94,29 @@ mod tests {
 
     #[test]
     fn empty_output_means_everything_missing() {
-        assert_eq!(missing_features("", "").len(), 6);
+        assert_eq!(missing_features("", "", Encoder::Amf).len(), 6);
+    }
+
+    #[test]
+    fn each_encoder_needs_its_own_codecs() {
+        assert_eq!(
+            missing_features("", "", Encoder::Qsv),
+            ["hevc_qsv", "av1_qsv", "ddagrab", "lut3d", "cas", "hwmap"]
+        );
+        assert_eq!(
+            missing_features("", "", Encoder::Nvenc),
+            ["hevc_nvenc", "av1_nvenc", "ddagrab", "lut3d", "cas"]
+        );
+        let enc = format!(
+            "{ENC} V....D hevc_qsv             H.265 (Intel Quick Sync)
+ V....D av1_qsv              AV1 (Intel Quick Sync)
+"
+        );
+        let fil = format!(
+            "{FIL} TS cas               V->V       x
+ .. hwmap             V->V       x
+"
+        );
+        assert!(missing_features(&enc, &fil, Encoder::Qsv).is_empty());
     }
 }

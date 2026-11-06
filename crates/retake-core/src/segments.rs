@@ -1,10 +1,10 @@
-//! The ring buffer's `index.csv` read as wall-clock segments, and the choice of which segments
-//! make a clip. Pure; times are wall-clock milliseconds since the Unix epoch.
+//! The ring buffer's `index.csv` read as segments on Retake's clock, and the choice of which
+//! segments make a clip. Pure; times are milliseconds on the same monotonic clock as presses.
 
 use crate::Ms;
 use crate::ffmpeg_args::SEGMENT_SECS;
 
-/// One closed segment of the ring, on the wall clock.
+/// One closed segment of the ring, on Retake's clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub file: String,
@@ -18,7 +18,7 @@ pub const SEGMENT_MS: Ms = SEGMENT_SECS as Ms * 1000;
 pub const GAP_TOLERANCE: Ms = 500;
 
 /// Parses ffmpeg's CSV segment list (`seg_03.ts,16.000000,18.000000` per line). Its times count
-/// from the start of the ffmpeg run; adding `session_start` puts them on the wall clock. Lines
+/// from the start of the ffmpeg run; adding `session_start` puts them on Retake's clock. Lines
 /// that don't parse, such as a half-written last line, are skipped. Sorted by start.
 pub fn parse_index(text: &str, session_start: Ms) -> Vec<Segment> {
     let secs = |s: &str| {

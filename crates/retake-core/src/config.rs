@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use toml::{Table, Value};
 
+use crate::autoconf::{Auto, EncoderSetting, auto_dirs};
+
 /// The commented default config, written next to the exe on first run.
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("default-config.toml");
 
@@ -42,8 +44,12 @@ pub enum Codec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
-    pub output: u32,
-    pub fps: u32,
+    /// The `ddagrab` output, or `auto` (the monitor Siege is on).
+    pub output: Auto<u32>,
+    /// Capture rate, or `auto` (the monitor's refresh rate).
+    pub fps: Auto<u32>,
+    /// Hardware encoder, or `auto` (from the GPU maker).
+    pub encoder: EncoderSetting,
     pub codec: Codec,
     pub qp_i: u32,
     pub qp_p: u32,
@@ -169,9 +175,11 @@ pub fn validate(c: &Config) -> Vec<String> {
     let mut errs = Vec::new();
     let cap = &c.capture;
 
-    if !ALLOWED_FPS.contains(&cap.fps) {
+    if let Auto::Value(fps) = cap.fps
+        && !ALLOWED_FPS.contains(&fps)
+    {
         let list = ALLOWED_FPS.map(|f| f.to_string()).join(", ");
-        errs.push(format!("capture.fps = {}: must be one of {list}", cap.fps));
+        errs.push(format!("capture.fps = {fps}: must be one of {list}"));
     }
     let mut qp_ok = true;
     for (name, v) in [("qp_i", cap.qp_i), ("qp_p", cap.qp_p)] {
@@ -186,7 +194,7 @@ pub fn validate(c: &Config) -> Vec<String> {
             cap.qp_i, cap.qp_p
         ));
     }
-    if cap.buffer_dir.to_string_lossy().contains('%') {
+    if !is_auto(&cap.buffer_dir) && cap.buffer_dir.to_string_lossy().contains('%') {
         errs.push(format!(
             "capture.buffer_dir = {}: must not contain '%'",
             cap.buffer_dir.display()
@@ -222,18 +230,42 @@ pub fn validate(c: &Config) -> Vec<String> {
     errs
 }
 
+/// The folder value that means "pick a drive for me".
+pub const AUTO_DIR: &str = "auto";
+
+fn is_auto(p: &Path) -> bool {
+    p == Path::new(AUTO_DIR)
+}
+
 /// Makes every relative path in the config absolute against `base` (the folder holding
 /// `config.toml`), so they don't depend on the working directory Retake was started from.
+/// `"auto"` folders are left for [`resolve_auto_dirs`]; the other paths have no `"auto"`.
 pub fn resolve_paths(c: &mut Config, base: &Path) {
-    for p in [
-        &mut c.capture.buffer_dir,
-        &mut c.clips.out_dir,
-        &mut c.autoclip.template,
-        &mut c.grade.lut,
-    ] {
+    for p in [&mut c.capture.buffer_dir, &mut c.clips.out_dir] {
+        if p.is_relative() && !is_auto(p) {
+            *p = base.join(&*p);
+        }
+    }
+    for p in [&mut c.autoclip.template, &mut c.grade.lut] {
         if p.is_relative() {
             *p = base.join(&*p);
         }
+    }
+}
+
+/// Whether `buffer_dir` or `out_dir` is `"auto"`.
+pub fn needs_auto_dirs(c: &Config) -> bool {
+    is_auto(&c.capture.buffer_dir) || is_auto(&c.clips.out_dir)
+}
+
+/// Puts each `"auto"` folder under `root` (`<root>\Retake\buffer`, `<root>\Retake\clips`).
+pub fn resolve_auto_dirs(c: &mut Config, root: &Path) {
+    let (buffer, clips) = auto_dirs(root);
+    if is_auto(&c.capture.buffer_dir) {
+        c.capture.buffer_dir = buffer;
+    }
+    if is_auto(&c.clips.out_dir) {
+        c.clips.out_dir = clips;
     }
 }
 
@@ -255,14 +287,31 @@ pub fn check_dirs(c: &Config) -> Vec<String> {
     errs
 }
 
-/// Loads `path`, resolves its relative paths against the file's folder and checks every rule,
+/// Loads `path`, resolves its relative paths against the file's folder and its `"auto"` folders
+/// under the drive `auto_root` picks (called only when needed), and checks every rule,
 /// including that the output directories are writable.
-pub fn load_file(path: &Path) -> Result<Config, ConfigError> {
+pub fn load_file(
+    path: &Path,
+    auto_root: &dyn Fn() -> Option<PathBuf>,
+) -> Result<Config, ConfigError> {
     let text = fs::read_to_string(path)
         .map_err(|e| ConfigError::Parse(format!("cannot read {}: {e}", path.display())))?;
     let mut config = load_str(&text)?;
     let base = path.parent().unwrap_or(Path::new("."));
     resolve_paths(&mut config, base);
+    if needs_auto_dirs(&config) {
+        let Some(root) = auto_root() else {
+            let field = if is_auto(&config.capture.buffer_dir) {
+                "capture.buffer_dir"
+            } else {
+                "clips.out_dir"
+            };
+            return Err(ConfigError::Invalid(vec![format!(
+                "{field} = auto: no fixed local drive found; set a folder"
+            )]));
+        };
+        resolve_auto_dirs(&mut config, &root);
+    }
     let errs = check_dirs(&config);
     if errs.is_empty() {
         Ok(config)
@@ -278,14 +327,18 @@ mod tests {
     #[test]
     fn default_config_parses() {
         let c = load_str("").unwrap();
-        assert_eq!(c.capture.fps, 120);
+        assert_eq!(c.capture.fps, Auto::Auto);
+        assert_eq!(c.capture.output, Auto::Auto);
+        assert_eq!(c.capture.encoder, EncoderSetting::Auto);
+        assert_eq!(c.capture.buffer_dir, Path::new(AUTO_DIR));
+        assert_eq!(c.clips.out_dir, Path::new(AUTO_DIR));
         assert_eq!(c.clips.pre_roll, 15);
     }
 
     #[test]
     fn user_value_overrides_default() {
         let c = load_str("[capture]\nfps = 60").unwrap();
-        assert_eq!(c.capture.fps, 60);
+        assert_eq!(c.capture.fps, Auto::Value(60));
         assert_eq!(c.capture.qp_i, 16);
     }
 
@@ -440,6 +493,38 @@ hotkey = \"Alt+Shift+K\""
     }
 
     #[test]
+    fn auto_values_skip_the_value_rules() {
+        assert!(load_str("[capture]\nfps = \"auto\"\noutput = \"auto\"").is_ok());
+        assert!(load_str("[capture]\nbuffer_dir = \"auto\"").is_ok());
+        assert_eq!(
+            load_str("[capture]\noutput = 2").unwrap().capture.output,
+            Auto::Value(2)
+        );
+    }
+
+    #[test]
+    fn encoder_must_be_known() {
+        let c = load_str("[capture]\nencoder = \"qsv\"").unwrap();
+        assert_eq!(c.capture.encoder, EncoderSetting::Qsv);
+        let e = load_str("[capture]\nencoder = \"x264\"")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("capture.encoder"), "{e}");
+    }
+
+    #[test]
+    fn auto_dirs_wait_for_a_drive() {
+        let mut c = load_str("").unwrap();
+        resolve_paths(&mut c, Path::new(r"C:\base"));
+        assert!(needs_auto_dirs(&c));
+        assert_eq!(c.capture.buffer_dir, Path::new(AUTO_DIR));
+        resolve_auto_dirs(&mut c, Path::new("D:\\"));
+        assert!(!needs_auto_dirs(&c));
+        assert_eq!(c.capture.buffer_dir, Path::new(r"D:\Retake\buffer"));
+        assert_eq!(c.clips.out_dir, Path::new(r"D:\Retake\clips"));
+    }
+
+    #[test]
     fn codec_must_be_known() {
         let e = load_str("[capture]\ncodec = \"h264\"")
             .unwrap_err()
@@ -452,10 +537,12 @@ hotkey = \"Alt+Shift+K\""
         let t = tempfile::tempdir().unwrap();
         let mut c = load_str("").unwrap();
         resolve_paths(&mut c, t.path());
+        resolve_auto_dirs(&mut c, t.path());
         assert!(check_dirs(&c).is_empty());
-        assert!(t.path().join("buffer").is_dir());
-        assert!(t.path().join("clips").is_dir());
-        assert!(!t.path().join("buffer").join(WRITE_TEST_FILE).exists());
+        let base = t.path().join("Retake");
+        assert!(base.join("buffer").is_dir());
+        assert!(base.join("clips").is_dir());
+        assert!(!base.join("buffer").join(WRITE_TEST_FILE).exists());
     }
 
     #[test]
@@ -475,6 +562,7 @@ hotkey = \"Alt+Shift+K\""
         std::fs::write(&f, "").unwrap();
         let mut c = load_str("").unwrap();
         resolve_paths(&mut c, t.path());
+        resolve_auto_dirs(&mut c, t.path());
         c.capture.buffer_dir = f.join("sub");
         let errs = check_dirs(&c);
         assert_eq!(errs.len(), 1);
@@ -486,8 +574,30 @@ hotkey = \"Alt+Shift+K\""
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("config.toml");
         std::fs::write(&p, "[capture]\nfps = 60").unwrap();
-        let c = load_file(&p).unwrap();
-        assert_eq!(c.capture.fps, 60);
+        let root = t.path().to_path_buf();
+        let c = load_file(&p, &|| Some(root.clone())).unwrap();
+        assert_eq!(c.capture.fps, Auto::Value(60));
+        assert_eq!(c.capture.buffer_dir, t.path().join("Retake").join("buffer"));
+    }
+
+    #[test]
+    fn load_file_asks_for_a_drive_only_when_needed() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[capture]\nbuffer_dir = 'buffer'\n[clips]\nout_dir = 'clips'",
+        )
+        .unwrap();
+        let c = load_file(&p, &|| panic!("no drive needed")).unwrap();
         assert_eq!(c.capture.buffer_dir, t.path().join("buffer"));
+        std::fs::write(&p, "").unwrap();
+        match load_file(&p, &|| None) {
+            Err(ConfigError::Invalid(e)) => assert_eq!(
+                e,
+                ["capture.buffer_dir = auto: no fixed local drive found; set a folder"]
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 }
