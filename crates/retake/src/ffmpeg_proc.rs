@@ -11,7 +11,9 @@ use retake_core::config::Priority;
 use retake_core::progress::{Stats, parse_stats};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS};
+use windows::Win32::System::Threading::{
+    BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
+};
 
 use crate::child::ChildJob;
 
@@ -21,7 +23,8 @@ pub const GRACE: Duration = Duration::from_secs(3);
 /// The creation flag for `capture.priority`.
 pub fn priority_class(p: Priority) -> PROCESS_CREATION_FLAGS {
     match p {
-        Priority::Normal => PROCESS_CREATION_FLAGS(0),
+        // Explicit: with no class flag a child inherits a below-normal parent's class.
+        Priority::Normal => NORMAL_PRIORITY_CLASS,
         Priority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
     }
 }

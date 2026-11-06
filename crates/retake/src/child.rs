@@ -66,7 +66,8 @@ impl ChildJob {
 
     /// Like [`Self::spawn_logged`], but stdin is piped (ffmpeg stops on `q`) and every stderr
     /// line goes to `on_stderr` instead of the log. `priority` is a priority-class creation flag
-    /// (`PROCESS_CREATION_FLAGS(0)` for normal).
+    /// (`NORMAL_PRIORITY_CLASS` for normal: with no class flag the child inherits a below-normal
+    /// or idle parent's class).
     pub fn spawn_supervised<S: AsRef<OsStr>>(
         &self,
         exe: &Path,
@@ -284,7 +285,7 @@ mod tests {
         let job = ChildJob::new().unwrap();
         for (flag, want) in [
             (BELOW_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS.0),
-            (PROCESS_CREATION_FLAGS(0), NORMAL_PRIORITY_CLASS.0),
+            (NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS.0),
         ] {
             let mut child = job
                 .spawn_supervised(
