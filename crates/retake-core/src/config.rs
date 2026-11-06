@@ -50,6 +50,16 @@ pub enum Preset {
     Quality,
 }
 
+/// Source of the game audio track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameSource {
+    /// Windows captures only the game's own audio, by process id (build 19041+).
+    Process,
+    /// Plain loopback of the output device: every system sound, no game process id used.
+    Device,
+}
+
 /// CPU priority class of the recording ffmpeg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +90,8 @@ pub struct Capture {
 #[serde(deny_unknown_fields)]
 pub struct Audio {
     pub game: bool,
+    /// Where the game track comes from.
+    pub game_source: GameSource,
     pub mic: bool,
     pub mic_device: String,
     pub mic_gate_db: f32,
@@ -399,6 +411,14 @@ preset = \"fast\""
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn game_source_defaults_to_process() {
+        assert_eq!(load_str("").unwrap().audio.game_source, GameSource::Process);
+        let c = load_str("[audio]\ngame_source = \"device\"").unwrap();
+        assert_eq!(c.audio.game_source, GameSource::Device);
+        assert!(load_str("[audio]\ngame_source = \"window\"").is_err());
     }
 
     #[test]

@@ -338,6 +338,8 @@ impl Loop {
             qp_p: cap.qp_p,
             buffer_dir: cap.buffer_dir.clone(),
             buffer_secs: cap.buffer_secs,
+            audio: Vec::new(),
+            origin_us: 0,
         }
     }
 

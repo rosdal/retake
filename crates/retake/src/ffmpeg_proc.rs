@@ -214,6 +214,8 @@ mod tests {
             qp_p: 18,
             buffer_dir: t.path().to_path_buf(),
             buffer_secs: 6,
+            audio: Vec::new(),
+            origin_us: 0,
         };
         let mut a = args(&[
             "-hide_banner",
@@ -287,6 +289,8 @@ mod tests {
             qp_p: 18,
             buffer_dir: t.path().to_path_buf(),
             buffer_secs: 6,
+            audio: Vec::new(),
+            origin_us: 0,
         };
         let job = ChildJob::new().unwrap();
         let mut f =
