@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use retake_core::Ms;
-use retake_core::buffer::{clear_dir, low_space_warning};
+use retake_core::buffer::clear_dir;
 use retake_core::config::Capture;
 use retake_core::ffmpeg_args::capture_args;
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, TrayStatus, Watcher, game_running, tray_status};
 
 use crate::child::ChildJob;
-use crate::drive::free_bytes;
+use crate::drive::warn_if_low_space;
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
 use crate::procs::process_names;
 
@@ -35,13 +35,15 @@ pub struct Setup {
 }
 
 enum Event {
-    Stats(Stats),
+    /// A stats line from ffmpeg run number `.0`.
+    Stats(u64, Stats),
     Shutdown,
 }
 
+/// The recorder thread. Dropping it stops ffmpeg gracefully and waits for the thread.
 pub struct Recorder {
     tx: Sender<Event>,
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Recorder {
@@ -52,13 +54,22 @@ impl Recorder {
             .name("recorder".into())
             .spawn(move || Loop::new(setup, stats_tx).run(rx))
             .context("spawning recorder thread")?;
-        Ok(Recorder { tx, thread })
+        Ok(Recorder {
+            tx,
+            thread: Some(thread),
+        })
     }
 
-    /// Stops ffmpeg gracefully and waits for the thread.
-    pub fn shutdown(self) {
+    /// Stops ffmpeg gracefully and waits for the thread (the same as dropping it).
+    pub fn shutdown(self) {}
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
         let _ = self.tx.send(Event::Shutdown);
-        if self.thread.join().is_err() {
+        if let Some(t) = self.thread.take()
+            && t.join().is_err()
+        {
             tracing::error!("recorder thread panicked");
         }
     }
@@ -72,6 +83,8 @@ struct Loop {
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
+    /// Counts ffmpeg starts; tags stats so a previous run's late lines are ignored.
+    run: u64,
     last_stats: Option<Stats>,
     shown: Option<TrayStatus>,
 }
@@ -88,6 +101,7 @@ impl Loop {
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
+            run: 0,
             last_stats: None,
             shown: None,
         }
@@ -103,7 +117,7 @@ impl Loop {
         self.publish();
         loop {
             match rx.recv_timeout(TICK) {
-                Ok(Event::Stats(st)) => self.on_stats(st),
+                Ok(Event::Stats(run, st)) => self.on_stats(run, st),
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -140,9 +154,13 @@ impl Loop {
         }
     }
 
-    fn on_stats(&mut self, st: Stats) {
+    fn on_stats(&mut self, run: u64, st: Stats) {
+        // A stopped or crashed ffmpeg's last lines can arrive after it is gone or replaced.
+        if self.ffmpeg.is_none() || run != self.run {
+            return;
+        }
         self.last_stats = Some(st);
-        match self.speed.observe(self.now(), st.speed) {
+        match self.speed.observe(self.now(), st.time) {
             Some(SpeedEvent::FallingBehind) => {
                 tracing::warn!(speed = st.speed, fps = st.fps, "encoder falling behind")
             }
@@ -157,19 +175,6 @@ impl Loop {
             match c {
                 Command::StartSession => {
                     tracing::info!("game running; starting recording");
-                    let dir = &self.s.capture.buffer_dir;
-                    match clear_dir(dir) {
-                        Ok(n) => tracing::info!(deleted = n, "buffer cleared"),
-                        Err(e) => tracing::warn!("clearing {}: {e}", dir.display()),
-                    }
-                    match free_bytes(dir) {
-                        Ok(free) => {
-                            if let Some(w) = low_space_warning(free, dir) {
-                                tracing::warn!("{w}");
-                            }
-                        }
-                        Err(e) => tracing::warn!("{e:#}"),
-                    }
                     cmd = self.spawn(now);
                 }
                 Command::Respawn => {
@@ -191,10 +196,23 @@ impl Loop {
         }
     }
 
+    /// Empties the buffer and starts a new ffmpeg run. The buffer is emptied on a respawn too:
+    /// the new run starts again at `seg_00` with timestamps from 0, so old segments left
+    /// behind would no longer line up with `index.csv`.
     fn spawn(&mut self, now: Ms) -> Option<Command> {
+        let dir = &self.s.capture.buffer_dir;
+        match clear_dir(dir) {
+            Ok(n) => tracing::info!(deleted = n, "buffer cleared"),
+            Err(e) => tracing::warn!("clearing {}: {e}", dir.display()),
+        }
+        warn_if_low_space(dir);
+        self.run += 1;
+        self.speed.reset();
+        self.last_stats = None;
         let tx = self.stats_tx.clone();
+        let run = self.run;
         let on_stats = move |st| {
-            let _ = tx.send(Event::Stats(st));
+            let _ = tx.send(Event::Stats(run, st));
         };
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &self.args, on_stats) {
             Ok(f) => {

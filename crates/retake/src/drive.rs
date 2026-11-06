@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use retake_core::buffer::DriveKind;
+use retake_core::buffer::{DriveKind, low_space_warning};
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumePathNameW};
 use windows::core::{HSTRING, PCWSTR};
 
@@ -41,6 +41,18 @@ pub fn free_bytes(dir: &Path) -> Result<u64> {
     unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir.as_os_str()), Some(&mut free), None, None) }
         .with_context(|| format!("GetDiskFreeSpaceExW({})", dir.display()))?;
     Ok(free)
+}
+
+/// Logs a warning if `dir`'s drive has less free space than the buffer wants.
+pub fn warn_if_low_space(dir: &Path) {
+    match free_bytes(dir) {
+        Ok(free) => {
+            if let Some(w) = low_space_warning(free, dir) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!("{e:#}"),
+    }
 }
 
 #[cfg(test)]

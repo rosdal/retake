@@ -42,7 +42,8 @@ pub fn check_output(outputs: &[OutputInfo], output: u32, fps: u32) -> Result<Vec
         ));
     };
     let mut warnings = Vec::new();
-    if o.refresh_hz < fps {
+    // Windows rounds fractional modes down (143.98 Hz → 143), so allow 1 Hz; 0 = unknown.
+    if o.refresh_hz != 0 && o.refresh_hz + 1 < fps {
         warnings.push(format!(
             "monitor {} ({}) runs at {} Hz, below capture.fps = {fps}: frames will repeat",
             o.index, o.name, o.refresh_hz
@@ -104,6 +105,22 @@ mod tests {
                 r"monitor 0 (\.\DISPLAY1) has Windows HDR on: colours will be off and files larger",
             ]
         );
+    }
+
+    #[test]
+    fn fractional_modes_rounded_down_are_fine() {
+        // Windows reports 143.98 Hz as 143 and 59.94 Hz as 59.
+        assert_eq!(check_output(&[out(0, 143, false)], 0, 144), Ok(vec![]));
+        assert_eq!(check_output(&[out(0, 59, false)], 0, 60), Ok(vec![]));
+        assert_eq!(
+            check_output(&[out(0, 142, false)], 0, 144).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_refresh_rate_is_not_a_warning() {
+        assert_eq!(check_output(&[out(0, 0, false)], 0, 120), Ok(vec![]));
     }
 
     #[test]

@@ -29,7 +29,8 @@ pub enum Phase {
 pub enum Command {
     /// A session begins: empty the buffer folder, then start ffmpeg.
     StartSession,
-    /// ffmpeg died mid-session: start it again, keeping the buffer.
+    /// ffmpeg died mid-session: empty the buffer (the new run's segments and index start over)
+    /// and start it again.
     Respawn,
     /// The session is over: stop ffmpeg gracefully.
     StopSession,
