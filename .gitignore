@@ -5,3 +5,4 @@ third_party/ffmpeg/
 /config.toml
 crates/*/config.toml
 third_party/presentmon/
+/bench/
