@@ -1,5 +1,3 @@
-// Used from the saver thread and wiring added next; removed once they land.
-#![allow(dead_code)]
 //! Saving clips: copy the chosen segments out of the ring, check none was overwritten while
 //! copying, join them with ffmpeg (stream copy) and publish the file under its final name.
 

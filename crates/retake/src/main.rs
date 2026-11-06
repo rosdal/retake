@@ -19,10 +19,11 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::process::{Child, ExitCode};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
 use retake_core::buffer::{drive_problem, write_readme};
+use retake_core::clip::{Kind, Press};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
 use retake_core::display::check_output;
 use retake_core::watcher::TrayStatus;
@@ -33,6 +34,7 @@ use windows::core::{HSTRING, w};
 use crate::child::ChildJob;
 use crate::instance::SingleInstance;
 use crate::recorder::Recorder;
+use crate::saver::{ClipDirs, Saver, SaverMsg, SaverSetup, SessionSlot};
 
 struct Args {
     console: bool,
@@ -180,6 +182,50 @@ fn main() -> ExitCode {
         }
     }
 
+    let dirs = ClipDirs::new(&config.clips.out_dir);
+    if let Err(e) = dirs.prepare() {
+        return fatal(&format!(
+            "Preparing {}: {e}",
+            config.clips.out_dir.display()
+        ));
+    }
+    let session: SessionSlot = Arc::default();
+
+    // Both strings were validated with the config, so a failure here is a bug.
+    let mut specs = Vec::new();
+    let mut kinds = Vec::new();
+    for (label, kind) in [
+        (&config.clips.hotkey, Kind::Normal),
+        (&config.clips.hotkey_full, Kind::Full),
+    ] {
+        match retake_core::hotkey::parse(label) {
+            Ok(key) => {
+                specs.push(tray::HotkeySpec {
+                    label: label.clone(),
+                    key,
+                });
+                kinds.push(kind);
+            }
+            Err(e) => return fatal(&format!("clips hotkey {label}: {e}")),
+        }
+    }
+    let (press_tx, press_rx) = mpsc::channel();
+    let cue = config.clips.sound_cue;
+    let hotkey_tx = press_tx.clone();
+    let on_hotkey = move |i: usize| {
+        let Some(&kind) = kinds.get(i) else { return };
+        let p = Press {
+            at: clock::wall_ms(),
+            stamp: clock::local_stamp(),
+            kind,
+        };
+        if hotkey_tx.send(SaverMsg::Press(p)).is_err() {
+            tracing::warn!("saver is not running; press ignored");
+        } else if cue {
+            sound::play_press();
+        }
+    };
+
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -187,11 +233,33 @@ fn main() -> ExitCode {
     };
     let recorder: Rc<RefCell<Option<Recorder>>> = Rc::default();
     let slot = recorder.clone();
+    let saver: Rc<RefCell<Option<Saver>>> = Rc::default();
+    let saver_slot = saver.clone();
     let setup_job = job.clone();
     let capture = config.capture.clone();
     let processes = config.game.processes.clone();
+    let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
     let on_ready = move |notifier: tray::TrayNotifier| {
+        let saver_setup = SaverSetup {
+            ffmpeg: ffmpeg.clone(),
+            job: setup_job.clone(),
+            dirs,
+            session: session.clone(),
+            pre_roll,
+            post_roll,
+            buffer_secs: capture.buffer_secs,
+            on_saved: Box::new(move |p: &Path| {
+                notifier.clip_saved(p.to_path_buf());
+                if cue {
+                    sound::play_saved();
+                }
+            }),
+        };
+        match Saver::start(saver_setup, press_tx, press_rx) {
+            Ok(s) => *saver_slot.borrow_mut() = Some(s),
+            Err(e) => tracing::error!("{e:#}"),
+        }
         let setup = recorder::Setup {
             ffmpeg,
             capture,
@@ -199,7 +267,7 @@ fn main() -> ExitCode {
             warning,
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),
-            session: Arc::default(),
+            session,
         };
         match Recorder::start(setup) {
             Ok(r) => *slot.borrow_mut() = Some(r),
@@ -211,6 +279,8 @@ fn main() -> ExitCode {
     };
     let shutdown = move || {
         tracing::info!(children = children.len(), "shutting down");
+        // The saver first: it reads the buffer the recorder is about to stop writing.
+        drop(saver.borrow_mut().take());
         if let Some(r) = recorder.borrow_mut().take() {
             r.shutdown();
         }
@@ -224,7 +294,7 @@ fn main() -> ExitCode {
         drop(guard); // flushes the log file
     };
 
-    match tray::run(paths, Vec::new(), |_| {}, on_ready, shutdown) {
+    match tray::run(paths, specs, on_hotkey, on_ready, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         // Already logged by tray::run, whose exit hook has closed the log.
         Err(e) => error_box(&format!("{e:#}")),

@@ -1,5 +1,3 @@
-// Used from the saver thread and wiring added next; removed once they land.
-#![allow(dead_code)]
 //! Wall-clock time for presses and sessions, and the local time a clip is named after.
 
 use std::time::{SystemTime, UNIX_EPOCH};

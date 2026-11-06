@@ -1,5 +1,3 @@
-// Wired to the hotkeys in the next commit.
-#![allow(dead_code)]
 //! The press and saved cues, played asynchronously from memory.
 
 use std::sync::LazyLock;

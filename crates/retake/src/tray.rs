@@ -107,7 +107,6 @@ impl TrayNotifier {
         };
     }
 
-    #[allow(dead_code)] // wired up with the saver in the next commit
     /// Remembers `path` for "Open last clip" and enables that item.
     pub fn clip_saved(&self, path: PathBuf) {
         *LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
