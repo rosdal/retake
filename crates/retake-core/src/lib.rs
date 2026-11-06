@@ -2,6 +2,7 @@
 pub mod buffer;
 pub mod clip;
 pub mod config;
+pub mod cue;
 pub mod display;
 pub mod ffmpeg_args;
 pub mod ffmpeg_caps;
