@@ -266,6 +266,8 @@ pub struct SaverSetup {
     pub buffer_secs: u32,
     /// Called on the saver thread with each finished clip.
     pub on_saved: Box<dyn Fn(&Path) + Send>,
+    /// Called with the reason when a clip could not be saved. The buffer keeps running.
+    pub on_failed: Box<dyn Fn(&str) + Send>,
 }
 
 /// The saver thread: collects presses, waits out each clip's post-roll, saves one clip at a
@@ -348,7 +350,10 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
             let cancelled = || stop.load(Ordering::Relaxed);
             match save(&job, &s.session, &s.dirs, &concat, &cancelled) {
                 Ok(path) => (s.on_saved)(&path),
-                Err(e) => tracing::warn!(id = job.id, "clip not saved: {e:#}"),
+                Err(e) => {
+                    tracing::warn!(id = job.id, "clip not saved: {e:#}");
+                    (s.on_failed)(&format!("{e:#}"));
+                }
             }
         }
     }

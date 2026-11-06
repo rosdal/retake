@@ -96,6 +96,11 @@ impl Ffmpeg {
         unsafe { GetProcessMemoryInfo(HANDLE(self.child.as_raw_handle()), &mut c, c.cb) }.ok()?;
         Some(c.WorkingSetSize as u64)
     }
+
+    /// ffmpeg's open handle count, for `--diag`.
+    pub fn handle_count(&self) -> Option<u32> {
+        crate::diag::handle_count(HANDLE(self.child.as_raw_handle()))
+    }
 }
 
 #[cfg(test)]

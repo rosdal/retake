@@ -198,8 +198,8 @@ pub fn audio_input_args(c: &CaptureSetup) -> Vec<String> {
             "s16le",
             "-ar",
             "48000",
-            "-ac",
-            "2",
+            "-ch_layout",
+            "stereo",
             "-thread_queue_size",
             "1024",
             "-i",
@@ -218,7 +218,16 @@ pub fn map_args(c: &CaptureSetup) -> Vec<String> {
     if c.audio.is_empty() {
         return Vec::new();
     }
-    let mut a = strs(&["-map", "[v]", "-fps_mode:v", "passthrough"]);
+    // A 90 kHz encoder time base (the MPEG-TS clock): with the default 1/fps, two frames
+    // stamped within one frame period would collide.
+    let mut a = strs(&[
+        "-map",
+        "[v]",
+        "-fps_mode:v",
+        "passthrough",
+        "-enc_time_base:v",
+        "1/90000",
+    ]);
     for k in 0..c.audio.len() {
         a.extend(["-map".into(), format!("{k}:a")]);
     }
@@ -298,8 +307,8 @@ mod tests {
                 "s16le",
                 "-ar",
                 "48000",
-                "-ac",
-                "2",
+                "-ch_layout",
+                "stereo",
                 "-thread_queue_size",
                 "1024",
                 "-i",
@@ -308,8 +317,8 @@ mod tests {
                 "s16le",
                 "-ar",
                 "48000",
-                "-ac",
-                "2",
+                "-ch_layout",
+                "stereo",
                 "-thread_queue_size",
                 "1024",
                 "-i",
@@ -318,6 +327,8 @@ mod tests {
                 "[v]",
                 "-fps_mode:v",
                 "passthrough",
+                "-enc_time_base:v",
+                "1/90000",
                 "-map",
                 "0:a",
                 "-map",

@@ -24,8 +24,8 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{
-    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    STGM_READ,
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM_READ,
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
@@ -315,6 +315,23 @@ fn friendly_name(dev: &IMMDevice) -> Result<String> {
         let store = dev.OpenPropertyStore(STGM_READ)?;
         let pv = store.GetValue(&PKEY_Device_FriendlyName)?;
         Ok(pv.Anonymous.Anonymous.Anonymous.pwszVal.to_string()?)
+    }
+}
+
+/// The id of the default output (`render`) or capture device, to notice a switch.
+pub fn default_device_id(render: bool) -> Option<String> {
+    // SAFETY: COM init for this call; the guard uninitialises it.
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .ok()?;
+    let _com = ComGuard;
+    let dev = default_device(render).ok()?;
+    // SAFETY: GetId returns a CoTaskMem string we free after copying it.
+    unsafe {
+        let id = dev.GetId().ok()?;
+        let s = id.to_string().ok();
+        CoTaskMemFree(Some(id.0 as *const _));
+        s
     }
 }
 

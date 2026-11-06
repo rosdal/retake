@@ -25,10 +25,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, HICON, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CONTEXTMENU, WM_ENDSESSION,
-    WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+    WM_CONTEXTMENU, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -188,11 +189,22 @@ struct Shown {
     tip: String,
 }
 
+/// Called with `true` on sleep and `false` on resume.
+type PowerHandler = Box<dyn Fn(bool)>;
+
 thread_local! {
     static STATE: RefCell<Option<LoopState>> = const { RefCell::new(None) };
     static SHOWN: RefCell<Option<Shown>> = const { RefCell::new(None) };
     /// The "TaskbarCreated" message Explorer broadcasts when it (re)starts.
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    /// Called with `true` when the PC is about to sleep and `false` when it has resumed.
+    static ON_POWER: RefCell<Option<PowerHandler>> = const { RefCell::new(None) };
+}
+
+/// Sets what happens on sleep (`true`) and resume (`false`). Call on the tray thread, e.g. from
+/// `on_ready`.
+pub fn set_power_handler(f: impl Fn(bool) + 'static) {
+    ON_POWER.with(|p| *p.borrow_mut() = Some(Box::new(f)));
 }
 
 /// Runs `on_exit` once, whichever way we leave.
@@ -356,6 +368,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
+        WM_POWERBROADCAST => {
+            let suspending = match wparam.0 as u32 {
+                PBT_APMSUSPEND => Some(true),
+                PBT_APMRESUMEAUTOMATIC => Some(false),
+                _ => None,
+            };
+            if let Some(s) = suspending {
+                ON_POWER.with(|p| {
+                    if let Some(f) = p.borrow().as_ref() {
+                        f(s);
+                    }
+                });
+            }
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 // The process may be terminated as soon as we return, so shut down here.

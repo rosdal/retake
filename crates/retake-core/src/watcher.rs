@@ -116,6 +116,23 @@ impl Watcher {
         None
     }
 
+    /// Stops a session at once, skipping the debounce: the PC is about to sleep or the disk is
+    /// full. The caller keeps feeding `running = false` until it may record again.
+    pub fn stop_now(&mut self, now: Ms) -> Option<Command> {
+        self.respawn_at = None;
+        match self.phase {
+            Phase::Recording | Phase::Stopping => {
+                self.enter(Phase::Idle, now);
+                Some(Command::StopSession)
+            }
+            Phase::Starting => {
+                self.enter(Phase::Idle, now);
+                None
+            }
+            Phase::Idle | Phase::Failed => None,
+        }
+    }
+
     /// Call regularly; fires a due restart.
     pub fn on_tick(&mut self, now: Ms) -> Option<Command> {
         match self.respawn_at {
@@ -158,6 +175,22 @@ mod tests {
     use super::*;
     use Command::*;
     use Phase::*;
+
+    #[test]
+    fn stop_now_skips_the_debounce_and_cancels_a_respawn() {
+        let mut w = Watcher::new();
+        w.on_game(0, true);
+        assert_eq!(w.on_game(5_000, true), Some(StartSession));
+        w.on_ffmpeg_exit(6_000);
+        assert_eq!(w.stop_now(6_100), Some(StopSession));
+        assert_eq!(w.phase(), Idle);
+        assert_eq!(w.on_tick(10_000), None);
+        // Starting just goes back to idle; nothing was running.
+        w.on_game(20_000, true);
+        assert_eq!(w.stop_now(21_000), None);
+        assert_eq!(w.phase(), Idle);
+        assert_eq!(w.stop_now(22_000), None);
+    }
 
     /// A watcher that has just started recording at t = 5 000.
     fn recording() -> Watcher {

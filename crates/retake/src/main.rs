@@ -4,6 +4,7 @@ mod audio_pump;
 mod background;
 mod child;
 mod clock;
+mod diag;
 mod display;
 mod drive;
 mod ffmpeg;
@@ -16,6 +17,7 @@ mod recorder;
 mod saver;
 mod setup_check;
 mod sound;
+mod sync_check;
 mod sysinfo;
 mod tray;
 mod window;
@@ -44,6 +46,8 @@ use crate::saver::{ClipDirs, Saver, SaverMsg, SaverSetup, SessionSlot};
 
 struct Args {
     console: bool,
+    /// `--diag`: log memory and handle counts every 5 minutes.
+    diag: bool,
     /// `--save` / `--save-full`: ask the running Retake for a clip, then exit.
     save: Option<bool>,
     dummy_child: bool,
@@ -54,6 +58,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         console: false,
+        diag: false,
         save: None,
         dummy_child: false,
         unknown: Vec::new(),
@@ -61,6 +66,7 @@ fn parse_args() -> Args {
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--console" => args.console = true,
+            "--diag" => args.diag = true,
             "--save" => args.save = Some(false),
             "--save-full" => args.save = Some(true),
             "--dummy-child" => args.dummy_child = true,
@@ -100,7 +106,37 @@ fn ensure_config(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// `retake.exe sync-check …`: a command-line tool, not the recorder. Prints to the console it
+/// was started from.
+fn sync_check_main(words: &[String]) -> ExitCode {
+    // SAFETY: plain Win32 calls; failure just means no console output.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            let _ = AllocConsole();
+        }
+    }
+    let run = || -> Result<bool> {
+        let args = sync_check::parse(words)?;
+        let exe = std::env::current_exe().context("finding Retake's own folder")?;
+        let ffmpeg = ffmpeg::locate(exe.parent().unwrap_or(Path::new(".")))?;
+        let report = sync_check::run(&ffmpeg, &args)?;
+        Ok(retake_core::sync::passes(&report))
+    };
+    match run() {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("sync-check: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    let words: Vec<String> = std::env::args().skip(1).collect();
+    if words.first().is_some_and(|w| w == "sync-check") {
+        return sync_check_main(&words[1..]);
+    }
     let args = parse_args();
     if args.console {
         // SAFETY: plain Win32 calls; failure just means no console output.
@@ -310,6 +346,7 @@ fn main() -> ExitCode {
     let setup_job = job.clone();
     let capture = config.capture.clone();
     let audio = config.audio.clone();
+    let diag = args.diag;
     let processes = config.game.processes.clone();
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
@@ -328,6 +365,7 @@ fn main() -> ExitCode {
                     sound::play_saved();
                 }
             }),
+            on_failed: Box::new(|why: &str| instance::toast(&format!("Clip not saved: {why}"))),
         };
         match Saver::start(saver_setup, press_tx, press_rx) {
             Ok(s) => *saver_slot.borrow_mut() = Some(s),
@@ -338,6 +376,7 @@ fn main() -> ExitCode {
             encoder,
             capture,
             audio,
+            diag,
             processes,
             warning,
             job: setup_job,
@@ -350,7 +389,15 @@ fn main() -> ExitCode {
             }),
         };
         match Recorder::start(setup) {
-            Ok(r) => *slot.borrow_mut() = Some(r),
+            Ok(r) => {
+                *slot.borrow_mut() = Some(r);
+                let power_slot = slot.clone();
+                tray::set_power_handler(move |suspending| {
+                    if let Some(r) = power_slot.borrow().as_ref() {
+                        r.power(suspending);
+                    }
+                });
+            }
             Err(e) => {
                 tracing::error!("{e:#}");
                 notifier.set(TrayStatus::Failed);
