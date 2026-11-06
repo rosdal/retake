@@ -914,6 +914,7 @@ dependencies = [
  "anyhow",
  "retake-core",
  "tauri-winrt-notification",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

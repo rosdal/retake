@@ -4,6 +4,7 @@ mod child;
 mod display;
 mod drive;
 mod ffmpeg;
+mod ffmpeg_proc;
 mod instance;
 mod logging;
 mod procs;
