@@ -7,14 +7,24 @@ use std::process::{Child, ChildStdin, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use retake_core::config::Priority;
 use retake_core::progress::{Stats, parse_stats};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS};
 
 use crate::child::ChildJob;
 
 /// How long ffmpeg gets to finish after `q` before it is terminated.
 pub const GRACE: Duration = Duration::from_secs(3);
+
+/// The creation flag for `capture.priority`.
+pub fn priority_class(p: Priority) -> PROCESS_CREATION_FLAGS {
+    match p {
+        Priority::Normal => PROCESS_CREATION_FLAGS(0),
+        Priority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+    }
+}
 
 pub struct Ffmpeg {
     child: Child,
@@ -28,12 +38,15 @@ impl Ffmpeg {
         job: &ChildJob,
         exe: &Path,
         args: &[String],
+        priority: Priority,
         on_stats: impl Fn(Stats) + Send + 'static,
     ) -> Result<Ffmpeg> {
-        let mut child = job.spawn_supervised(exe, args, move |line| match parse_stats(line) {
-            Some(s) => on_stats(s),
-            None => tracing::warn!(target: "ffmpeg", "{line}"),
-        })?;
+        let flag = priority_class(priority);
+        let mut child =
+            job.spawn_supervised(exe, args, flag, move |line| match parse_stats(line) {
+                Some(s) => on_stats(s),
+                None => tracing::warn!(target: "ffmpeg", "{line}"),
+            })?;
         let stdin = child.stdin.take();
         Ok(Ffmpeg { child, stdin })
     }
@@ -104,6 +117,7 @@ mod tests {
             &job,
             Path::new("ping.exe"),
             &args(&["-n", "30", "127.0.0.1"]),
+            Priority::Normal,
             |_| {},
         )
         .unwrap();
@@ -119,7 +133,14 @@ mod tests {
     #[test]
     fn exited_reports_a_finished_child() {
         let job = ChildJob::new().unwrap();
-        let mut f = Ffmpeg::spawn(&job, &cmd(), &args(&["/C", "exit 4"]), |_| {}).unwrap();
+        let mut f = Ffmpeg::spawn(
+            &job,
+            &cmd(),
+            &args(&["/C", "exit 4"]),
+            Priority::Normal,
+            |_| {},
+        )
+        .unwrap();
         let start = Instant::now();
         let status = loop {
             if let Some(s) = f.exited() {
@@ -141,6 +162,7 @@ mod tests {
             &job,
             &cmd(),
             &[String::from("/C"), format!("echo {line} 1>&2")],
+            Priority::Normal,
             move |s| sink.lock().unwrap().push(s),
         )
         .unwrap();
@@ -160,6 +182,7 @@ mod tests {
             &job,
             Path::new("ping.exe"),
             &args(&["-n", "5", "127.0.0.1"]),
+            Priority::Normal,
             |_| {},
         )
         .unwrap();
@@ -212,7 +235,10 @@ mod tests {
         let stats = Arc::new(Mutex::new(0));
         let n = stats.clone();
         let job = ChildJob::new().unwrap();
-        let mut f = Ffmpeg::spawn(&job, &exe, &a, move |_| *n.lock().unwrap() += 1).unwrap();
+        let mut f = Ffmpeg::spawn(&job, &exe, &a, Priority::Normal, move |_| {
+            *n.lock().unwrap() += 1
+        })
+        .unwrap();
         std::thread::sleep(Duration::from_secs(9));
         assert!(f.exited().is_none(), "ffmpeg died early");
         let start = Instant::now();
@@ -260,7 +286,8 @@ mod tests {
             buffer_secs: 6,
         };
         let job = ChildJob::new().unwrap();
-        let mut f = Ffmpeg::spawn(&job, &exe, &capture_args(&cap), |_| {}).unwrap();
+        let mut f =
+            Ffmpeg::spawn(&job, &exe, &capture_args(&cap), Priority::Normal, |_| {}).unwrap();
         std::thread::sleep(Duration::from_secs(5));
         assert!(
             f.exited().is_none(),

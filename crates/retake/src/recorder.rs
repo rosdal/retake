@@ -366,9 +366,10 @@ impl Loop {
         tracing::info!(args = %args.join(" "), "ffmpeg command");
         self.current = Some(setup);
         let start = now_ms();
-        match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, on_stats) {
+        let priority = self.s.capture.priority;
+        match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, priority, on_stats) {
             Ok(f) => {
-                tracing::info!(pid = f.pid(), "ffmpeg recording");
+                tracing::info!(pid = f.pid(), ?priority, "ffmpeg recording");
                 *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
                     run: self.run,
                     start,
