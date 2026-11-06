@@ -232,4 +232,45 @@ mod tests {
         );
         assert!(*stats.lock().unwrap() >= 5, "stats lines not parsed");
     }
+
+    /// The real capture command (desktop duplication into this GPU's own encoder) records.
+    /// Needs `scripts/fetch-ffmpeg.ps1` and a GPU with a hardware encoder, so it is opt-in:
+    /// `cargo test -- --ignored`. ffmpeg 7.1.1's AMF encoder rejected ddagrab's BGRA frames,
+    /// which only a test on an AMD GPU could show.
+    #[test]
+    #[ignore = "needs the pinned ffmpeg and a hardware encoder"]
+    fn pinned_ffmpeg_records_the_desktop_with_this_gpus_encoder() {
+        use retake_core::autoconf::{EncoderSetting, pick_encoder};
+        use retake_core::ffmpeg_args::{CaptureSetup, capture_args};
+        let exe =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin\ffmpeg.exe");
+        let (vendor, outputs) = crate::display::adapter().unwrap();
+        let encoder = pick_encoder(EncoderSetting::Auto, vendor).unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let cap = CaptureSetup {
+            output: outputs[0].index,
+            fps: 60,
+            encoder,
+            codec: retake_core::config::Codec::Hevc,
+            qp_i: 16,
+            qp_p: 18,
+            buffer_dir: t.path().to_path_buf(),
+            buffer_secs: 6,
+        };
+        let job = ChildJob::new().unwrap();
+        let mut f = Ffmpeg::spawn(&job, &exe, &capture_args(&cap), |_| {}).unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(
+            f.exited().is_none(),
+            "{encoder}: ffmpeg exited; see its warnings above"
+        );
+        assert!(f.stop(GRACE), "did not stop on q");
+        let written = std::fs::read_dir(t.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".ts"))
+            .filter(|e| e.metadata().is_ok_and(|m| m.len() > 0))
+            .count();
+        assert!(written >= 2, "{encoder}: only {written} segments written");
+    }
 }

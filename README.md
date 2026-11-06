@@ -32,7 +32,7 @@ Most clippers make you choose: lightweight but manual (ShadowPlay, Adrenalin, OB
 | **Automatic clips** | After each match, every kill is clipped. Multi-kills become **one clip from your first kill to your last**, named for the play: `_2K`, `_3K`, `_4K`, `_ACE`. Choose every kill, 2K and up, 3K and up, or aces only. |
 | **Smart manual clips** | Pressed `F9` a bit late on a 3K? Retake extends the clip back to your first kill of the round. |
 | **Automatic grading** | Each clip gets its exposure and colour corrected and a clean, punchy look. Raw clips are kept unless you choose to overwrite them. |
-| **Edit-ready** | 120–240 fps, near-lossless HEVC or AV1, game / mic / Discord on separate tracks, kill markers for your editor. |
+| **Edit-ready** | 120–240 fps, near-lossless HEVC (AV1 later), game / mic / Discord on separate tracks, kill markers for your editor. |
 | **Montages (optional)** | Pick a song and some clips; Retake puts your best play on the drop, lands every kill on a beat, and adds speed ramps, slow-mo and motion blur. Exports 9:16 for TikTok or 16:9 for YouTube, plus a DaVinci Resolve timeline. Never automatic; your clips stay untouched. |
 | **Any game, any GPU** | Works with any game. AMD (AMF), NVIDIA (NVENC) and Intel (QSV) hardware encoders. |
 | **Simple interface** | One window and a tray icon. No terminal, no config files to edit. |

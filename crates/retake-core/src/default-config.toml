@@ -17,13 +17,13 @@ fps           = "auto"
 # Hardware encoder: "amf" (AMD), "qsv" (Intel), "nvenc" (NVIDIA), or "auto":
 # the one for your GPU.
 encoder       = "auto"
-# "hevc" or "av1".
+# "hevc". ("av1" isn't supported yet: clips can't be saved from it.)
 codec         = "hevc"
 # Constant QP for I- and P-frames, 0–51, lower is better. qp_i must be <= qp_p.
 qp_i          = 16
 qp_p          = 18
 # Where the ring buffer segments go, or "auto": Retake/buffer on the fastest
-# local drive with at least 100 GB free. A folder of your own should be on a fast
+# local drive with at least 20 GB free. A folder of your own should be on a fast
 # NVMe drive outside OneDrive, excluded from Defender real-time scanning,
 # e.g. "D:/Retake/buffer".
 buffer_dir    = "auto"
