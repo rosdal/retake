@@ -26,7 +26,22 @@ pub struct CaptureSetup {
     pub preset: Preset,
     pub buffer_dir: PathBuf,
     pub buffer_secs: u32,
+    /// Audio pipes, in track order. Empty = video only.
+    pub audio: Vec<AudioInput>,
+    /// The run's origin in Unix microseconds: video and audio timestamps both count from it.
+    /// Only used with audio.
+    pub origin_us: i64,
 }
+
+/// One audio track: a named pipe carrying 48 kHz s16le stereo, and its title in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInput {
+    pub pipe: String,
+    pub title: &'static str,
+}
+
+/// AAC bitrate per audio track.
+pub const AUDIO_BITRATE: &str = "256k";
 
 /// Segments needed to hold `buffer_secs`, rounded up.
 pub fn segment_count(buffer_secs: u32) -> u32 {
@@ -37,11 +52,23 @@ fn strs(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// The capture source. With audio, frames are restamped with ffmpeg's wall clock counted from
+/// the run's origin: ddagrab counts from its own first frame, a moment nobody outside ffmpeg
+/// knows, while the audio pump places samples by their capture time from that same origin.
 fn ddagrab(c: &CaptureSetup) -> String {
-    format!(
+    let mut s = format!(
         "ddagrab=output_idx={}:framerate={}:draw_mouse=0",
         c.output, c.fps
-    )
+    );
+    if !c.audio.is_empty() {
+        s.push_str(&format!(",setpts=(RTCTIME-{})/(TB*1000000)", c.origin_us));
+    }
+    s
+}
+
+/// The filter graph's video output label, needed for `-map` once there are audio inputs.
+fn video_label(c: &CaptureSetup) -> &'static str {
+    if c.audio.is_empty() { "" } else { "[v]" }
 }
 
 /// Desktop Duplication of monitor `output` at `fps`, without the cursor. AMF and NVENC take the
@@ -51,7 +78,7 @@ pub fn input_args(c: &CaptureSetup) -> Vec<String> {
     match c.encoder {
         Encoder::Amf | Encoder::Nvenc => {
             let mut a = strs(&["-init_hw_device", "d3d11va", "-filter_complex"]);
-            a.push(ddagrab(c));
+            a.push(format!("{}{}", ddagrab(c), video_label(c)));
             a
         }
         Encoder::Qsv => {
@@ -64,7 +91,11 @@ pub fn input_args(c: &CaptureSetup) -> Vec<String> {
                 "dx",
                 "-filter_complex",
             ]);
-            a.push(format!("{},hwmap=derive_device=qsv,format=qsv", ddagrab(c)));
+            a.push(format!(
+                "{},hwmap=derive_device=qsv,format=qsv{}",
+                ddagrab(c),
+                video_label(c)
+            ));
             a
         }
     }
@@ -158,6 +189,46 @@ pub fn segment_args(c: &CaptureSetup) -> Vec<String> {
     a
 }
 
+/// One raw PCM input per audio pipe (inputs 0..n, timestamped by sample count).
+pub fn audio_input_args(c: &CaptureSetup) -> Vec<String> {
+    let mut a = Vec::new();
+    for t in &c.audio {
+        a.extend(strs(&[
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-thread_queue_size",
+            "1024",
+            "-i",
+        ]));
+        a.push(t.pipe.clone());
+    }
+    a
+}
+
+/// Maps the video and each audio track, encodes audio as AAC and titles the tracks. Empty
+/// without audio: ffmpeg then maps the filter graph's only output by itself.
+///
+/// With audio the video keeps its wall-clock timestamps (`passthrough`): re-gridding them to
+/// a constant frame rate drifted the picture by about 100 ms over 20 s against the audio.
+pub fn map_args(c: &CaptureSetup) -> Vec<String> {
+    if c.audio.is_empty() {
+        return Vec::new();
+    }
+    let mut a = strs(&["-map", "[v]", "-fps_mode:v", "passthrough"]);
+    for k in 0..c.audio.len() {
+        a.extend(["-map".into(), format!("{k}:a")]);
+    }
+    a.extend(strs(&["-c:a", "aac", "-b:a", AUDIO_BITRATE]));
+    for (k, t) in c.audio.iter().enumerate() {
+        a.extend([format!("-metadata:s:a:{k}"), format!("title={}", t.title)]);
+    }
+    a
+}
+
 /// The full ring-buffer command line (after the exe name).
 pub fn capture_args(c: &CaptureSetup) -> Vec<String> {
     let mut a = strs(&[
@@ -169,6 +240,8 @@ pub fn capture_args(c: &CaptureSetup) -> Vec<String> {
         "1",
     ]);
     a.extend(input_args(c));
+    a.extend(audio_input_args(c));
+    a.extend(map_args(c));
     a.extend(encoder_args(c));
     a.extend(segment_args(c));
     a
@@ -190,7 +263,105 @@ mod tests {
             preset: Preset::Speed,
             buffer_dir: PathBuf::from(r"C:\buf"),
             buffer_secs: 60,
+            audio: Vec::new(),
+            origin_us: 0,
         }
+    }
+
+    fn with_audio(n: usize) -> CaptureSetup {
+        let titles = ["Game", "Mic", "Comms"];
+        CaptureSetup {
+            audio: (0..n)
+                .map(|k| AudioInput {
+                    pipe: format!(r"\\.\pipe\retake_{k}"),
+                    title: titles[k],
+                })
+                .collect(),
+            origin_us: 1_700_000_000_000_000,
+            ..amf()
+        }
+    }
+
+    #[test]
+    fn game_and_mic_tracks() {
+        let a = capture_args(&with_audio(2));
+        let v = a.iter().position(|s| s == "-c:v").unwrap();
+        assert_eq!(
+            a[6..v],
+            [
+                "-init_hw_device",
+                "d3d11va",
+                "-filter_complex",
+                "ddagrab=output_idx=0:framerate=120:draw_mouse=0,\
+                 setpts=(RTCTIME-1700000000000000)/(TB*1000000)[v]",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-thread_queue_size",
+                "1024",
+                "-i",
+                r"\\.\pipe\retake_0",
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-thread_queue_size",
+                "1024",
+                "-i",
+                r"\\.\pipe\retake_1",
+                "-map",
+                "[v]",
+                "-fps_mode:v",
+                "passthrough",
+                "-map",
+                "0:a",
+                "-map",
+                "1:a",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "256k",
+                "-metadata:s:a:0",
+                "title=Game",
+                "-metadata:s:a:1",
+                "title=Mic",
+            ]
+        );
+        // Everything from the video encoder on is the same as without audio.
+        let plain = capture_args(&amf());
+        let pv = plain.iter().position(|s| s == "-c:v").unwrap();
+        assert_eq!(a[v..], plain[pv..]);
+    }
+
+    #[test]
+    fn comms_is_a_third_track() {
+        let a = capture_args(&with_audio(3));
+        assert!(a.windows(2).any(|w| w == ["-map", "2:a"]));
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["-metadata:s:a:2", "title=Comms"])
+        );
+        assert_eq!(a.iter().filter(|s| *s == "-i").count(), 3);
+    }
+
+    #[test]
+    fn qsv_with_audio_labels_after_hwmap() {
+        let c = CaptureSetup {
+            encoder: Encoder::Qsv,
+            ..with_audio(1)
+        };
+        let i = input_args(&c);
+        assert!(
+            i.last()
+                .unwrap()
+                .ends_with(",hwmap=derive_device=qsv,format=qsv[v]")
+        );
+        assert!(i.last().unwrap().contains(",setpts=(RTCTIME-"));
     }
 
     #[test]

@@ -227,6 +227,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "object",
+ "retake-audio",
  "retake-core",
  "tauri-winrt-notification",
  "tempfile",
@@ -234,6 +235,17 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows",
+]
+
+[[package]]
+name = "retake-audio"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "retake-core",
+ "tracing",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

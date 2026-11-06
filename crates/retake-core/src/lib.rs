@@ -1,4 +1,5 @@
 //! Pure, platform-independent logic for Retake. No Windows APIs here.
+pub mod audio;
 pub mod autoconf;
 pub mod buffer;
 pub mod clip;

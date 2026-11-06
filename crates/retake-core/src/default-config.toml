@@ -35,8 +35,11 @@ buffer_dir    = "auto"
 buffer_secs   = 60
 
 [audio]
-# Process loopback on Siege (track 1).
+# Game audio (track 1).
 game          = true
+# "process": only the game's own sound (Windows 10 2004 or later; older Windows
+# falls back to "device"). "device": everything your speakers play.
+game_source   = "process"
 # Microphone (track 2).
 mic           = true
 mic_device    = "default"
