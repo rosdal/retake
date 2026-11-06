@@ -35,7 +35,8 @@ mic_gate_db   = -50
 comms         = false
 
 [clips]
-# Where saved clips go, e.g. "D:/Retake/clips".
+# Where saved clips go, e.g. "D:/Retake/clips". Finished clips land in its raw/ folder;
+# tmp/ is scratch space while saving.
 out_dir       = "clips"
 # Seconds kept before and after the trigger.
 pre_roll      = 15

@@ -11,14 +11,16 @@ use anyhow::{Context, Result};
 use retake_core::Ms;
 use retake_core::buffer::clear_dir;
 use retake_core::config::Capture;
-use retake_core::ffmpeg_args::capture_args;
+use retake_core::ffmpeg_args::{capture_args, segment_count};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, TrayStatus, Watcher, game_running, tray_status};
 
 use crate::child::ChildJob;
+use crate::clock::wall_ms;
 use crate::drive::warn_if_low_space;
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
 use crate::procs::process_names;
+use crate::saver::{Session, SessionSlot};
 
 const TICK: Duration = Duration::from_millis(250);
 const POLL: Ms = 2_000;
@@ -32,6 +34,8 @@ pub struct Setup {
     pub warning: bool,
     pub job: Arc<ChildJob>,
     pub notify: Box<dyn Fn(TrayStatus) + Send>,
+    /// The current ffmpeg run, for the saver.
+    pub session: SessionSlot,
 }
 
 enum Event {
@@ -200,6 +204,8 @@ impl Loop {
     /// the new run starts again at `seg_00` with timestamps from 0, so old segments left
     /// behind would no longer line up with `index.csv`.
     fn spawn(&mut self, now: Ms) -> Option<Command> {
+        // Before the buffer is emptied, so a save in progress sees the run end.
+        *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let dir = &self.s.capture.buffer_dir;
         match clear_dir(dir) {
             Ok(n) => tracing::info!(deleted = n, "buffer cleared"),
@@ -214,9 +220,16 @@ impl Loop {
         let on_stats = move |st| {
             let _ = tx.send(Event::Stats(run, st));
         };
+        let start = wall_ms();
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &self.args, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), "ffmpeg recording");
+                *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
+                    run: self.run,
+                    start,
+                    buffer_dir: self.s.capture.buffer_dir.clone(),
+                    wrap: segment_count(self.s.capture.buffer_secs),
+                });
                 self.ffmpeg = Some(f);
                 None
             }

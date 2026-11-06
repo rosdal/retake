@@ -5,18 +5,23 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use retake_core::hotkey::Hotkey;
 use retake_core::watcher::TrayStatus;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostMessageW,
     PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+    WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, w};
 
@@ -30,6 +35,16 @@ pub struct TrayPaths {
 
 const WM_TRAY_MENU: u32 = WM_APP + 1;
 const WM_TRAY_STATUS: u32 = WM_APP + 2;
+const WM_TRAY_CLIP: u32 = WM_APP + 3;
+
+/// One hotkey to register; `label` is the config text, used in warnings.
+pub struct HotkeySpec {
+    pub label: String,
+    pub key: Hotkey,
+}
+
+/// The newest saved clip, written by the saver thread, read by "Open last clip".
+static LAST_CLIP: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 const STATUSES: [TrayStatus; 4] = [
     TrayStatus::Idle,
@@ -46,13 +61,36 @@ fn status_from_wparam(w: usize) -> Option<TrayStatus> {
     STATUSES.get(w).copied()
 }
 
-/// Icon colour and tooltip for each status.
-fn look(s: TrayStatus) -> ([u8; 3], &'static str) {
-    match s {
+/// Icon colour and tooltip for a status, plus a hotkey problem if there is one. The problem
+/// is a second tooltip line; it turns an idle icon yellow but never hides red (recording).
+fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
+    const YELLOW: [u8; 3] = [234, 179, 8];
+    let (rgb, tip) = match s {
         TrayStatus::Idle => ([140, 140, 140], "Retake — idle"),
         TrayStatus::Recording => ([220, 38, 38], "Retake — recording"),
-        TrayStatus::Warning => ([234, 179, 8], "Retake — warning, see the log"),
-        TrayStatus::Failed => ([234, 179, 8], "Retake — recording failed, see the log"),
+        TrayStatus::Warning => (YELLOW, "Retake — warning, see the log"),
+        TrayStatus::Failed => (YELLOW, "Retake — recording failed, see the log"),
+    };
+    match problem {
+        Some(p) => {
+            let rgb = if s == TrayStatus::Idle { YELLOW } else { rgb };
+            (rgb, format!("{tip}\n{p}"))
+        }
+        None => (rgb, tip.to_owned()),
+    }
+}
+
+/// The tray line for hotkeys that could not be registered.
+fn hotkey_problem(failed: &[&str]) -> Option<String> {
+    match failed {
+        [] => None,
+        [one] => Some(format!(
+            "Hotkey {one} unavailable — another app may be using it"
+        )),
+        many => Some(format!(
+            "Hotkeys {} unavailable — another app may be using them",
+            many.join(", ")
+        )),
     }
 }
 
@@ -72,6 +110,20 @@ impl TrayNotifier {
             )
         };
     }
+
+    /// Remembers `path` for "Open last clip" and enables that item.
+    pub fn clip_saved(&self, path: PathBuf) {
+        *LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        // SAFETY: the window lives for the whole run; posting is thread-safe.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(self.0 as *mut _)),
+                WM_TRAY_CLIP,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +132,7 @@ enum Action {
     OpenClips = 1,
     OpenLogs = 2,
     Quit = 3,
+    OpenLastClip = 4,
 }
 
 impl Action {
@@ -89,6 +142,7 @@ impl Action {
             Self::OpenClips,
             Self::OpenLogs,
             Self::Quit,
+            Self::OpenLastClip,
         ]
         .into_iter()
         .find(|a| *a as usize == w)
@@ -98,11 +152,15 @@ impl Action {
 struct LoopState {
     paths: TrayPaths,
     on_exit: Option<Box<dyn FnOnce()>>,
+    on_hotkey: Box<dyn Fn(usize)>,
+    /// Hotkeys that could not be registered, as a tooltip line.
+    problem: Option<String>,
 }
 
 thread_local! {
     static STATE: RefCell<Option<LoopState>> = const { RefCell::new(None) };
     static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+    static LAST_ITEM: RefCell<Option<MenuItem>> = const { RefCell::new(None) };
 }
 
 /// Runs `on_exit` once, whichever way we leave.
@@ -130,7 +188,8 @@ fn open(path: &std::path::Path, fallback_notepad: bool) {
 }
 
 fn set_status(s: TrayStatus) {
-    let (rgb, tip) = look(s);
+    let problem = STATE.with(|st| st.borrow().as_ref().and_then(|st| st.problem.clone()));
+    let (rgb, tip) = look(s, problem.as_deref());
     TRAY.with(|t| {
         if let Some(tray) = t.borrow().as_ref() {
             if let Err(e) = icon(rgb).and_then(|i| tray.set_icon(Some(i)).map_err(Into::into)) {
@@ -150,6 +209,12 @@ fn on_menu(action: Action) {
         Action::OpenConfig => open(&paths.config, true),
         Action::OpenClips => open(&paths.clips, false),
         Action::OpenLogs => open(&paths.logs, false),
+        Action::OpenLastClip => {
+            let last = LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(p) = last {
+                open(&p, false);
+            }
+        }
         Action::Quit => {
             tracing::info!("quit from tray");
             // SAFETY: called on the message-loop thread.
@@ -170,6 +235,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = status_from_wparam(wparam.0) {
                 set_status(s);
             }
+            LRESULT(0)
+        }
+        WM_TRAY_CLIP => {
+            LAST_ITEM.with(|i| {
+                if let Some(i) = i.borrow().as_ref() {
+                    i.set_enabled(true);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_HOTKEY => {
+            // The callback only sends on a channel and plays a sound; it never touches the
+            // tray state, so calling it under this shared borrow is fine.
+            STATE.with(|s| {
+                if let Some(st) = s.borrow().as_ref() {
+                    (st.on_hotkey)(wparam.0);
+                }
+            });
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
@@ -242,6 +325,8 @@ fn icon(rgb: [u8; 3]) -> Result<Icon> {
 /// error reaches the log even when `on_exit` flushes and closes it.
 pub fn run(
     paths: TrayPaths,
+    hotkeys: Vec<HotkeySpec>,
+    on_hotkey: impl Fn(usize) + 'static,
     on_ready: impl FnOnce(TrayNotifier) + 'static,
     on_exit: impl FnOnce() + 'static,
 ) -> Result<()> {
@@ -249,9 +334,11 @@ pub fn run(
         *s.borrow_mut() = Some(LoopState {
             paths,
             on_exit: Some(Box::new(on_exit)),
+            on_hotkey: Box::new(on_hotkey),
+            problem: None,
         })
     });
-    let result = run_loop(on_ready);
+    let result = run_loop(&hotkeys, on_ready);
     if let Err(e) = &result {
         tracing::error!("tray failed: {e:#}");
     }
@@ -259,11 +346,34 @@ pub fn run(
     result
 }
 
-fn run_loop(on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
+fn run_loop(hotkeys: &[HotkeySpec], on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
     let hwnd = create_hidden_window()?;
     let hwnd_raw = hwnd.0 as isize;
 
+    let mut failed = Vec::new();
+    for (i, h) in hotkeys.iter().enumerate() {
+        let mods = HOT_KEY_MODIFIERS(h.key.modifiers) | MOD_NOREPEAT;
+        // SAFETY: our own window; the id is unique per hotkey.
+        match unsafe { RegisterHotKey(Some(hwnd), i as i32, mods, h.key.vk) } {
+            Ok(()) => tracing::info!(hotkey = %h.label, "hotkey registered"),
+            Err(e) => {
+                tracing::warn!(hotkey = %h.label, "RegisterHotKey failed: {e}");
+                failed.push(h.label.as_str());
+            }
+        }
+    }
+    let problem = hotkey_problem(&failed);
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.problem = problem.clone();
+        }
+    });
+
     let items = [
+        (
+            MenuItem::new("Open last clip", false, None),
+            Action::OpenLastClip,
+        ),
         (MenuItem::new("Open config", true, None), Action::OpenConfig),
         (
             MenuItem::new("Open clips folder", true, None),
@@ -273,9 +383,11 @@ fn run_loop(on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
         (MenuItem::new("Quit", true, None), Action::Quit),
     ];
     let menu = Menu::new();
-    menu.append_items(&[&items[0].0, &items[1].0, &items[2].0])?;
+    menu.append(&items[0].0)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&items[3].0)?;
+    menu.append_items(&[&items[1].0, &items[2].0, &items[3].0])?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&items[4].0)?;
 
     let ids: Vec<_> = items.iter().map(|(i, a)| (i.id().clone(), *a)).collect();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -293,7 +405,7 @@ fn run_loop(on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
         }
     }));
 
-    let (rgb, tip) = look(TrayStatus::Idle);
+    let (rgb, tip) = look(TrayStatus::Idle, problem.as_deref());
     let tray = TrayIconBuilder::new()
         .with_tooltip(tip)
         .with_icon(icon(rgb)?)
@@ -301,6 +413,7 @@ fn run_loop(on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
         .build()
         .context("creating tray icon")?;
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
+    LAST_ITEM.with(|i| *i.borrow_mut() = Some(items[0].0.clone()));
     tracing::info!("tray ready");
     on_ready(TrayNotifier(hwnd_raw));
 
@@ -337,16 +450,50 @@ mod tests {
 
     #[test]
     fn colours_are_grey_red_yellow() {
-        assert_eq!(look(TrayStatus::Idle).0, [140, 140, 140]);
-        assert_eq!(look(TrayStatus::Recording).0, [220, 38, 38]);
-        assert_eq!(look(TrayStatus::Warning).0, [234, 179, 8]);
-        assert_eq!(look(TrayStatus::Warning).0, look(TrayStatus::Failed).0);
+        assert_eq!(look(TrayStatus::Idle, None).0, [140, 140, 140]);
+        assert_eq!(look(TrayStatus::Recording, None).0, [220, 38, 38]);
+        assert_eq!(look(TrayStatus::Warning, None).0, [234, 179, 8]);
+        assert_eq!(look(TrayStatus::Failed, None).0, [234, 179, 8]);
+        assert_eq!(look(TrayStatus::Recording, None).1, "Retake — recording");
+    }
+
+    #[test]
+    fn hotkey_problem_adds_a_line_and_keeps_recording_red() {
+        let p = hotkey_problem(&["F9"]).unwrap();
+        assert_eq!(p, "Hotkey F9 unavailable — another app may be using it");
+        let (rgb, tip) = look(TrayStatus::Recording, Some(&p));
+        assert_eq!(rgb, [220, 38, 38], "recording must stay visible");
+        assert_eq!(tip, format!("Retake — recording\n{p}"));
+        let (rgb, tip) = look(TrayStatus::Idle, Some(&p));
+        assert_eq!(rgb, [234, 179, 8], "idle shows the warning");
+        assert_eq!(tip, format!("Retake — idle\n{p}"));
+        assert_eq!(
+            hotkey_problem(&["F9", "Ctrl+F9"]).unwrap(),
+            "Hotkeys F9, Ctrl+F9 unavailable — another app may be using them"
+        );
+        assert_eq!(hotkey_problem(&[]), None);
+    }
+
+    #[test]
+    fn actions_round_trip() {
+        for a in [
+            Action::OpenConfig,
+            Action::OpenClips,
+            Action::OpenLogs,
+            Action::Quit,
+            Action::OpenLastClip,
+        ] {
+            assert_eq!(
+                Action::from_wparam(a as usize).map(|x| x as usize),
+                Some(a as usize)
+            );
+        }
     }
 
     #[test]
     fn icon_builds_for_every_status() {
         for s in ALL {
-            icon(look(s).0).unwrap();
+            icon(look(s, None).0).unwrap();
         }
     }
 }
