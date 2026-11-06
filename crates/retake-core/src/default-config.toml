@@ -23,7 +23,7 @@ codec         = "hevc"
 qp_i          = 16
 qp_p          = 18
 # Where the ring buffer segments go, or "auto": Retake/buffer on the fastest
-# local drive with at least 100 GB free. A folder of your own should be on a fast
+# local drive with at least 20 GB free. A folder of your own should be on a fast
 # NVMe drive outside OneDrive, excluded from Defender real-time scanning,
 # e.g. "D:/Retake/buffer".
 buffer_dir    = "auto"

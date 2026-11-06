@@ -234,8 +234,10 @@ pub struct DriveInfo {
     pub used: bool,
 }
 
-/// Free space a drive needs to be preferred for the buffer and clips.
-pub const AUTO_DRIVE_MIN_FREE: u64 = 100 * 1024 * 1024 * 1024;
+/// Free space a drive needs to be preferred for the buffer and clips. The 60 s buffer takes
+/// 1–2 GB at 1440p240 near-lossless and a 20 s clip about 0.5 GB, so this holds the buffer
+/// and a few dozen clips. Below it a drive can still be picked; it just isn't preferred.
+pub const AUTO_DRIVE_MIN_FREE: u64 = 20 * 1024 * 1024 * 1024;
 
 /// The drive for `"auto"` folders. A drive Retake already uses keeps being used, so clips
 /// don't move to another drive as free space changes. Otherwise: among drives with at least
@@ -373,8 +375,14 @@ mod tests {
             drive("D:\\", 150, Speed::Nvme),
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
+        // 50 GB on NVMe is plenty: speed wins over a roomier HDD.
         let d = [
             drive("C:\\", 50, Speed::Nvme),
+            drive("E:\\", 400, Speed::Hdd),
+        ];
+        assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("C:\\"));
+        let d = [
+            drive("C:\\", 15, Speed::Nvme),
             drive("E:\\", 400, Speed::Hdd),
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("E:\\"));
@@ -384,8 +392,8 @@ mod tests {
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
         let d = [
-            drive("C:\\", 40, Speed::Nvme),
-            drive("D:\\", 60, Speed::Hdd),
+            drive("C:\\", 10, Speed::Nvme),
+            drive("D:\\", 15, Speed::Hdd),
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
         assert_eq!(pick_drive(&[]), None);
@@ -394,7 +402,7 @@ mod tests {
     #[test]
     fn drive_already_used_stays_picked() {
         let mut d = [
-            drive("C:\\", 90, Speed::Nvme),
+            drive("C:\\", 15, Speed::Nvme),
             drive("D:\\", 900, Speed::Hdd),
         ];
         assert_eq!(pick_drive(&d).unwrap().root, PathBuf::from("D:\\"));
