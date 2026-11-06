@@ -8,18 +8,25 @@
 processes     = ["RainbowSix.exe", "RainbowSix_Vulkan.exe"]
 
 [capture]
-# Monitor index for ddagrab (0 = primary).
-output        = 0
-# Capture frame rate: 60, 120, 144, 165 or 240.
-fps           = 120
-# "hevc" or "av1" (both on AMD AMF).
+# Monitor index for ddagrab, or "auto": the monitor Siege's window is on
+# (the main monitor until the window appears).
+output        = "auto"
+# Capture frame rate: 60, 120, 144, 165 or 240, or "auto": the fastest of those
+# the monitor shows.
+fps           = "auto"
+# Hardware encoder: "amf" (AMD), "qsv" (Intel), "nvenc" (NVIDIA), or "auto":
+# the one for your GPU.
+encoder       = "auto"
+# "hevc" or "av1".
 codec         = "hevc"
 # Constant QP for I- and P-frames, 0–51, lower is better. qp_i must be <= qp_p.
 qp_i          = 16
 qp_p          = 18
-# Where the ring buffer segments go. Use a fast NVMe drive outside OneDrive,
-# excluded from Defender real-time scanning, e.g. "D:/Retake/buffer".
-buffer_dir    = "buffer"
+# Where the ring buffer segments go, or "auto": Retake/buffer on the fastest
+# local drive with at least 100 GB free. A folder of your own should be on a fast
+# NVMe drive outside OneDrive, excluded from Defender real-time scanning,
+# e.g. "D:/Retake/buffer".
+buffer_dir    = "auto"
 # Length of the ring buffer. Must be >= pre_roll + post_roll + 4.
 buffer_secs   = 60
 
@@ -35,9 +42,10 @@ mic_gate_db   = -50
 comms         = false
 
 [clips]
-# Where saved clips go, e.g. "D:/Retake/clips". Finished clips land in its raw/ folder;
-# tmp/ is scratch space while saving.
-out_dir       = "clips"
+# Where saved clips go, e.g. "D:/Retake/clips", or "auto": Retake/clips on the
+# same drive choice as buffer_dir. Finished clips land in its raw/ folder; tmp/ is
+# scratch space while saving.
+out_dir       = "auto"
 # Seconds kept before and after the trigger.
 pre_roll      = 15
 post_roll     = 3

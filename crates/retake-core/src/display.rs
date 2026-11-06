@@ -14,6 +14,10 @@ pub struct OutputInfo {
     pub refresh_hz: u32,
     /// Windows HDR (BT.2020 PQ) is on.
     pub hdr: bool,
+    /// The monitor holding the desktop origin (Windows' main display).
+    pub primary: bool,
+    /// Its `HMONITOR` as a number, to match a window's monitor; 0 = unknown.
+    pub monitor: isize,
 }
 
 impl fmt::Display for OutputInfo {
@@ -70,6 +74,8 @@ mod tests {
             height: 1440,
             refresh_hz: hz,
             hdr,
+            primary: index == 0,
+            monitor: 0,
         }
     }
 

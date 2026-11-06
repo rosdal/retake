@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use retake_core::autoconf::Encoder;
 use retake_core::ffmpeg_caps::missing_features;
 
 use crate::child::run_capture;
@@ -31,11 +32,11 @@ pub fn locate(exe_dir: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Fails, naming every missing encoder and filter, if `ffmpeg` lacks a required feature.
-pub fn self_check(ffmpeg: &Path) -> Result<()> {
+/// Fails, naming every missing encoder and filter, if `ffmpeg` lacks what `encoder` needs.
+pub fn self_check(ffmpeg: &Path, encoder: Encoder) -> Result<()> {
     let encoders = run_capture(ffmpeg, &["-hide_banner", "-encoders"])?;
     let filters = run_capture(ffmpeg, &["-hide_banner", "-filters"])?;
-    let missing = missing_features(&encoders, &filters);
+    let missing = missing_features(&encoders, &filters, encoder);
     if !missing.is_empty() {
         bail!("{} is missing: {}", ffmpeg.display(), missing.join(", "));
     }
@@ -71,13 +72,15 @@ mod tests {
     fn pinned_ffmpeg_passes_self_check() {
         let p =
             Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin\ffmpeg.exe");
-        self_check(&p).unwrap();
+        for e in [Encoder::Amf, Encoder::Qsv, Encoder::Nvenc] {
+            self_check(&p, e).unwrap();
+        }
     }
 
     #[test]
     fn self_check_fails_on_a_non_ffmpeg() {
         let cmd = PathBuf::from(std::env::var("ComSpec").unwrap());
-        let err = self_check(&cmd).unwrap_err().to_string();
+        let err = self_check(&cmd, Encoder::Amf).unwrap_err().to_string();
         assert!(err.contains("hevc_amf") || err.contains("exited"), "{err}");
     }
 }

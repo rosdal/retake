@@ -527,15 +527,22 @@ mod tests {
     #[test]
     #[ignore]
     fn pinned_ffmpeg_saves_hevc_clips() {
-        use retake_core::config::load_str;
         use retake_core::ffmpeg_args::segment_args;
         let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin");
         let ffmpeg = bin.join("ffmpeg.exe");
         let t = tempfile::tempdir().unwrap();
         let buf = t.path().join("buffer");
         fs::create_dir(&buf).unwrap();
-        let mut cap = load_str("").unwrap().capture;
-        cap.buffer_dir = buf.clone();
+        let cap = retake_core::ffmpeg_args::CaptureSetup {
+            output: 0,
+            fps: 60,
+            encoder: retake_core::autoconf::Encoder::Amf,
+            codec: retake_core::config::Codec::Hevc,
+            qp_i: 16,
+            qp_p: 18,
+            buffer_dir: buf.clone(),
+            buffer_secs: 60,
+        };
         let mut args: Vec<String> = [
             "-hide_banner",
             "-loglevel",

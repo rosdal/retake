@@ -14,6 +14,7 @@ mod saver;
 mod sound;
 mod sysinfo;
 mod tray;
+mod window;
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -22,6 +23,7 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result};
+use retake_core::autoconf::{pick_drive, pick_encoder, pick_fps, pick_output};
 use retake_core::buffer::{drive_problem, write_readme};
 use retake_core::clip::{Kind, Press};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
@@ -126,22 +128,48 @@ fn main() -> ExitCode {
         Ok(false) => {}
         Err(e) => return fatal(&format!("{e:#}")),
     }
-    let config: Config = match config::load_file(&config_path) {
+    let pick_root = || {
+        let drives = drive::fixed_drives();
+        let d = pick_drive(&drives)?;
+        tracing::info!(
+            drive = %d.root.display(),
+            speed = %d.speed,
+            free_gb = d.free / (1024 * 1024 * 1024),
+            "auto: buffer and clips drive"
+        );
+        Some(d.root.clone())
+    };
+    let config: Config = match config::load_file(&config_path, &pick_root) {
         Ok(c) => c,
         Err(e) => return fatal(&e.to_string()),
     };
     tracing::info!(path = %config_path.display(), "config loaded");
 
-    let ffmpeg = match ffmpeg::locate(&exe_dir).and_then(|p| ffmpeg::self_check(&p).map(|()| p)) {
-        Ok(p) => p,
-        Err(e) => return fatal(&format!("{e:#}")),
-    };
-
-    let outputs = match display::outputs() {
-        Ok(o) => o,
+    let (vendor, outputs) = match display::adapter() {
+        Ok(a) => a,
         Err(e) => return fatal(&format!("Listing monitors: {e:#}")),
     };
-    let warnings = match check_output(&outputs, config.capture.output, config.capture.fps) {
+    let encoder = match pick_encoder(config.capture.encoder, vendor) {
+        Ok(e) => e,
+        Err(e) => return fatal(&e),
+    };
+    tracing::info!(%encoder, %vendor, setting = ?config.capture.encoder, "encoder");
+
+    let ffmpeg =
+        match ffmpeg::locate(&exe_dir).and_then(|p| ffmpeg::self_check(&p, encoder).map(|()| p)) {
+            Ok(p) => p,
+            Err(e) => return fatal(&format!("{e:#}")),
+        };
+
+    // An explicit monitor must exist; with "auto" the recorder decides per session.
+    let Some(output) = pick_output(config.capture.output, &outputs, None) else {
+        return fatal("No monitors found on the primary GPU");
+    };
+    let refresh = outputs
+        .iter()
+        .find(|o| o.index == output)
+        .map_or(0, |o| o.refresh_hz);
+    let warnings = match check_output(&outputs, output, pick_fps(config.capture.fps, refresh)) {
         Ok(w) => w,
         Err(e) => return fatal(&e),
     };
@@ -262,6 +290,7 @@ fn main() -> ExitCode {
         }
         let setup = recorder::Setup {
             ffmpeg,
+            encoder,
             capture,
             processes,
             warning,
