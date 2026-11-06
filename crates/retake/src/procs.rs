@@ -8,7 +8,6 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 
 /// Exe file names (e.g. `RainbowSix.exe`) of every running process.
-#[allow(dead_code)] // TODO(v0.2 task 8): used by the recorder
 pub fn process_names() -> Result<Vec<String>> {
     // SAFETY: the snapshot handle is closed below; `entry` is a properly sized out-struct.
     unsafe {

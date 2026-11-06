@@ -7,8 +7,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use retake_core::watcher::TrayStatus;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -28,6 +29,50 @@ pub struct TrayPaths {
 }
 
 const WM_TRAY_MENU: u32 = WM_APP + 1;
+const WM_TRAY_STATUS: u32 = WM_APP + 2;
+
+const STATUSES: [TrayStatus; 4] = [
+    TrayStatus::Idle,
+    TrayStatus::Recording,
+    TrayStatus::Warning,
+    TrayStatus::Failed,
+];
+
+fn status_to_wparam(s: TrayStatus) -> usize {
+    STATUSES.iter().position(|x| *x == s).expect("listed")
+}
+
+fn status_from_wparam(w: usize) -> Option<TrayStatus> {
+    STATUSES.get(w).copied()
+}
+
+/// Icon colour and tooltip for each status.
+fn look(s: TrayStatus) -> ([u8; 3], &'static str) {
+    match s {
+        TrayStatus::Idle => ([140, 140, 140], "Retake — idle"),
+        TrayStatus::Recording => ([220, 38, 38], "Retake — recording"),
+        TrayStatus::Warning => ([234, 179, 8], "Retake — warning, see the log"),
+        TrayStatus::Failed => ([234, 179, 8], "Retake — recording failed, see the log"),
+    }
+}
+
+/// Sets the tray status from any thread.
+#[derive(Clone, Copy)]
+pub struct TrayNotifier(isize);
+
+impl TrayNotifier {
+    pub fn set(&self, s: TrayStatus) {
+        // SAFETY: the window lives for the whole run; posting is thread-safe.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(self.0 as *mut _)),
+                WM_TRAY_STATUS,
+                WPARAM(status_to_wparam(s)),
+                LPARAM(0),
+            )
+        };
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -57,6 +102,7 @@ struct LoopState {
 
 thread_local! {
     static STATE: RefCell<Option<LoopState>> = const { RefCell::new(None) };
+    static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
 }
 
 /// Runs `on_exit` once, whichever way we leave.
@@ -83,6 +129,20 @@ fn open(path: &std::path::Path, fallback_notepad: bool) {
     }
 }
 
+fn set_status(s: TrayStatus) {
+    let (rgb, tip) = look(s);
+    TRAY.with(|t| {
+        if let Some(tray) = t.borrow().as_ref() {
+            if let Err(e) = icon(rgb).and_then(|i| tray.set_icon(Some(i)).map_err(Into::into)) {
+                tracing::warn!("setting tray icon: {e:#}");
+            }
+            if let Err(e) = tray.set_tooltip(Some(tip)) {
+                tracing::warn!("setting tray tooltip: {e}");
+            }
+        }
+    });
+}
+
 fn on_menu(action: Action) {
     let paths = STATE.with(|s| s.borrow().as_ref().map(|st| st.paths.clone()));
     let Some(paths) = paths else { return };
@@ -103,6 +163,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_TRAY_MENU => {
             if let Some(a) = Action::from_wparam(wparam.0) {
                 on_menu(a);
+            }
+            LRESULT(0)
+        }
+        WM_TRAY_STATUS => {
+            if let Some(s) = status_from_wparam(wparam.0) {
+                set_status(s);
             }
             LRESULT(0)
         }
@@ -155,8 +221,8 @@ fn create_hidden_window() -> Result<HWND> {
     }
 }
 
-/// A 32×32 icon drawn in code: a filled red circle with a soft edge.
-fn icon() -> Result<Icon> {
+/// A 32×32 icon drawn in code: a filled circle of colour `rgb` with a soft edge.
+fn icon(rgb: [u8; 3]) -> Result<Icon> {
     const N: u32 = 32;
     let mut rgba = Vec::with_capacity((N * N * 4) as usize);
     let c = (N as f32 - 1.0) / 2.0;
@@ -164,23 +230,28 @@ fn icon() -> Result<Icon> {
         for x in 0..N {
             let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
             let alpha = (14.5 - d).clamp(0.0, 1.0);
-            rgba.extend_from_slice(&[220, 38, 38, (alpha * 255.0) as u8]);
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8]);
         }
     }
     Icon::from_rgba(rgba, N, N).context("building tray icon")
 }
 
-/// Shows the tray icon and pumps messages until Quit or session end. `on_exit` runs exactly
+/// Shows the tray icon and pumps messages until Quit or session end. `on_ready` runs once the
+/// icon exists, with a handle for setting its status from any thread. `on_exit` runs exactly
 /// once on every way out, including setup failures; a failure is logged before it runs so the
 /// error reaches the log even when `on_exit` flushes and closes it.
-pub fn run(paths: TrayPaths, on_exit: impl FnOnce() + 'static) -> Result<()> {
+pub fn run(
+    paths: TrayPaths,
+    on_ready: impl FnOnce(TrayNotifier) + 'static,
+    on_exit: impl FnOnce() + 'static,
+) -> Result<()> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(LoopState {
             paths,
             on_exit: Some(Box::new(on_exit)),
         })
     });
-    let result = run_loop();
+    let result = run_loop(on_ready);
     if let Err(e) = &result {
         tracing::error!("tray failed: {e:#}");
     }
@@ -188,7 +259,7 @@ pub fn run(paths: TrayPaths, on_exit: impl FnOnce() + 'static) -> Result<()> {
     result
 }
 
-fn run_loop() -> Result<()> {
+fn run_loop(on_ready: impl FnOnce(TrayNotifier)) -> Result<()> {
     let hwnd = create_hidden_window()?;
     let hwnd_raw = hwnd.0 as isize;
 
@@ -222,13 +293,16 @@ fn run_loop() -> Result<()> {
         }
     }));
 
-    let _tray = TrayIconBuilder::new()
-        .with_tooltip("Retake")
-        .with_icon(icon()?)
+    let (rgb, tip) = look(TrayStatus::Idle);
+    let tray = TrayIconBuilder::new()
+        .with_tooltip(tip)
+        .with_icon(icon(rgb)?)
         .with_menu(Box::new(menu))
         .build()
         .context("creating tray icon")?;
+    TRAY.with(|t| *t.borrow_mut() = Some(tray));
     tracing::info!("tray ready");
+    on_ready(TrayNotifier(hwnd_raw));
 
     let mut msg = MSG::default();
     // SAFETY: standard message loop on the thread that owns the window.
@@ -238,5 +312,41 @@ fn run_loop() -> Result<()> {
             DispatchMessageW(&msg);
         }
     }
+    TRAY.with(|t| t.borrow_mut().take());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [TrayStatus; 4] = [
+        TrayStatus::Idle,
+        TrayStatus::Recording,
+        TrayStatus::Warning,
+        TrayStatus::Failed,
+    ];
+
+    #[test]
+    fn status_round_trips_through_wparam() {
+        for s in ALL {
+            assert_eq!(status_from_wparam(status_to_wparam(s)), Some(s));
+        }
+        assert_eq!(status_from_wparam(99), None);
+    }
+
+    #[test]
+    fn colours_are_grey_red_yellow() {
+        assert_eq!(look(TrayStatus::Idle).0, [140, 140, 140]);
+        assert_eq!(look(TrayStatus::Recording).0, [220, 38, 38]);
+        assert_eq!(look(TrayStatus::Warning).0, [234, 179, 8]);
+        assert_eq!(look(TrayStatus::Warning).0, look(TrayStatus::Failed).0);
+    }
+
+    #[test]
+    fn icon_builds_for_every_status() {
+        for s in ALL {
+            icon(look(s).0).unwrap();
+        }
+    }
 }

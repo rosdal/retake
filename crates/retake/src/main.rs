@@ -8,11 +8,15 @@ mod ffmpeg_proc;
 mod instance;
 mod logging;
 mod procs;
+mod recorder;
 mod sysinfo;
 mod tray;
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::process::{Child, ExitCode};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use retake_core::buffer::{drive_problem, low_space_warning, write_readme};
@@ -24,6 +28,7 @@ use windows::core::{HSTRING, w};
 
 use crate::child::ChildJob;
 use crate::instance::SingleInstance;
+use crate::recorder::Recorder;
 
 struct Args {
     console: bool,
@@ -155,7 +160,7 @@ fn main() -> ExitCode {
     }
 
     let job = match ChildJob::new() {
-        Ok(j) => j,
+        Ok(j) => Arc::new(j),
         Err(e) => return fatal(&format!("{e:#}")),
     };
     let mut children: Vec<Child> = Vec::new();
@@ -183,8 +188,31 @@ fn main() -> ExitCode {
         clips: config.clips.out_dir.clone(),
         logs: logging::log_dir(),
     };
+    let recorder: Rc<RefCell<Option<Recorder>>> = Rc::default();
+    let slot = recorder.clone();
+    let setup_job = job.clone();
+    let capture = config.capture.clone();
+    let processes = config.game.processes.clone();
+    let warning = !warnings.is_empty();
+    let on_ready = move |notifier: tray::TrayNotifier| {
+        let setup = recorder::Setup {
+            ffmpeg,
+            capture,
+            processes,
+            warning,
+            job: setup_job,
+            notify: Box::new(move |s| notifier.set(s)),
+        };
+        match Recorder::start(setup) {
+            Ok(r) => *slot.borrow_mut() = Some(r),
+            Err(e) => tracing::error!("{e:#}"),
+        }
+    };
     let shutdown = move || {
         tracing::info!(children = children.len(), "shutting down");
+        if let Some(r) = recorder.borrow_mut().take() {
+            r.shutdown();
+        }
         for mut c in children {
             let _ = c.kill();
             let _ = c.wait();
@@ -195,7 +223,7 @@ fn main() -> ExitCode {
         drop(guard); // flushes the log file
     };
 
-    match tray::run(paths, shutdown) {
+    match tray::run(paths, on_ready, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         // Already logged by tray::run, whose exit hook has closed the log.
         Err(e) => error_box(&format!("{e:#}")),

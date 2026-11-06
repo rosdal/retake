@@ -14,7 +14,6 @@ use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY
 use crate::child::ChildJob;
 
 /// How long ffmpeg gets to finish after `q` before it is terminated.
-#[allow(dead_code)] // TODO(v0.2 task 8): used by the recorder
 pub const GRACE: Duration = Duration::from_secs(3);
 
 pub struct Ffmpeg {
@@ -22,7 +21,6 @@ pub struct Ffmpeg {
     stdin: Option<ChildStdin>,
 }
 
-#[allow(dead_code)] // TODO(v0.2 task 8): used by the recorder
 impl Ffmpeg {
     /// Starts `exe args…`. Stats lines go to `on_stats`; every other stderr line is logged at
     /// `warn` (ffmpeg runs with `-loglevel warning`, so they are all warnings or errors).
