@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod child;
 mod clock;
 mod display;
@@ -11,6 +12,7 @@ mod logging;
 mod procs;
 mod recorder;
 mod saver;
+mod setup_check;
 mod sound;
 mod sysinfo;
 mod tray;
@@ -33,6 +35,7 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, Attac
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
 
+use crate::background::{Background, SharedGate};
 use crate::child::ChildJob;
 use crate::instance::SingleInstance;
 use crate::recorder::Recorder;
@@ -254,6 +257,17 @@ fn main() -> ExitCode {
         }
     };
 
+    // Game-time quiet mode: background work (the setup check, later grading and exports)
+    // only runs while Siege is closed.
+    let quiet: SharedGate = Arc::default();
+    let background = match Background::start(quiet.clone()) {
+        Ok(b) => b,
+        Err(e) => return fatal(&format!("{e:#}")),
+    };
+    let jobs = background.submitter();
+    let check_gate = quiet.clone();
+    jobs.submit("setup check", move || setup_check::run(&check_gate));
+
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -297,6 +311,11 @@ fn main() -> ExitCode {
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),
             session,
+            quiet: quiet.clone(),
+            on_session_end: Box::new(move || {
+                let gate = quiet.clone();
+                jobs.submit("setup check", move || setup_check::run(&gate));
+            }),
         };
         match Recorder::start(setup) {
             Ok(r) => *slot.borrow_mut() = Some(r),
@@ -313,6 +332,7 @@ fn main() -> ExitCode {
         if let Some(r) = recorder.borrow_mut().take() {
             r.shutdown();
         }
+        drop(background);
         for mut c in children {
             let _ = c.kill();
             let _ = c.wait();

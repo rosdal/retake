@@ -50,3 +50,74 @@ Game + mic audio ──────▶ buffer               ├─▶ your plays
 
 1. **Recording.** Retake starts when it sees a known game. It captures the screen with Windows Desktop Duplication and encodes on the GPU into a rolling buffer on disk. Game audio, mic and (optionally) Discord are captured as separate tracks.
 2. **Finding your plays.** `F9` saves the buffer any time. Automatic clips are found after the match, using the safest source each game offers:
+
+   | Source | Used for |
+   | --- | --- |
+   | The game's own event API | Counter-Strike 2 (Valve's Game State Integration), League of Legends (Riot's Live Client Data API) |
+   | The game's own replay files | Rainbow Six Siege (Match Replay files, parsed with [r6-dissect](https://github.com/redraskal/r6-dissect)) |
+   | Detection on Retake's own recording | Games with a kill feed and no API or replays; models ship with Retake |
+3. **Clipping.** Your kills are grouped per round, so a 3K is one clip from 15 s before the first kill to 3 s after the last.
+4. **Grading.** Each clip is measured, corrected and given the look, baked into one 3D LUT and rendered in 10-bit on the GPU.
+5. **Montages, if you want one.** The montage builder reads a song's beats and drop, arranges the clips you picked and renders the whole timeline in one GPU pass.
+
+## Anti-cheat safety
+ 
+Retake is designed to stay in the same category as OBS display capture and Discord screen share:
+ 
+- **Never touches a game's process.** No injection, no hooks, no memory reading, no overlay, no input automation, no kernel driver.
+- **Records the screen only while you play.** Replay parsing, kill detection and grading run after the game has closed.
+- **Strict safety mode.** One switch makes Retake avoid even targeting the game's process for audio.
+- **Ordinary, signed binaries.** No packing or obfuscation; hashes published with every release.
+- **Guarded in CI.** Builds fail if code uses process-memory or input-injection APIs.
+No third-party tool can be guaranteed safe with every anti-cheat. If you're unsure, use Strict safety mode.
+ 
+## Requirements
+ 
+- Windows 10 version 2004 or later, or Windows 11
+- A GPU with a hardware video encoder: AMD Radeon (RX 5000 series or newer recommended), NVIDIA GeForce (GTX 16 / RTX series) or Intel Arc / recent Intel iGPU
+- Games running in borderless or windowed fullscreen, with Windows HDR off for the game
+- For automatic Rainbow Six Siege clips: Match Replay enabled in Siege (Retake tells you if it isn't)
+- Free disk space for the buffer and your clips (an SSD is strongly recommended)
+
+## Install
+ 
+Not released yet. When it is: download the installer from [Releases](../../releases), run it, and start a game. There is nothing to configure.
+
+## Development
+ 
+Requires the stable Rust toolchain (`x86_64-pc-windows-msvc`) on Windows.
+ 
+```powershell
+./scripts/fetch-ffmpeg.ps1   # downloads the pinned ffmpeg into third_party/ffmpeg/
+cargo test
+cargo run -- --console       # runs with logs in the terminal
+```
+ 
+The workspace is split into `retake` (the app), `retake-core` (pure, tested logic), `retake-audio` (WASAPI capture) and `retake-detect` (play detection).
+ 
+## FAQ
+ 
+**Do I have to make montages?**
+No. Retake is a clipper first: every play is saved as its own clip. The montage builder is there if you want it.
+ 
+**Why not just use Medal, Outplayed or AMD's recorder?**
+They're good tools. Retake is for people who want automatic clips without an account, ads, a watermark or a heavy background app, and who want footage that holds up in a real editor.
+ 
+**Does Retake upload anything?**
+No. Clips stay on your PC unless you share them yourself.
+ 
+**Will it hurt my FPS?**
+Encoding runs on the GPU's dedicated video engine, and nothing else runs while you play. The target is under 3% average FPS loss; measured results will be published per release.
+ 
+**Can I get banned for using it?**
+Retake is built to avoid everything anti-cheat systems look for; see [Anti-cheat safety](#anti-cheat-safety). No third-party tool can promise zero risk.
+ 
+## Acknowledgements
+ 
+- [FFmpeg](https://ffmpeg.org) for capture, encoding and filtering
+- [r6-dissect](https://github.com/redraskal/r6-dissect) for Rainbow Six Siege replay parsing
+- [native-windows-gui](https://github.com/gabdube/native-windows-gui) for the interface
+- [blur](https://github.com/f0e/blur) and the frame-blending community for motion-blur techniques
+## License
+ 
+To be decided before the first release. Bundled third-party components keep their own licences; see `THIRD_PARTY_LICENSES.txt` in each release.

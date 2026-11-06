@@ -9,7 +9,9 @@ pub mod ffmpeg_args;
 pub mod ffmpeg_caps;
 pub mod hotkey;
 pub mod progress;
+pub mod quiet;
 pub mod segments;
+pub mod siege_settings;
 pub mod watcher;
 
 /// Milliseconds since an arbitrary start. Pure code takes time as a value so tests are exact.

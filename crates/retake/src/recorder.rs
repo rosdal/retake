@@ -17,6 +17,7 @@ use retake_core::ffmpeg_args::{CaptureSetup, capture_args, segment_count};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
 
+use crate::background::SharedGate;
 use crate::child::ChildJob;
 use crate::clock::wall_ms;
 use crate::drive::warn_if_low_space;
@@ -41,6 +42,10 @@ pub struct Setup {
     pub notify: Box<dyn Fn(TrayStatus) + Send>,
     /// The current ffmpeg run, for the saver.
     pub session: SessionSlot,
+    /// Game-time quiet mode, updated on every poll.
+    pub quiet: SharedGate,
+    /// Called when a recording session ends (the game closed).
+    pub on_session_end: Box<dyn Fn() + Send>,
 }
 
 enum Event {
@@ -149,6 +154,19 @@ impl Loop {
                             .map(|(p, _)| *p)
                             .collect();
                         let running = !self.game_pids.is_empty();
+                        let changed = self
+                            .s
+                            .quiet
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .on_game(running, wall_ms());
+                        match changed {
+                            Some(true) => tracing::info!("quiet mode on: game running"),
+                            Some(false) => {
+                                tracing::info!("game closed; background work may start in 30 s")
+                            }
+                            None => {}
+                        }
                         let cmd = self.watcher.on_game(now, running);
                         self.apply(cmd, now);
                         self.follow_game_window(now);
@@ -209,6 +227,7 @@ impl Loop {
                         f.stop(GRACE);
                     }
                     self.speed.reset();
+                    (self.s.on_session_end)();
                 }
                 Command::GiveUp => tracing::error!(
                     "ffmpeg crashed too often (5 restarts in 10 minutes); \
