@@ -9,8 +9,10 @@ mod display;
 mod drive;
 mod ffmpeg;
 mod ffmpeg_proc;
+mod grader;
 mod instance;
 mod logging;
+mod media;
 mod pipe;
 mod procs;
 mod recorder;
@@ -334,6 +336,27 @@ fn main() -> ExitCode {
     let check_gate = quiet.clone();
     jobs.submit("setup check", move || setup_check::run(&check_gate));
 
+    // Grading and exports: queued per saved clip, run only while the game is closed.
+    let grader = grader::Grader {
+        ffmpeg: ffmpeg.clone(),
+        encoder,
+        grade: config.grade.clone(),
+        blur: config.motion_blur.clone(),
+        out_dir: config.clips.out_dir.clone(),
+    };
+    if let Err(e) = grader.look() {
+        return fatal(&format!("grade.look: {e:#}"));
+    }
+    let media = media::Media::start(
+        grader,
+        jobs.clone(),
+        config.export.when,
+        config.export.presets.clone(),
+        config.clips.max_raw_gb,
+        instance::toast,
+    );
+    let saved_media = media.clone();
+
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -364,6 +387,7 @@ fn main() -> ExitCode {
                 if cue {
                     sound::play_saved();
                 }
+                saved_media.clip_saved(p);
             }),
             on_failed: Box::new(|why: &str| instance::toast(&format!("Clip not saved: {why}"))),
         };
@@ -371,6 +395,10 @@ fn main() -> ExitCode {
             Ok(s) => *saver_slot.borrow_mut() = Some(s),
             Err(e) => tracing::error!("{e:#}"),
         }
+        tray::set_media_handler(move |a| match a {
+            tray::MediaAction::ExportNow => media.export_now(),
+            tray::MediaAction::Regrade(p) => media.regrade(&p),
+        });
         let setup = recorder::Setup {
             ffmpeg,
             encoder,

@@ -26,6 +26,7 @@ pub struct Config {
     pub autoclip: Autoclip,
     pub grade: Grade,
     pub export: Export,
+    pub motion_blur: MotionBlur,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +108,9 @@ pub struct Clips {
     pub hotkey: String,
     pub hotkey_full: String,
     pub sound_cue: bool,
+    /// Delete the oldest raw clips that already have a graded version once raw clips take
+    /// more than this many GB. 0 = off.
+    pub max_raw_gb: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,25 +126,72 @@ pub struct Autoclip {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grade {
-    pub lut: PathBuf,
-    pub cas_strength: f32,
+    pub mode: GradeMode,
+    pub output: GradeOutput,
+    /// `save_as` only: `clip.mkv` → `clip<suffix>.mkv`.
+    pub suffix: String,
+    /// The look LUT: `"builtin"` (Retake's Siege look) or a `.cube` file.
+    pub look: PathBuf,
+    pub look_strength: f32,
+    pub auto_exposure: bool,
+    pub exposure_amount: f32,
+    pub auto_white_bal: bool,
+    pub wb_amount: f32,
+    pub contrast: f32,
+    pub vibrance: f32,
+    /// CAS strength, 0 = off.
+    pub sharpen: f32,
+    pub hud_mask: bool,
+    pub hud_protect: bool,
+    pub bit_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum GradeMode {
+    Off,
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeOutput {
+    /// Keep the raw clip; write the graded one next to it.
+    SaveAs,
+    /// Replace the raw clip once the graded one is written and checked.
+    Overwrite,
+}
+
+/// The look value that means Retake's built-in Siege look.
+pub const BUILTIN_LOOK: &str = "builtin";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExportWhen {
+    /// 30 s after the game closes (never during a match).
     AfterGame,
-    Immediately,
+    /// Only when asked from the tray.
     Manual,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Export {
-    pub auto: bool,
     pub when: ExportWhen,
+    /// Any of "edit", "edit-smooth", "share", "vertical".
     pub presets: Vec<String>,
-    pub keep_raw: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotionBlur {
+    pub enabled: bool,
+    /// Presets that get blur: "share" and/or "vertical", never "edit".
+    pub apply_to: Vec<String>,
+    pub output_fps: u32,
+    pub amount: f64,
+    /// "equal", "gaussian_sym" or "pyramid".
+    pub weighting: String,
 }
 
 /// Why a config could not be loaded.
@@ -267,6 +318,70 @@ pub fn validate(c: &Config) -> Vec<String> {
             clips.hotkey_full
         ));
     }
+    if clips.max_raw_gb.is_nan() || clips.max_raw_gb < 0.0 {
+        errs.push(format!(
+            "clips.max_raw_gb = {}: must be 0 or more",
+            clips.max_raw_gb
+        ));
+    }
+    let g = &c.grade;
+    for (name, v) in [
+        ("look_strength", g.look_strength),
+        ("exposure_amount", g.exposure_amount),
+        ("wb_amount", g.wb_amount),
+        ("vibrance", g.vibrance),
+        ("sharpen", g.sharpen),
+    ] {
+        if !(0.0..=1.0).contains(&v) {
+            errs.push(format!("grade.{name} = {v}: must be 0–1"));
+        }
+    }
+    if !(1.0..=1.3).contains(&g.contrast) {
+        errs.push(format!("grade.contrast = {}: must be 1.0–1.3", g.contrast));
+    }
+    if g.bit_depth != 8 && g.bit_depth != 10 {
+        errs.push(format!(
+            "grade.bit_depth = {}: must be 8 or 10",
+            g.bit_depth
+        ));
+    }
+    if g.suffix.is_empty() || g.suffix.contains(['/', '\\', ':']) {
+        errs.push(format!(
+            "grade.suffix = \"{}\": must be a non-empty file-name part",
+            g.suffix
+        ));
+    }
+    for p in &c.export.presets {
+        if crate::export::Preset::parse(p).is_none() {
+            errs.push(format!(
+                "export.presets: \"{p}\" is not one of edit, edit-smooth, share, vertical"
+            ));
+        }
+    }
+    let mb = &c.motion_blur;
+    for p in &mb.apply_to {
+        match crate::export::Preset::parse(p) {
+            Some(x) if x.blurrable() => {}
+            _ => errs.push(format!(
+                "motion_blur.apply_to: \"{p}\" must be \"share\" or \"vertical\" (edit exports keep their frames for slow-mo)"
+            )),
+        }
+    }
+    if !(24..=120).contains(&mb.output_fps) {
+        errs.push(format!(
+            "motion_blur.output_fps = {}: must be 24–120",
+            mb.output_fps
+        ));
+    }
+    if !(0.1..=3.0).contains(&mb.amount) {
+        errs.push(format!("motion_blur.amount = {}: must be 0.1–3", mb.amount));
+    }
+    if crate::export::Weighting::parse(&mb.weighting).is_none() {
+        errs.push(format!(
+            "motion_blur.weighting = \"{}\": must be equal, gaussian_sym or pyramid",
+            mb.weighting
+        ));
+    }
     errs
 }
 
@@ -286,10 +401,11 @@ pub fn resolve_paths(c: &mut Config, base: &Path) {
             *p = base.join(&*p);
         }
     }
-    for p in [&mut c.autoclip.template, &mut c.grade.lut] {
-        if p.is_relative() {
-            *p = base.join(&*p);
-        }
+    if c.autoclip.template.is_relative() {
+        c.autoclip.template = base.join(&c.autoclip.template);
+    }
+    if c.grade.look.is_relative() && c.grade.look != Path::new(BUILTIN_LOOK) {
+        c.grade.look = base.join(&c.grade.look);
     }
 }
 
@@ -414,6 +530,27 @@ preset = \"fast\""
     }
 
     #[test]
+    fn grade_defaults_and_rules() {
+        let c = load_str("").unwrap();
+        assert_eq!(c.grade.mode, GradeMode::On);
+        assert_eq!(c.grade.output, GradeOutput::SaveAs);
+        assert_eq!(c.export.presets, ["edit"]);
+        assert!(!c.motion_blur.enabled);
+        for bad in [
+            "[grade]\ncontrast = 1.5",
+            "[grade]\nbit_depth = 12",
+            "[grade]\nwb_amount = 2.0",
+            "[grade]\nsuffix = \"\"",
+            "[export]\npresets = [\"gif\"]",
+            "[motion_blur]\napply_to = [\"edit\"]",
+            "[motion_blur]\nweighting = \"box\"",
+            "[export]\nwhen = \"immediately\"",
+        ] {
+            assert!(load_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn game_source_defaults_to_process() {
         assert_eq!(load_str("").unwrap().audio.game_source, GameSource::Process);
         let c = load_str("[audio]\ngame_source = \"device\"").unwrap();
@@ -535,7 +672,7 @@ buffer_dir = 'D:/100%/buf'"
     fn every_relative_path_is_resolved() {
         let mut c = load_str("").unwrap();
         resolve_paths(&mut c, Path::new(r"C:\base"));
-        assert_eq!(c.grade.lut, Path::new(r"C:\base\luts/siege.cube"));
+        assert_eq!(c.grade.look, Path::new("builtin"));
         assert_eq!(c.autoclip.template, Path::new(r"C:\base\name.png"));
     }
 

@@ -144,6 +144,17 @@ enum Action {
     OpenLogs = 3,
     Quit = 4,
     OpenLastClip = 5,
+    ExportNow = 6,
+    RegradeLast = 7,
+}
+
+/// What the menu asks of the grading and export queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaAction {
+    /// Run pending exports now (`export.when = "manual"`).
+    ExportNow,
+    /// Grade this clip again.
+    Regrade(PathBuf),
 }
 
 impl Action {
@@ -154,6 +165,8 @@ impl Action {
             Self::OpenLogs,
             Self::Quit,
             Self::OpenLastClip,
+            Self::ExportNow,
+            Self::RegradeLast,
         ]
         .into_iter()
         .find(|a| *a as usize == id)
@@ -164,6 +177,8 @@ impl Action {
 fn menu_items(have_clip: bool) -> Vec<Option<(Action, &'static str, bool)>> {
     vec![
         Some((Action::OpenLastClip, "Open last clip", have_clip)),
+        Some((Action::RegradeLast, "Regrade last clip", have_clip)),
+        Some((Action::ExportNow, "Export pending now", true)),
         None,
         Some((Action::OpenConfig, "Open config", true)),
         Some((Action::OpenClips, "Open clips folder", true)),
@@ -191,6 +206,21 @@ struct Shown {
 
 /// Called with `true` on sleep and `false` on resume.
 type PowerHandler = Box<dyn Fn(bool)>;
+type MediaHandler = Box<dyn Fn(MediaAction)>;
+
+/// Sets what the menu's "Export pending now" and "Regrade last clip" do. Call on the tray
+/// thread, e.g. from `on_ready`.
+pub fn set_media_handler(f: impl Fn(MediaAction) + 'static) {
+    ON_MEDIA.with(|m| *m.borrow_mut() = Some(Box::new(f)));
+}
+
+fn media(a: MediaAction) {
+    ON_MEDIA.with(|m| {
+        if let Some(f) = m.borrow().as_ref() {
+            f(a);
+        }
+    });
+}
 
 thread_local! {
     static STATE: RefCell<Option<LoopState>> = const { RefCell::new(None) };
@@ -199,6 +229,8 @@ thread_local! {
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     /// Called with `true` when the PC is about to sleep and `false` when it has resumed.
     static ON_POWER: RefCell<Option<PowerHandler>> = const { RefCell::new(None) };
+    /// Called for the menu's grading and export items.
+    static ON_MEDIA: RefCell<Option<MediaHandler>> = const { RefCell::new(None) };
 }
 
 /// Sets what happens on sleep (`true`) and resume (`false`). Call on the tray thread, e.g. from
@@ -285,6 +317,13 @@ fn on_menu(action: Action) {
             let last = LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(p) = last {
                 open(&p, false);
+            }
+        }
+        Action::ExportNow => media(MediaAction::ExportNow),
+        Action::RegradeLast => {
+            let last = LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(p) = last {
+                media(MediaAction::Regrade(p));
             }
         }
         Action::Quit => {
@@ -647,8 +686,12 @@ mod tests {
             .flatten()
             .map(|i| i.0)
             .collect();
-        assert_eq!(actions.len(), 5);
+        assert_eq!(actions.len(), 7);
         assert_eq!(actions.last(), Some(&Action::Quit));
+        // Regrade needs a clip; exporting pending work doesn't.
+        let items: Vec<_> = menu_items(false).into_iter().flatten().collect();
+        assert!(items.iter().any(|i| i.0 == Action::RegradeLast && !i.2));
+        assert!(items.iter().any(|i| i.0 == Action::ExportNow && i.2));
     }
 
     #[test]
