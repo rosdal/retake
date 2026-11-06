@@ -4,6 +4,7 @@ pub mod config;
 pub mod display;
 pub mod ffmpeg_args;
 pub mod ffmpeg_caps;
+pub mod hotkey;
 pub mod progress;
 pub mod watcher;
 

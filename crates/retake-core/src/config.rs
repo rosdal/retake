@@ -200,6 +200,25 @@ pub fn validate(c: &Config) -> Vec<String> {
             cap.buffer_secs
         ));
     }
+    let clips = &c.clips;
+    let mut parsed = Vec::new();
+    for (name, text) in [
+        ("hotkey", &clips.hotkey),
+        ("hotkey_full", &clips.hotkey_full),
+    ] {
+        match crate::hotkey::parse(text) {
+            Ok(k) => parsed.push(k),
+            Err(e) => errs.push(format!("clips.{name} = {text}: {e}")),
+        }
+    }
+    if let [a, b] = parsed[..]
+        && a == b
+    {
+        errs.push(format!(
+            "clips.hotkey_full = {}: must differ from clips.hotkey",
+            clips.hotkey_full
+        ));
+    }
     errs
 }
 
@@ -386,6 +405,38 @@ buffer_dir = 'D:/100%/buf'"
         resolve_paths(&mut c, Path::new(r"C:\base"));
         assert_eq!(c.grade.lut, Path::new(r"C:\base\luts/siege.cube"));
         assert_eq!(c.autoclip.template, Path::new(r"C:\base\name.png"));
+    }
+
+    #[test]
+    fn hotkeys_must_parse_and_differ() {
+        assert_eq!(
+            errs(
+                "[clips]
+hotkey = \"Ctrl+Q+\""
+            ),
+            ["clips.hotkey = Ctrl+Q+: \"Q\" is not a modifier (Ctrl, Alt, Shift, Win)"]
+        );
+        assert_eq!(
+            errs(
+                "[clips]
+hotkey_full = \"F99\""
+            ),
+            ["clips.hotkey_full = F99: unknown key \"F99\""]
+        );
+        assert_eq!(
+            errs(
+                "[clips]
+hotkey = \"ctrl+f9\""
+            ),
+            ["clips.hotkey_full = Ctrl+F9: must differ from clips.hotkey"]
+        );
+        assert!(
+            load_str(
+                "[clips]
+hotkey = \"Alt+Shift+K\""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
