@@ -2,6 +2,7 @@
 
 mod child;
 mod display;
+mod drive;
 mod ffmpeg;
 mod instance;
 mod logging;
@@ -12,6 +13,7 @@ use std::path::Path;
 use std::process::{Child, ExitCode};
 
 use anyhow::{Context, Result};
+use retake_core::buffer::{drive_problem, low_space_warning, write_readme};
 use retake_core::config::{self, Config, DEFAULT_CONFIG_TOML};
 use retake_core::display::check_output;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
@@ -132,6 +134,22 @@ fn main() -> ExitCode {
     };
     for w in &warnings {
         tracing::warn!("{w}");
+    }
+
+    let buffer_dir = &config.capture.buffer_dir;
+    if let Some(e) = drive_problem(drive::drive_kind(buffer_dir), buffer_dir) {
+        return fatal(&e);
+    }
+    match drive::free_bytes(buffer_dir) {
+        Ok(free) => {
+            if let Some(w) = low_space_warning(free, buffer_dir) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!("{e:#}"),
+    }
+    if let Err(e) = write_readme(buffer_dir) {
+        tracing::warn!("writing buffer README: {e}");
     }
 
     let job = match ChildJob::new() {
