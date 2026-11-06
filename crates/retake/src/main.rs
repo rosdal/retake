@@ -11,6 +11,7 @@ mod logging;
 mod procs;
 mod recorder;
 mod saver;
+mod sound;
 mod sysinfo;
 mod tray;
 
@@ -223,7 +224,7 @@ fn main() -> ExitCode {
         drop(guard); // flushes the log file
     };
 
-    match tray::run(paths, on_ready, shutdown) {
+    match tray::run(paths, Vec::new(), |_| {}, on_ready, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         // Already logged by tray::run, whose exit hook has closed the log.
         Err(e) => error_box(&format!("{e:#}")),
