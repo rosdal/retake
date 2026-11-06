@@ -237,6 +237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "retake-audio"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "retake-core",
+ "tracing",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "retake-core"
 version = "0.3.0"
 dependencies = [
