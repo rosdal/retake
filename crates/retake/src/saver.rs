@@ -647,6 +647,8 @@ mod tests {
             qp_p: 18,
             buffer_dir: buf.clone(),
             buffer_secs: 60,
+            audio: Vec::new(),
+            origin_us: 0,
         };
         let mut args: Vec<String> = [
             "-hide_banner",
