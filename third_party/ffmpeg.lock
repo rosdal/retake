@@ -1,0 +1,6 @@
+# Pinned ffmpeg build. scripts/fetch-ffmpeg.ps1 downloads it, checks the hash and
+# unpacks it into third_party/ffmpeg/ (git-ignored).
+version=7.1.1
+flavor=gyan.dev full_build
+url=https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build.zip
+sha256=d760e1b3574402ed18b4865851f87d87e73965a982e6453212df8621fed1c508
