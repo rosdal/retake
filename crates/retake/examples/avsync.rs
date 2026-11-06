@@ -59,6 +59,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 };
                 FillRect(hdc, &rc, brush);
                 let _ = DeleteObject(brush.into());
+                // Fixed colour patches along the bottom (red, green, blue, mid-grey) to check
+                // the capture's colour matrix and range. COLORREF is 0x00BBGGRR.
+                for (i, c) in [0x0000_00FFu32, 0x0000_FF00, 0x00FF_0000, 0x0080_8080]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let b = CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
+                    let x = i as i32 * 90 + 10;
+                    let r = RECT {
+                        left: x,
+                        top: 300,
+                        right: x + 80,
+                        bottom: 350,
+                    };
+                    FillRect(hdc, &r, b);
+                    let _ = DeleteObject(b.into());
+                }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }

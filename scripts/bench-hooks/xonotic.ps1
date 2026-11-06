@@ -10,7 +10,7 @@ $exe = Join-Path $dir 'xonotic.exe'
 if (-not (Test-Path $exe)) { throw "no xonotic.exe in $dir" }
 Get-Process xonotic -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill(); $_.WaitForExit(5000) | Out-Null }
 $user = Join-Path (Split-Path $dir) 'xonotic-user'
-$args = @('-userdir', $user, '+vid_fullscreen', '1', '+vid_desktopfullscreen', '1', '+vid_vsync', '0',
+$args = @('-userdir', $user, '-condebug', '+vid_fullscreen', '1', '+vid_desktopfullscreen', '1', '+vid_vsync', '0',
     '+cl_maxfps', '0', '+snd_volume', '0.1', '+playdemo', 'demos/the-big-keybench')
 $p = Start-Process $exe -WorkingDirectory $dir -ArgumentList $args -PassThru
 $deadline = (Get-Date).AddSeconds(30)

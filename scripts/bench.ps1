@@ -269,6 +269,7 @@ $retake = $null
 try {
     foreach ($cfg in $Configs) {
         $overlay = $Overlays[$cfg]
+        $retried = @{}
         for ($n = 1; $n -le $Runs; $n++) {
             $stem = Join-Path $Out "$cfg-$n"
             $ff = $null
@@ -288,13 +289,25 @@ try {
                 Read-Host "Run $n/$Runs of '$cfg': go to the route's start, press Enter, then play the route"
             }
             $gamePids = @(Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object Id)
-            if (-not $gamePids) { throw "$Process is not running" }
+            if (-not $gamePids) {
+                # With a run hook the game is restarted per run; one lost run is retried once.
+                if ($RunHook -and -not $retried.ContainsKey($n)) {
+                    $retried[$n] = $true
+                    Write-Warning "$Process exited before run $n of '$cfg'; retrying it once."
+                    if ($retake) { Stop-Process -Id $retake.Id -ErrorAction SilentlyContinue; $retake.WaitForExit(10000) | Out-Null; $retake = $null }
+                    $n--
+                    continue
+                }
+                throw "$Process is not running"
+            }
             $ffPid = if ($ff) { [int]$ff.ProcessId } else { 0 }
             $cpu0 = @{ ff = if ($ffPid) { Get-CpuSeconds $ffPid }; rt = if ($retake) { Get-CpuSeconds $retake.Id } }
             $t0 = Get-Date
             $job = Start-CounterJob $gamePids $ffPid $Seconds
+            # High-fps games overflow PresentMon's default 2048-event buffer.
             & $presentMon --process_name $Process --timed $Seconds --terminate_after_timed `
-                --no_console_stats --stop_existing_session --output_file "$stem.csv" | Out-Null
+                --no_console_stats --stop_existing_session --set_circular_buffer_size 8192 `
+                --output_file "$stem.csv" | Out-Null
             if ($LASTEXITCODE) { throw "PresentMon exited with $LASTEXITCODE" }
             $samples = Receive-Job -Job $job -Wait -AutoRemoveJob
             $wall = ((Get-Date) - $t0).TotalSeconds

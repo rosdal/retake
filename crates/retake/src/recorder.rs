@@ -336,7 +336,16 @@ impl Loop {
 
     fn check_disk(&mut self) {
         let dir = &self.s.capture.buffer_dir;
-        let Ok(free) = free_bytes(dir) else { return };
+        // RETAKE_TEST_FREE_MB_FILE names a file holding a number of MB: the drive then
+        // pretends to have that much free space, to test the low-disk path without filling a
+        // disk. Read on every poll, so a test can change it while Retake runs.
+        let fake = std::env::var_os("RETAKE_TEST_FREE_MB_FILE")
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024);
+        let Some(free) = fake.or_else(|| free_bytes(dir).ok()) else {
+            return;
+        };
         match self.disk.on_free(free) {
             Some(DiskEvent::Low) => {
                 tracing::error!(
