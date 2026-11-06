@@ -181,6 +181,15 @@ pub fn validate(c: &Config) -> Vec<String> {
         let list = ALLOWED_FPS.map(|f| f.to_string()).join(", ");
         errs.push(format!("capture.fps = {fps}: must be one of {list}"));
     }
+    // The ring buffer is MPEG-TS, which ffmpeg writes AV1 into as an unreadable data stream:
+    // AV1 recordings could never be saved as clips.
+    if cap.codec == Codec::Av1 {
+        errs.push(
+            "capture.codec = \"av1\": not supported yet (clips can't be saved from AV1); \
+             use \"hevc\""
+                .to_owned(),
+        );
+    }
     let mut qp_ok = true;
     for (name, v) in [("qp_i", cap.qp_i), ("qp_p", cap.qp_p)] {
         if v > 51 {
@@ -340,6 +349,15 @@ mod tests {
         let c = load_str("[capture]\nfps = 60").unwrap();
         assert_eq!(c.capture.fps, Auto::Value(60));
         assert_eq!(c.capture.qp_i, 16);
+    }
+
+    #[test]
+    fn av1_is_refused_for_now() {
+        let e = load_str("[capture]\ncodec = \"av1\"")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not supported yet"), "{e}");
+        assert!(load_str("[capture]\ncodec = \"hevc\"").is_ok());
     }
 
     #[test]

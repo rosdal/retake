@@ -17,7 +17,7 @@ fps           = "auto"
 # Hardware encoder: "amf" (AMD), "qsv" (Intel), "nvenc" (NVIDIA), or "auto":
 # the one for your GPU.
 encoder       = "auto"
-# "hevc" or "av1".
+# "hevc". ("av1" isn't supported yet: clips can't be saved from it.)
 codec         = "hevc"
 # Constant QP for I- and P-frames, 0–51, lower is better. qp_i must be <= qp_p.
 qp_i          = 16
