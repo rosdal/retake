@@ -5,7 +5,8 @@
 //! key takes its default and a misspelt one is an error.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use toml::{Table, Value};
@@ -143,10 +144,12 @@ pub fn load_str(user: &str) -> Result<Config, ConfigError> {
     let mut merged: Table = DEFAULT_CONFIG_TOML
         .parse()
         .expect("embedded default-config.toml is valid TOML");
-    let user: Table = user.parse().map_err(|e| ConfigError::Parse(format!("{e}")))?;
+    let user: Table = user
+        .parse()
+        .map_err(|e| ConfigError::Parse(format!("{e}")))?;
     merge(&mut merged, user);
-    let config = Config::deserialize(Value::Table(merged))
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let config =
+        Config::deserialize(Value::Table(merged)).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let errs = validate(&config);
     if errs.is_empty() {
         Ok(config)
@@ -155,9 +158,87 @@ pub fn load_str(user: &str) -> Result<Config, ConfigError> {
     }
 }
 
+/// Allowed capture frame rates.
+pub const ALLOWED_FPS: [u32; 5] = [60, 120, 144, 165, 240];
+
+/// Name of the probe file `check_dirs` writes and deletes.
+pub const WRITE_TEST_FILE: &str = ".retake-write-test";
+
 /// Rules that need no filesystem access. Returns one message per broken rule.
-pub fn validate(_c: &Config) -> Vec<String> {
-    Vec::new()
+pub fn validate(c: &Config) -> Vec<String> {
+    let mut errs = Vec::new();
+    let cap = &c.capture;
+
+    if !ALLOWED_FPS.contains(&cap.fps) {
+        errs.push(format!(
+            "capture.fps = {}: must be one of 60, 120, 144, 165, 240",
+            cap.fps
+        ));
+    }
+    let mut qp_ok = true;
+    for (name, v) in [("qp_i", cap.qp_i), ("qp_p", cap.qp_p)] {
+        if v > 51 {
+            errs.push(format!("capture.{name} = {v}: must be 0–51"));
+            qp_ok = false;
+        }
+    }
+    if qp_ok && cap.qp_i > cap.qp_p {
+        errs.push(format!(
+            "capture.qp_i = {}: must be ≤ capture.qp_p ({})",
+            cap.qp_i, cap.qp_p
+        ));
+    }
+    let min_buffer = c.clips.pre_roll + c.clips.post_roll + 4;
+    if cap.buffer_secs < min_buffer {
+        errs.push(format!(
+            "capture.buffer_secs = {}: must be ≥ pre_roll + post_roll + 4 ({min_buffer})",
+            cap.buffer_secs
+        ));
+    }
+    errs
+}
+
+/// Makes relative directory paths absolute against `base` (the folder holding `config.toml`).
+pub fn resolve_paths(c: &mut Config, base: &Path) {
+    for p in [&mut c.capture.buffer_dir, &mut c.clips.out_dir] {
+        if p.is_relative() {
+            *p = base.join(&*p);
+        }
+    }
+}
+
+/// Checks each output directory exists (creating it if needed) and is writable.
+pub fn check_dirs(c: &Config) -> Vec<String> {
+    let mut errs = Vec::new();
+    for (name, dir) in [
+        ("capture.buffer_dir", &c.capture.buffer_dir),
+        ("clips.out_dir", &c.clips.out_dir),
+    ] {
+        let probe = dir.join(WRITE_TEST_FILE);
+        let result = fs::create_dir_all(dir)
+            .and_then(|()| fs::write(&probe, b"ok"))
+            .and_then(|()| fs::remove_file(&probe));
+        if let Err(e) = result {
+            errs.push(format!("{name} = {}: not writable ({e})", dir.display()));
+        }
+    }
+    errs
+}
+
+/// Loads `path`, resolves its relative paths against the file's folder and checks every rule,
+/// including that the output directories are writable.
+pub fn load_file(path: &Path) -> Result<Config, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| ConfigError::Parse(format!("cannot read {}: {e}", path.display())))?;
+    let mut config = load_str(&text)?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    resolve_paths(&mut config, base);
+    let errs = check_dirs(&config);
+    if errs.is_empty() {
+        Ok(config)
+    } else {
+        Err(ConfigError::Invalid(errs))
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +272,9 @@ mod tests {
 
     #[test]
     fn wrong_type_names_field() {
-        let e = load_str("[capture]\nfps = \"fast\"").unwrap_err().to_string();
+        let e = load_str("[capture]\nfps = \"fast\"")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("fps"), "{e}");
     }
 
@@ -202,5 +285,110 @@ mod tests {
             .filter(|l| l.trim_start().starts_with('#'))
             .count();
         assert!(comments >= 10);
+    }
+
+    fn errs(toml: &str) -> Vec<String> {
+        match load_str(toml) {
+            Err(ConfigError::Invalid(v)) => v,
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fps_must_be_allowed() {
+        assert_eq!(
+            errs("[capture]\nfps = 100"),
+            ["capture.fps = 100: must be one of 60, 120, 144, 165, 240"]
+        );
+    }
+
+    #[test]
+    fn every_allowed_fps_is_accepted() {
+        for fps in [60, 120, 144, 165, 240] {
+            assert!(
+                load_str(&format!("[capture]\nfps = {fps}")).is_ok(),
+                "{fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn qp_range() {
+        assert_eq!(
+            errs("[capture]\nqp_i = 60\nqp_p = 60"),
+            [
+                "capture.qp_i = 60: must be 0–51",
+                "capture.qp_p = 60: must be 0–51"
+            ]
+        );
+    }
+
+    #[test]
+    fn qp_order() {
+        assert_eq!(
+            errs("[capture]\nqp_i = 20\nqp_p = 18"),
+            ["capture.qp_i = 20: must be ≤ capture.qp_p (18)"]
+        );
+    }
+
+    #[test]
+    fn buffer_long_enough() {
+        assert_eq!(
+            errs("[capture]\nbuffer_secs = 21"),
+            ["capture.buffer_secs = 21: must be ≥ pre_roll + post_roll + 4 (22)"]
+        );
+        assert!(load_str("[capture]\nbuffer_secs = 22").is_ok());
+    }
+
+    #[test]
+    fn codec_must_be_known() {
+        let e = load_str("[capture]\ncodec = \"h264\"")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("capture.codec"), "{e}");
+    }
+
+    #[test]
+    fn dirs_created_and_writable() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = load_str("").unwrap();
+        resolve_paths(&mut c, t.path());
+        assert!(check_dirs(&c).is_empty());
+        assert!(t.path().join("buffer").is_dir());
+        assert!(t.path().join("clips").is_dir());
+        assert!(!t.path().join("buffer").join(WRITE_TEST_FILE).exists());
+    }
+
+    #[test]
+    fn absolute_paths_are_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let abs = t.path().join("elsewhere");
+        let toml = format!("[clips]\nout_dir = '{}'", abs.display());
+        let mut c = load_str(&toml).unwrap();
+        resolve_paths(&mut c, Path::new("C:/unused"));
+        assert_eq!(c.clips.out_dir, abs);
+    }
+
+    #[test]
+    fn bad_dir_reported() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("file");
+        std::fs::write(&f, "").unwrap();
+        let mut c = load_str("").unwrap();
+        resolve_paths(&mut c, t.path());
+        c.capture.buffer_dir = f.join("sub");
+        let errs = check_dirs(&c);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].starts_with("capture.buffer_dir = "), "{}", errs[0]);
+    }
+
+    #[test]
+    fn load_file_writes_nothing_but_checks_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("config.toml");
+        std::fs::write(&p, "[capture]\nfps = 60").unwrap();
+        let c = load_file(&p).unwrap();
+        assert_eq!(c.capture.fps, 60);
+        assert_eq!(c.capture.buffer_dir, t.path().join("buffer"));
     }
 }
