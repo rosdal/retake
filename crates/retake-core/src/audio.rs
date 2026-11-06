@@ -60,7 +60,13 @@ impl Timeline {
         if self.pending.len() < end {
             self.pending.resize(end, None);
         }
-        for (i, f) in frames.chunks_exact(CHANNELS).enumerate().skip(skip) {
+        for (i, f) in frames
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .enumerate()
+            .skip(skip)
+        {
             let slot = &mut self.pending[first + i - skip];
             if slot.is_none() {
                 *slot = Some([f[0], f[1]]);
