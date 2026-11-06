@@ -170,7 +170,9 @@ fn icon() -> Result<Icon> {
     Icon::from_rgba(rgba, N, N).context("building tray icon")
 }
 
-/// Shows the tray icon and pumps messages until Quit or session end, then runs `on_exit`.
+/// Shows the tray icon and pumps messages until Quit or session end. `on_exit` runs exactly
+/// once on every way out, including setup failures; a failure is logged before it runs so the
+/// error reaches the log even when `on_exit` flushes and closes it.
 pub fn run(paths: TrayPaths, on_exit: impl FnOnce() + 'static) -> Result<()> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(LoopState {
@@ -178,7 +180,15 @@ pub fn run(paths: TrayPaths, on_exit: impl FnOnce() + 'static) -> Result<()> {
             on_exit: Some(Box::new(on_exit)),
         })
     });
+    let result = run_loop();
+    if let Err(e) = &result {
+        tracing::error!("tray failed: {e:#}");
+    }
+    run_exit_hook();
+    result
+}
 
+fn run_loop() -> Result<()> {
     let hwnd = create_hidden_window()?;
     let hwnd_raw = hwnd.0 as isize;
 
@@ -228,6 +238,5 @@ pub fn run(paths: TrayPaths, on_exit: impl FnOnce() + 'static) -> Result<()> {
             DispatchMessageW(&msg);
         }
     }
-    run_exit_hook();
     Ok(())
 }

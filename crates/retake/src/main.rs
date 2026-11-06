@@ -22,18 +22,21 @@ use crate::instance::SingleInstance;
 struct Args {
     console: bool,
     dummy_child: bool,
+    /// Logged once logging is up; a GUI-subsystem exe has nowhere to print them earlier.
+    unknown: Vec<String>,
 }
 
 fn parse_args() -> Args {
     let mut args = Args {
         console: false,
         dummy_child: false,
+        unknown: Vec::new(),
     };
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--console" => args.console = true,
             "--dummy-child" => args.dummy_child = true,
-            other => eprintln!("ignoring unknown argument {other}"),
+            _ => args.unknown.push(a),
         }
     }
     args
@@ -42,6 +45,11 @@ fn parse_args() -> Args {
 /// A fatal startup error: logged, then shown in a message box because there's no console.
 fn fatal(msg: &str) -> ExitCode {
     tracing::error!("{msg}");
+    error_box(msg)
+}
+
+/// Shows `msg` in an error box and returns exit code 1.
+fn error_box(msg: &str) -> ExitCode {
     let text = HSTRING::from(msg);
     // SAFETY: strings outlive the call.
     let rc = unsafe { MessageBoxW(None, &text, w!("Retake"), MB_OK | MB_ICONERROR) };
@@ -75,17 +83,20 @@ fn main() -> ExitCode {
         }
     }
 
-    let guard = match logging::init(args.console) {
-        Ok(g) => g,
-        Err(e) => return fatal(&format!("Could not start logging: {e:#}")),
-    };
-    logging::log_startup_info();
-
+    // Before logging, so a second launch doesn't write into the running instance's log.
     let Some(instance) = SingleInstance::acquire() else {
-        tracing::info!("another instance is running; exiting");
         instance::toast("Retake is already running.");
         return ExitCode::SUCCESS;
     };
+
+    let guard = match logging::init(args.console) {
+        Ok(g) => g,
+        Err(e) => return error_box(&format!("Could not start logging: {e:#}")),
+    };
+    logging::log_startup_info();
+    for a in &args.unknown {
+        tracing::warn!("ignoring unknown argument {a}");
+    }
 
     let exe_dir = match std::env::current_exe() {
         Ok(p) => p.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -152,6 +163,7 @@ fn main() -> ExitCode {
 
     match tray::run(paths, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fatal(&format!("{e:#}")),
+        // Already logged by tray::run, whose exit hook has closed the log.
+        Err(e) => error_box(&format!("{e:#}")),
     }
 }

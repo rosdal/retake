@@ -63,8 +63,11 @@ impl ChildJob {
         let process = HANDLE(child.as_raw_handle());
         // SAFETY: both handles are valid for the duration of the call.
         if let Err(e) = unsafe { AssignProcessToJobObject(self.handle, process) } {
-            let _ = child.kill();
-            bail!("AssignProcessToJobObject: {e}");
+            // A child that already finished can't be assigned; that's not a failure.
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+                bail!("AssignProcessToJobObject: {e}");
+            }
         }
 
         let name = exe
@@ -116,7 +119,16 @@ fn for_each_line(reader: impl Read, max: usize, mut f: impl FnMut(&str)) {
                 _ => {
                     line.push(b);
                     if line.len() >= max {
+                        // Cut before an unfinished UTF-8 sequence so no character is split.
+                        let cut = match std::str::from_utf8(&line) {
+                            Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
+                                e.valid_up_to()
+                            }
+                            _ => line.len(),
+                        };
+                        let rest = line.split_off(cut);
                         emit(&mut line);
+                        line = rest;
                     }
                 }
             }
@@ -169,6 +181,23 @@ mod tests {
         let mut got = Vec::new();
         for_each_line(&input[..], 8, |l| got.push(l.to_owned()));
         assert_eq!(got, ["a", "b", "c", "d", "long-lin", "e-here"]);
+    }
+
+    #[test]
+    fn cap_does_not_split_a_utf8_character() {
+        let input = "abé-x\n".as_bytes(); // 'é' is 2 bytes, straddling the 3-byte cap
+        let mut got = Vec::new();
+        for_each_line(input, 3, |l| got.push(l.to_owned()));
+        assert_eq!(got, ["ab", "é-", "x"]);
+    }
+
+    #[test]
+    fn instantly_exiting_child_is_not_an_error() {
+        let job = ChildJob::new().unwrap();
+        for _ in 0..20 {
+            let mut c = job.spawn_logged(&cmd(), &["/C", "exit 0"]).unwrap();
+            c.wait().unwrap();
+        }
     }
 
     fn cmd() -> PathBuf {

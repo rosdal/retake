@@ -77,7 +77,7 @@ pub struct Clips {
 pub struct Autoclip {
     pub enabled: bool,
     pub region: [u32; 4],
-    pub template: String,
+    pub template: PathBuf,
     pub threshold: f32,
     pub merge_window: u32,
 }
@@ -85,7 +85,7 @@ pub struct Autoclip {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grade {
-    pub lut: String,
+    pub lut: PathBuf,
     pub cas_strength: f32,
 }
 
@@ -170,10 +170,8 @@ pub fn validate(c: &Config) -> Vec<String> {
     let cap = &c.capture;
 
     if !ALLOWED_FPS.contains(&cap.fps) {
-        errs.push(format!(
-            "capture.fps = {}: must be one of 60, 120, 144, 165, 240",
-            cap.fps
-        ));
+        let list = ALLOWED_FPS.map(|f| f.to_string()).join(", ");
+        errs.push(format!("capture.fps = {}: must be one of {list}", cap.fps));
     }
     let mut qp_ok = true;
     for (name, v) in [("qp_i", cap.qp_i), ("qp_p", cap.qp_p)] {
@@ -188,8 +186,9 @@ pub fn validate(c: &Config) -> Vec<String> {
             cap.qp_i, cap.qp_p
         ));
     }
-    let min_buffer = c.clips.pre_roll + c.clips.post_roll + 4;
-    if cap.buffer_secs < min_buffer {
+    // u64 so huge roll values can't overflow.
+    let min_buffer = u64::from(c.clips.pre_roll) + u64::from(c.clips.post_roll) + 4;
+    if u64::from(cap.buffer_secs) < min_buffer {
         errs.push(format!(
             "capture.buffer_secs = {}: must be ≥ pre_roll + post_roll + 4 ({min_buffer})",
             cap.buffer_secs
@@ -198,9 +197,15 @@ pub fn validate(c: &Config) -> Vec<String> {
     errs
 }
 
-/// Makes relative directory paths absolute against `base` (the folder holding `config.toml`).
+/// Makes every relative path in the config absolute against `base` (the folder holding
+/// `config.toml`), so they don't depend on the working directory Retake was started from.
 pub fn resolve_paths(c: &mut Config, base: &Path) {
-    for p in [&mut c.capture.buffer_dir, &mut c.clips.out_dir] {
+    for p in [
+        &mut c.capture.buffer_dir,
+        &mut c.clips.out_dir,
+        &mut c.autoclip.template,
+        &mut c.grade.lut,
+    ] {
         if p.is_relative() {
             *p = base.join(&*p);
         }
@@ -338,6 +343,32 @@ mod tests {
             ["capture.buffer_secs = 21: must be ≥ pre_roll + post_roll + 4 (22)"]
         );
         assert!(load_str("[capture]\nbuffer_secs = 22").is_ok());
+    }
+
+    #[test]
+    fn huge_roll_does_not_overflow() {
+        let e = errs("[clips]\npre_roll = 4294967295");
+        assert_eq!(
+            e,
+            ["capture.buffer_secs = 60: must be ≥ pre_roll + post_roll + 4 (4294967302)"]
+        );
+    }
+
+    #[test]
+    fn fps_message_lists_allowed_values() {
+        let list = ALLOWED_FPS.map(|f| f.to_string()).join(", ");
+        assert_eq!(
+            errs("[capture]\nfps = 1"),
+            [format!("capture.fps = 1: must be one of {list}")]
+        );
+    }
+
+    #[test]
+    fn every_relative_path_is_resolved() {
+        let mut c = load_str("").unwrap();
+        resolve_paths(&mut c, Path::new(r"C:\base"));
+        assert_eq!(c.grade.lut, Path::new(r"C:\base\luts/siege.cube"));
+        assert_eq!(c.autoclip.template, Path::new(r"C:\base\name.png"));
     }
 
     #[test]
