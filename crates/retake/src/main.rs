@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_pump;
 mod background;
 mod child;
 mod clock;
@@ -9,6 +10,7 @@ mod ffmpeg;
 mod ffmpeg_proc;
 mod instance;
 mod logging;
+mod pipe;
 mod procs;
 mod recorder;
 mod saver;

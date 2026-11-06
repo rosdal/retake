@@ -227,6 +227,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "object",
+ "retake-audio",
  "retake-core",
  "tauri-winrt-notification",
  "tempfile",
