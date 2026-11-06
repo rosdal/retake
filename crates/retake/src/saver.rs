@@ -642,6 +642,7 @@ mod tests {
             fps: 60,
             encoder: retake_core::autoconf::Encoder::Amf,
             codec: retake_core::config::Codec::Hevc,
+            preset: retake_core::config::Preset::Speed,
             qp_i: 16,
             qp_p: 18,
             buffer_dir: buf.clone(),

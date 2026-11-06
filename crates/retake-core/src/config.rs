@@ -41,6 +41,23 @@ pub enum Codec {
     Av1,
 }
 
+/// Encoder speed/quality trade-off, mapped per encoder by `ffmpeg_args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    Speed,
+    Balanced,
+    Quality,
+}
+
+/// CPU priority class of the recording ffmpeg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Normal,
+    BelowNormal,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
@@ -53,6 +70,8 @@ pub struct Capture {
     pub codec: Codec,
     pub qp_i: u32,
     pub qp_p: u32,
+    pub preset: Preset,
+    pub priority: Priority,
     pub buffer_dir: PathBuf,
     pub buffer_secs: u32,
 }
@@ -358,6 +377,28 @@ mod tests {
             .to_string();
         assert!(e.contains("not supported yet"), "{e}");
         assert!(load_str("[capture]\ncodec = \"hevc\"").is_ok());
+    }
+
+    #[test]
+    fn preset_and_priority_default_and_parse() {
+        let c = load_str("").unwrap();
+        assert_eq!(c.capture.preset, Preset::Speed);
+        assert_eq!(c.capture.priority, Priority::Normal);
+        let c = load_str(
+            "[capture]
+preset = \"balanced\"
+priority = \"below_normal\"",
+        )
+        .unwrap();
+        assert_eq!(c.capture.preset, Preset::Balanced);
+        assert_eq!(c.capture.priority, Priority::BelowNormal);
+        assert!(
+            load_str(
+                "[capture]
+preset = \"fast\""
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -333,6 +333,7 @@ impl Loop {
             fps,
             encoder: self.s.encoder,
             codec: cap.codec,
+            preset: cap.preset,
             qp_i: cap.qp_i,
             qp_p: cap.qp_p,
             buffer_dir: cap.buffer_dir.clone(),
