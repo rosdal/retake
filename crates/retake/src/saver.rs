@@ -6,16 +6,21 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use retake_core::Ms;
-use retake_core::clip::{ClipJob, Kind, clip_name, concat_args, concat_list, numbered};
+use retake_core::clip::{
+    ClipJob, Kind, Press, Scheduler, clip_name, concat_args, concat_list, numbered,
+};
 use retake_core::ffmpeg_args::INDEX_FILE;
-use retake_core::segments::{Segment, parse_index, select, still_intact, writing_file};
+use retake_core::segments::{SEGMENT_MS, Segment, parse_index, select, still_intact, writing_file};
 
 use crate::child::ChildJob;
+use crate::clock::wall_ms;
 
 /// The ffmpeg run whose segments are in the buffer now.
 #[derive(Debug, Clone)]
@@ -188,10 +193,97 @@ pub fn run_concat(ffmpeg: &Path, job: &ChildJob, list: &Path, out: &Path) -> Res
     Ok(())
 }
 
+pub enum SaverMsg {
+    Press(Press),
+    Shutdown,
+}
+
+pub struct SaverSetup {
+    pub ffmpeg: PathBuf,
+    pub job: Arc<ChildJob>,
+    pub dirs: ClipDirs,
+    pub session: SessionSlot,
+    pub pre_roll: u32,
+    pub post_roll: u32,
+    pub buffer_secs: u32,
+    /// Called on the saver thread with each finished clip.
+    pub on_saved: Box<dyn Fn(&Path) + Send>,
+}
+
+/// The saver thread: collects presses, waits out each clip's post-roll, saves one clip at a
+/// time. Dropping it drops pending clips and waits for a save in progress.
+pub struct Saver {
+    tx: Sender<SaverMsg>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Saver {
+    /// `tx` is the sending side of `rx`, kept to deliver `Shutdown`.
+    pub fn start(setup: SaverSetup, tx: Sender<SaverMsg>, rx: Receiver<SaverMsg>) -> Result<Saver> {
+        let thread = std::thread::Builder::new()
+            .name("saver".into())
+            .spawn(move || run(setup, rx))
+            .context("spawning saver thread")?;
+        Ok(Saver {
+            tx,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        let _ = self.tx.send(SaverMsg::Shutdown);
+        if let Some(t) = self.thread.take()
+            && t.join().is_err()
+        {
+            tracing::error!("saver thread panicked");
+        }
+    }
+}
+
+fn run(s: SaverSetup, rx: Receiver<SaverMsg>) {
+    let mut sched = Scheduler::new(s.pre_roll, s.post_roll, s.buffer_secs);
+    let concat = |list: &Path, out: &Path| run_concat(&s.ffmpeg, &s.job, list, out);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(SaverMsg::Press(p)) => {
+                let merged = sched.press(p);
+                tracing::info!(kind = ?p.kind, merged, "clip hotkey");
+            }
+            Ok(SaverMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        for job in sched.due(wall_ms()) {
+            wait_for_segments(&s.session, job.to);
+            match save(&job, &s.session, &s.dirs, &concat) {
+                Ok(path) => (s.on_saved)(&path),
+                Err(e) => tracing::warn!(id = job.id, "clip not saved: {e:#}"),
+            }
+        }
+    }
+    if sched.pending() > 0 {
+        tracing::info!(pending = sched.pending(), "quitting; pending clips dropped");
+    }
+}
+
+/// Waits until the index lists a segment ending at or after `to` (the one holding the end of
+/// the clip has closed), or until it can't be coming any more.
+fn wait_for_segments(slot: &SessionSlot, to: Ms) {
+    let give_up = to + 2 * SEGMENT_MS + 1_000;
+    while let Some(s) = current(slot) {
+        let segs = read_index(&s.buffer_dir, s.start);
+        if segs.last().is_some_and(|x| x.end >= to) || wall_ms() >= give_up {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use retake_core::clip::Stamp;
+    use retake_core::clip::{Kind, Stamp};
 
     const START: Ms = 1_000_000_000;
     const T: Stamp = Stamp {
@@ -326,5 +418,85 @@ mod tests {
         dirs.prepare().unwrap();
         assert_eq!(fs::read_dir(&dirs.tmp).unwrap().count(), 0);
         assert!(dirs.raw.join("keep.mkv").exists());
+    }
+
+    /// The real segmenter (testsrc + libx265, so HEVC like AMF) fills a 60 s ring with 70 s of
+    /// video, so it has wrapped; then a normal and a full save run through the real concat and
+    /// ffprobe checks the lengths. Needs `scripts/fetch-ffmpeg.ps1`: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn pinned_ffmpeg_saves_hevc_clips() {
+        use retake_core::config::load_str;
+        use retake_core::ffmpeg_args::segment_args;
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin");
+        let ffmpeg = bin.join("ffmpeg.exe");
+        let t = tempfile::tempdir().unwrap();
+        let buf = t.path().join("buffer");
+        fs::create_dir(&buf).unwrap();
+        let mut cap = load_str("").unwrap().capture;
+        cap.buffer_dir = buf.clone();
+        let mut args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=60",
+            "-t",
+            "70",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "log-level=error",
+            "-g",
+            "120",
+            "-bf",
+            "0",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(segment_args(&cap));
+        let job = Arc::new(ChildJob::new().unwrap());
+        let status = job.spawn_logged(&ffmpeg, &args).unwrap().wait().unwrap();
+        assert!(status.success(), "segmenter: {status}");
+
+        let slot: SessionSlot = Arc::new(Mutex::new(Some(Session {
+            run: 1,
+            start: START,
+            buffer_dir: buf,
+            wrap: 30,
+        })));
+        let dirs = ClipDirs::new(&t.path().join("clips"));
+        dirs.prepare().unwrap();
+        let concat = |l: &Path, o: &Path| run_concat(&ffmpeg, &job, l, o);
+        let probe = |p: &Path| -> f64 {
+            let out = crate::child::run_capture(
+                &bin.join("ffprobe.exe"),
+                &[
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration:stream=codec_name",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    p.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            assert!(out.contains("hevc"), "{out}");
+            out.lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .next_back()
+                .unwrap()
+        };
+
+        let normal = save(&job_at(Kind::Normal, 50, 35, 53), &slot, &dirs, &concat).unwrap();
+        let d = probe(&normal);
+        assert!((d - 20.0).abs() < 0.1, "normal clip {d} s");
+
+        let full = save(&job_at(Kind::Full, 69, 9, 72), &slot, &dirs, &concat).unwrap();
+        let d = probe(&full);
+        assert!((d - 58.0).abs() < 0.1, "full clip {d} s");
     }
 }

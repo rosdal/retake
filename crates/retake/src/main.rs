@@ -198,6 +198,7 @@ fn main() -> ExitCode {
             warning,
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),
+            session: Arc::default(),
         };
         match Recorder::start(setup) {
             Ok(r) => *slot.borrow_mut() = Some(r),
