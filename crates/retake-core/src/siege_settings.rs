@@ -2,9 +2,10 @@
 //! warns about settings that spoil footage for montage editing.
 //!
 //! `LensEffects` and `DOF` are the key names a Siege settings guide confirms
-//! (steamcommunity.com/discussions/forum/29/3821910756550676421). Motion blur and HDR key
-//! names aren't confirmed, so every key mentioning `blur` or `hdr` is reported as unconfirmed
-//! for a human to look at.
+//! (steamcommunity.com/discussions/forum/29/3821910756550676421). `WindowMode=0` is exclusive
+//! fullscreen, confirmed in Siege's menu. Motion blur and HDR key names aren't confirmed (a
+//! real 2026 `GameSettings.ini` had neither), so every key mentioning `blur` or `hdr` is
+//! reported as unconfirmed for a human to look at.
 
 /// What the check found in one settings file.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -27,6 +28,13 @@ const MUST_BE_OFF: [(&str, &str); 2] = [
     ),
 ];
 
+/// Keys with a value that spoils recording, with why.
+const BAD_VALUE: [(&str, f64, &str); 1] = [(
+    "WindowMode",
+    0.0,
+    "Siege runs in exclusive fullscreen: switch to borderless, which screen capture needs",
+)];
+
 /// Checks the text of a `GameSettings.ini`. Keys match in any section, ignoring case.
 pub fn check(ini: &str) -> SetupReport {
     let mut report = SetupReport::default();
@@ -44,6 +52,17 @@ pub fn check(ini: &str) -> SetupReport {
             .find(|(k, _)| key.eq_ignore_ascii_case(k))
         {
             if value.parse::<f64>().is_ok_and(|v| v != 0.0) {
+                report
+                    .warnings
+                    .push(format!("Siege: {why} ({key}={value})"));
+            }
+            continue;
+        }
+        if let Some((_, bad, why)) = BAD_VALUE
+            .iter()
+            .find(|(k, _, _)| key.eq_ignore_ascii_case(k))
+        {
+            if value.parse::<f64>().is_ok_and(|v| v == *bad) {
                 report
                     .warnings
                     .push(format!("Siege: {why} ({key}={value})"));
@@ -94,6 +113,18 @@ mod tests {
             ]
         );
         assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_about_exclusive_fullscreen_only() {
+        let r = check("[DISPLAY_SETTINGS]\nWindowMode=0\n");
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains("exclusive fullscreen"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(check("WindowMode=2\n").warnings.is_empty());
     }
 
     #[test]
