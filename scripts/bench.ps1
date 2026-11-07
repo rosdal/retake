@@ -22,6 +22,8 @@
 .EXAMPLE
   ./scripts/bench.ps1 -Install C:\Tools\Retake -Configs baseline,default,hevc-240 -Runs 3
 .EXAMPLE
+  ./scripts/bench.ps1 -Install C:\Tools\Retake -Process xonotic.exe -RunHook scripts\bench-hooks\xonotic.ps1 -NoPrompt
+.EXAMPLE
   ./scripts/bench.ps1 -Report bench\2026-11-07_201500
 #>
 [CmdletBinding(DefaultParameterSetName = 'Run')]
@@ -32,6 +34,13 @@ param(
     [Parameter(ParameterSetName = 'Run')][ValidateRange(5, 600)][int]$Seconds = 60,
     [Parameter(ParameterSetName = 'Run')][string]$Process = 'RainbowSix.exe',
     [Parameter(ParameterSetName = 'Run')][string]$Out,
+    # Unattended runs: a script run before every run that (re)starts the game on its route
+    # (e.g. scripts/bench-hooks/xonotic.ps1 replays a demo), -Settle seconds to wait after it
+    # before capturing, and no prompts.
+    [Parameter(ParameterSetName = 'Run')][string]$RunHook,
+    [Parameter(ParameterSetName = 'Run')][ValidateRange(0, 600)][int]$Settle = 20,
+    [Parameter(ParameterSetName = 'Run')][switch]$NoPrompt,
+    [Parameter(ParameterSetName = 'Run')][string]$GameBuild,
     [Parameter(ParameterSetName = 'Report', Mandatory)][string]$Report
 )
 $ErrorActionPreference = 'Stop'
@@ -163,7 +172,7 @@ function Get-BenchEnvironment {
     $ffmpeg = @($env:RETAKE_FFMPEG, (Join-Path $Install 'ffmpeg\ffmpeg.exe'),
         (Join-Path $root 'third_party\ffmpeg\bin\ffmpeg.exe')) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     $pmVersion = (Get-Content (Join-Path $root 'third_party/presentmon.lock') | Where-Object { $_ -match '^version=' }) -replace '^version=', ''
-    $siege = Read-Host "Game build (from the game's menu; Enter to skip)"
+    $siege = if ($GameBuild -or $NoPrompt) { $GameBuild } else { Read-Host "Game build (from the game's menu; Enter to skip)" }
     [ordered]@{
         Date       = (Get-Date).ToString('yyyy-MM-dd HH:mm', $inv)
         Cpu        = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
@@ -251,7 +260,8 @@ if ($hadConfig) { Copy-Item $configPath $backup }
 $envInfo = Get-BenchEnvironment
 $envInfo | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $Out 'env.json') -Encoding utf8
 Write-Host "Results go to $Out"
-if (-not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+if (-not $RunHook -and -not (Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+    if ($NoPrompt) { throw "$Process isn't running" }
     Read-Host "$Process isn't running. Start it, get into the custom game, then press Enter"
 }
 
@@ -259,24 +269,45 @@ $retake = $null
 try {
     foreach ($cfg in $Configs) {
         $overlay = $Overlays[$cfg]
+        $retried = @{}
         for ($n = 1; $n -le $Runs; $n++) {
             $stem = Join-Path $Out "$cfg-$n"
             $ff = $null
+            if ($RunHook) { & $RunHook }
+            $ready = (Get-Date).AddSeconds($Settle)
             if ($null -ne $overlay) {
                 ConvertTo-OverlayToml $overlay $Process | Set-Content -Path $configPath -Encoding utf8
                 $retake = Start-Process -FilePath $retakeExe -WorkingDirectory $Install -PassThru
                 $ff = Wait-Ffmpeg $retake.Id
                 Write-Host "Retake is recording ($cfg; ffmpeg pid $($ff.ProcessId))."
             }
-            Read-Host "Run $n/$Runs of '$cfg': go to the route's start, press Enter, then play the route"
+            if ($NoPrompt) {
+                $wait = ($ready - (Get-Date)).TotalSeconds
+                if ($wait -gt 0) { Start-Sleep -Milliseconds ([int]($wait * 1000)) }
+                Write-Host "Run $n/$Runs of '$cfg': capturing."
+            } else {
+                Read-Host "Run $n/$Runs of '$cfg': go to the route's start, press Enter, then play the route"
+            }
             $gamePids = @(Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object Id)
-            if (-not $gamePids) { throw "$Process is not running" }
+            if (-not $gamePids) {
+                # With a run hook the game is restarted per run; one lost run is retried once.
+                if ($RunHook -and -not $retried.ContainsKey($n)) {
+                    $retried[$n] = $true
+                    Write-Warning "$Process exited before run $n of '$cfg'; retrying it once."
+                    if ($retake) { Stop-Process -Id $retake.Id -ErrorAction SilentlyContinue; $retake.WaitForExit(10000) | Out-Null; $retake = $null }
+                    $n--
+                    continue
+                }
+                throw "$Process is not running"
+            }
             $ffPid = if ($ff) { [int]$ff.ProcessId } else { 0 }
             $cpu0 = @{ ff = if ($ffPid) { Get-CpuSeconds $ffPid }; rt = if ($retake) { Get-CpuSeconds $retake.Id } }
             $t0 = Get-Date
             $job = Start-CounterJob $gamePids $ffPid $Seconds
+            # High-fps games overflow PresentMon's default 2048-event buffer.
             & $presentMon --process_name $Process --timed $Seconds --terminate_after_timed `
-                --no_console_stats --stop_existing_session --output_file "$stem.csv" | Out-Null
+                --no_console_stats --stop_existing_session --set_circular_buffer_size 8192 `
+                --output_file "$stem.csv" | Out-Null
             if ($LASTEXITCODE) { throw "PresentMon exited with $LASTEXITCODE" }
             $samples = Receive-Job -Job $job -Wait -AutoRemoveJob
             $wall = ((Get-Date) - $t0).TotalSeconds

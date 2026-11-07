@@ -24,8 +24,8 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{
-    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    STGM_READ,
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM_READ,
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
@@ -189,6 +189,7 @@ struct Stream {
     capture: IAudioCaptureClient,
     event: EventHandle,
     description: String,
+    loopback: bool,
 }
 
 fn open(source: &Source) -> Result<Stream> {
@@ -238,6 +239,7 @@ fn open(source: &Source) -> Result<Stream> {
         capture,
         event,
         description: format!("{name}, 48 kHz 16-bit stereo"),
+        loopback,
     })
 }
 
@@ -281,8 +283,12 @@ fn pump(s: &Stream, mut on_data: OnData, stop: &AtomicBool) -> Result<()> {
             }
             // SAFETY: releasing exactly what GetBuffer gave us.
             unsafe { s.capture.ReleaseBuffer(frames) }.context("ReleaseBuffer")?;
-            // Process loopback may not stamp packets; then the packet ends about now.
-            let at = if qpc == 0 {
+            // Loopback packets are stamped with when they will be played (after the output
+            // device's latency), but the picture is captured when it is composed, before it is
+            // shown. Placing loopback audio at its mix time, when the packet arrives here,
+            // lines it up with the picture the way the game made them. A microphone's stamp
+            // is its real capture time, so it is used as is.
+            let at = if s.loopback || qpc == 0 {
                 qpc_to_unix_us(qpc_100ns()) - i64::from(frames) * 1_000_000 / i64::from(RATE)
             } else {
                 qpc_to_unix_us(qpc)
@@ -315,6 +321,23 @@ fn friendly_name(dev: &IMMDevice) -> Result<String> {
         let store = dev.OpenPropertyStore(STGM_READ)?;
         let pv = store.GetValue(&PKEY_Device_FriendlyName)?;
         Ok(pv.Anonymous.Anonymous.Anonymous.pwszVal.to_string()?)
+    }
+}
+
+/// The id of the default output (`render`) or capture device, to notice a switch.
+pub fn default_device_id(render: bool) -> Option<String> {
+    // SAFETY: COM init for this call; the guard uninitialises it.
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .ok()?;
+    let _com = ComGuard;
+    let dev = default_device(render).ok()?;
+    // SAFETY: GetId returns a CoTaskMem string we free after copying it.
+    unsafe {
+        let id = dev.GetId().ok()?;
+        let s = id.to_string().ok();
+        CoTaskMemFree(Some(id.0 as *const _));
+        s
     }
 }
 
@@ -488,8 +511,12 @@ mod tests {
             |_, _| {},
         )
         .err();
-        // On a machine without any microphone this still errors, just with "none".
-        let e = e.expect("a missing mic must fail").to_string();
-        assert!(e.contains("no such mic 1234"), "{e}");
+        // On a machine without any microphone this still errors, just with "none"; on a CI
+        // runner without the audio service the enumerator itself fails first.
+        let e = format!("{:#}", e.expect("a missing mic must fail"));
+        assert!(
+            e.contains("no such mic 1234") || e.contains("enumerator"),
+            "{e}"
+        );
     }
 }

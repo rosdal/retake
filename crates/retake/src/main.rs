@@ -4,18 +4,22 @@ mod audio_pump;
 mod background;
 mod child;
 mod clock;
+mod diag;
 mod display;
 mod drive;
 mod ffmpeg;
 mod ffmpeg_proc;
+mod grader;
 mod instance;
 mod logging;
+mod media;
 mod pipe;
 mod procs;
 mod recorder;
 mod saver;
 mod setup_check;
 mod sound;
+mod sync_check;
 mod sysinfo;
 mod tray;
 mod window;
@@ -44,6 +48,8 @@ use crate::saver::{ClipDirs, Saver, SaverMsg, SaverSetup, SessionSlot};
 
 struct Args {
     console: bool,
+    /// `--diag`: log memory and handle counts every 5 minutes.
+    diag: bool,
     /// `--save` / `--save-full`: ask the running Retake for a clip, then exit.
     save: Option<bool>,
     dummy_child: bool,
@@ -54,6 +60,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         console: false,
+        diag: false,
         save: None,
         dummy_child: false,
         unknown: Vec::new(),
@@ -61,6 +68,7 @@ fn parse_args() -> Args {
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--console" => args.console = true,
+            "--diag" => args.diag = true,
             "--save" => args.save = Some(false),
             "--save-full" => args.save = Some(true),
             "--dummy-child" => args.dummy_child = true,
@@ -100,7 +108,122 @@ fn ensure_config(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// For the command-line tools in this GUI-subsystem exe: print to the console they were
+/// started from, unless output is already redirected (to a file or pipe).
+fn attach_console() {
+    use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: plain Win32 calls; failure just means no console output.
+    unsafe {
+        let redirected =
+            GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
+        if !redirected && AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            let _ = AllocConsole();
+        }
+    }
+}
+
+/// `retake.exe sync-check …`: a command-line tool, not the recorder. Prints to the console it
+/// was started from.
+fn sync_check_main(words: &[String]) -> ExitCode {
+    attach_console();
+    let run = || -> Result<bool> {
+        let args = sync_check::parse(words)?;
+        let exe = std::env::current_exe().context("finding Retake's own folder")?;
+        let ffmpeg = ffmpeg::locate(exe.parent().unwrap_or(Path::new(".")))?;
+        let report = sync_check::run(&ffmpeg, &args)?;
+        Ok(retake_core::sync::passes(&report))
+    };
+    match run() {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("sync-check: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `retake.exe grade <clip>… [--export <preset>]…`: grades clips (and makes exports) right
+/// away with the settings in `config.toml`, without the recorder. Prints to the console.
+fn grade_main(words: &[String]) -> ExitCode {
+    attach_console();
+    let run = || -> Result<()> {
+        let mut clips = Vec::new();
+        let mut presets = Vec::new();
+        let mut it = words.iter();
+        while let Some(w) = it.next() {
+            if w == "--export" {
+                let p = it.next().context("--export needs a preset")?;
+                presets.push(
+                    retake_core::export::Preset::parse(p)
+                        .with_context(|| format!("unknown preset {p}"))?,
+                );
+            } else {
+                clips.push(std::path::PathBuf::from(w));
+            }
+        }
+        if clips.is_empty() {
+            anyhow::bail!(
+                "usage: retake grade <clip>... [--export edit|edit-smooth|share|vertical]..."
+            );
+        }
+        let exe = std::env::current_exe().context("finding Retake''s own folder")?;
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        ensure_config(&dir.join("config.toml"))?;
+        let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+        let config = config::load_file(&dir.join("config.toml"), &pick_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (vendor, _) = display::adapter()?;
+        let encoder =
+            pick_encoder(config.capture.encoder, vendor).map_err(|e| anyhow::anyhow!(e))?;
+        let g = grader::Grader {
+            ffmpeg: ffmpeg::locate(dir)?,
+            encoder,
+            grade: config.grade.clone(),
+            blur: config.motion_blur.clone(),
+            out_dir: config.clips.out_dir.clone(),
+        };
+        for clip in &clips {
+            let t = std::time::Instant::now();
+            if config.grade.mode == retake_core::config::GradeMode::On {
+                let out = g.grade(clip)?;
+                println!(
+                    "graded {} -> {} in {:.1} s",
+                    clip.display(),
+                    out.display(),
+                    t.elapsed().as_secs_f32()
+                );
+            }
+            for &p in &presets {
+                let t = std::time::Instant::now();
+                let out = g.export(clip, p)?;
+                println!(
+                    "exported {} -> {} in {:.1} s",
+                    p.name(),
+                    out.display(),
+                    t.elapsed().as_secs_f32()
+                );
+            }
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("grade: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    let words: Vec<String> = std::env::args().skip(1).collect();
+    if words.first().is_some_and(|w| w == "sync-check") {
+        return sync_check_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "grade") {
+        return grade_main(&words[1..]);
+    }
     let args = parse_args();
     if args.console {
         // SAFETY: plain Win32 calls; failure just means no console output.
@@ -298,6 +421,27 @@ fn main() -> ExitCode {
     let check_gate = quiet.clone();
     jobs.submit("setup check", move || setup_check::run(&check_gate));
 
+    // Grading and exports: queued per saved clip, run only while the game is closed.
+    let grader = grader::Grader {
+        ffmpeg: ffmpeg.clone(),
+        encoder,
+        grade: config.grade.clone(),
+        blur: config.motion_blur.clone(),
+        out_dir: config.clips.out_dir.clone(),
+    };
+    if let Err(e) = grader.look() {
+        return fatal(&format!("grade.look: {e:#}"));
+    }
+    let media = media::Media::start(
+        grader,
+        jobs.clone(),
+        config.export.when,
+        config.export.presets.clone(),
+        config.clips.max_raw_gb,
+        instance::toast,
+    );
+    let saved_media = media.clone();
+
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -310,6 +454,7 @@ fn main() -> ExitCode {
     let setup_job = job.clone();
     let capture = config.capture.clone();
     let audio = config.audio.clone();
+    let diag = args.diag;
     let processes = config.game.processes.clone();
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
@@ -327,17 +472,24 @@ fn main() -> ExitCode {
                 if cue {
                     sound::play_saved();
                 }
+                saved_media.clip_saved(p);
             }),
+            on_failed: Box::new(|why: &str| instance::toast(&format!("Clip not saved: {why}"))),
         };
         match Saver::start(saver_setup, press_tx, press_rx) {
             Ok(s) => *saver_slot.borrow_mut() = Some(s),
             Err(e) => tracing::error!("{e:#}"),
         }
+        tray::set_media_handler(move |a| match a {
+            tray::MediaAction::ExportNow => media.export_now(),
+            tray::MediaAction::Regrade(p) => media.regrade(&p),
+        });
         let setup = recorder::Setup {
             ffmpeg,
             encoder,
             capture,
             audio,
+            diag,
             processes,
             warning,
             job: setup_job,
@@ -350,7 +502,15 @@ fn main() -> ExitCode {
             }),
         };
         match Recorder::start(setup) {
-            Ok(r) => *slot.borrow_mut() = Some(r),
+            Ok(r) => {
+                *slot.borrow_mut() = Some(r);
+                let power_slot = slot.clone();
+                tray::set_power_handler(move |suspending| {
+                    if let Some(r) = power_slot.borrow().as_ref() {
+                        r.power(suspending);
+                    }
+                });
+            }
             Err(e) => {
                 tracing::error!("{e:#}");
                 notifier.set(TrayStatus::Failed);

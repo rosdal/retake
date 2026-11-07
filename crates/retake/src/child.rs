@@ -128,6 +128,32 @@ impl ChildJob {
     }
 }
 
+impl ChildJob {
+    /// Runs `exe args…` to completion in this job (so it dies with Retake), with no window, at
+    /// below-normal priority, and returns its output.
+    pub fn run_output<S: AsRef<OsStr>>(
+        &self,
+        exe: &Path,
+        args: &[S],
+    ) -> Result<std::process::Output> {
+        let child = Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags((CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS).0)
+            .spawn()
+            .with_context(|| format!("spawning {}", exe.display()))?;
+        // SAFETY: both handles are valid for the duration of the call.
+        if let Err(e) =
+            unsafe { AssignProcessToJobObject(self.handle, HANDLE(child.as_raw_handle())) }
+        {
+            tracing::warn!("{} runs outside Retake's job: {e}", exe.display());
+        }
+        child.wait_with_output().context("waiting for the child")
+    }
+}
+
 impl Drop for ChildJob {
     fn drop(&mut self) {
         // SAFETY: we own the handle and close it exactly once.

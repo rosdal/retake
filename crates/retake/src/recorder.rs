@@ -12,8 +12,11 @@ use retake_core::Ms;
 use retake_core::autoconf::{Auto, Encoder, MonitorChoice, follow_game, pick_fps, pick_monitor};
 use retake_core::buffer::clear_dir;
 use retake_core::config::{Audio, Capture, GameSource};
+use retake_core::disk::{DiskEvent, DiskGuard};
 use retake_core::display::OutputInfo;
-use retake_core::ffmpeg_args::{AudioInput, CaptureSetup, capture_args, segment_count};
+use retake_core::ffmpeg_args::{
+    AUDIO_DIR, AudioInput, CaptureSetup, audio_capture_args, capture_args, segment_count,
+};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
 
@@ -21,7 +24,7 @@ use crate::audio_pump::{Pump, Track};
 use crate::background::SharedGate;
 use crate::child::ChildJob;
 use crate::clock::now_ms;
-use crate::drive::warn_if_low_space;
+use crate::drive::{free_bytes, warn_if_low_space};
 use crate::ffmpeg_proc::{Ffmpeg, GRACE};
 use crate::pipe::{OutPipe, pipe_name};
 use crate::procs::processes;
@@ -39,6 +42,8 @@ pub struct Setup {
     /// The capture settings as configured; `"auto"` values are decided per session.
     pub capture: Capture,
     pub audio: Audio,
+    /// `--diag`: log memory and handle counts every 5 minutes.
+    pub diag: bool,
     pub encoder: Encoder,
     pub processes: Vec<String>,
     /// A startup warning (monitor refresh, HDR) keeps the icon yellow.
@@ -56,6 +61,8 @@ pub struct Setup {
 enum Event {
     /// A stats line from ffmpeg run number `.0`.
     Stats(u64, Stats),
+    /// The PC is going to sleep (`true`) or has resumed (`false`).
+    Power(bool),
     Shutdown,
 }
 
@@ -81,6 +88,12 @@ impl Recorder {
 
     /// Stops ffmpeg gracefully and waits for the thread (the same as dropping it).
     pub fn shutdown(self) {}
+
+    /// The PC is going to sleep (`true`): stop recording now. Resumed (`false`): record again
+    /// if the game still runs.
+    pub fn power(&self, suspending: bool) {
+        let _ = self.tx.send(Event::Power(suspending));
+    }
 }
 
 impl Drop for Recorder {
@@ -111,10 +124,15 @@ struct Loop {
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
-    /// Feeds the running ffmpeg's audio inputs.
+    /// The audio recorder (its own ffmpeg, see `audio_capture_args`) and the pump feeding it.
+    audio_ffmpeg: Option<Ffmpeg>,
     pump: Option<Pump>,
     /// The game process the game track captures, to notice a restarted game.
     audio_pid: Option<u32>,
+    /// Free space on the buffer drive; recording stops while it is low.
+    disk: DiskGuard,
+    /// The PC is going to sleep: recording stops until it resumes.
+    suspended: bool,
     /// Counts ffmpeg starts; tags stats so a previous run's late lines are ignored.
     run: u64,
     last_stats: Option<Stats>,
@@ -135,8 +153,11 @@ impl Loop {
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
+            audio_ffmpeg: None,
             pump: None,
             audio_pid: None,
+            disk: DiskGuard::new(),
+            suspended: false,
             run: 0,
             last_stats: None,
             shown: None,
@@ -150,10 +171,21 @@ impl Loop {
     fn run(mut self, rx: Receiver<Event>) {
         let mut next_poll: Ms = 0;
         let mut next_summary: Ms = SUMMARY_EVERY;
+        let mut next_diag: Ms = 0;
         self.publish();
         loop {
             match rx.recv_timeout(TICK) {
                 Ok(Event::Stats(run, st)) => self.on_stats(run, st),
+                Ok(Event::Power(suspending)) => {
+                    self.suspended = suspending;
+                    if suspending {
+                        tracing::info!("PC going to sleep; stopping the recording");
+                        let cmd = self.watcher.stop_now(self.now());
+                        self.apply(cmd, self.now());
+                    } else {
+                        tracing::info!("PC resumed; recording again if the game still runs");
+                    }
+                }
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -168,6 +200,10 @@ impl Loop {
                             .map(|(p, _)| *p)
                             .collect();
                         let running = !self.game_pids.is_empty();
+                        self.check_disk();
+                        // Low disk or sleep: the watcher sees "no game" and stops the session
+                        // (and won't start one) through its normal path.
+                        let may_record = running && !self.disk.low() && !self.suspended;
                         let changed = self
                             .s
                             .quiet
@@ -181,7 +217,7 @@ impl Loop {
                             }
                             None => {}
                         }
-                        let cmd = self.watcher.on_game(now, running);
+                        let cmd = self.watcher.on_game(now, may_record);
                         self.apply(cmd, now);
                         self.follow_game_window(now);
                         self.follow_game_pid(now);
@@ -192,7 +228,16 @@ impl Loop {
             if let Some(status) = self.ffmpeg.as_mut().and_then(Ffmpeg::exited) {
                 tracing::warn!(%status, "ffmpeg exited unexpectedly");
                 self.ffmpeg = None;
-                self.pump = None;
+                self.stop_ffmpeg();
+                self.speed.reset();
+                let cmd = self.watcher.on_ffmpeg_exit(now);
+                self.apply(cmd, now);
+            }
+            if let Some(status) = self.audio_ffmpeg.as_mut().and_then(Ffmpeg::exited) {
+                // The run restarts as a whole, so video and audio keep one origin.
+                tracing::warn!(%status, "audio ffmpeg exited unexpectedly; restarting the recording");
+                self.audio_ffmpeg = None;
+                self.stop_ffmpeg();
                 self.speed.reset();
                 let cmd = self.watcher.on_ffmpeg_exit(now);
                 self.apply(cmd, now);
@@ -202,6 +247,10 @@ impl Loop {
             if now >= next_summary {
                 next_summary = now + SUMMARY_EVERY;
                 self.log_summary();
+            }
+            if self.s.diag && now >= next_diag {
+                next_diag = now + crate::diag::EVERY_MS;
+                self.log_diag();
             }
             self.publish();
         }
@@ -236,7 +285,7 @@ impl Loop {
                     cmd = self.spawn(now);
                 }
                 Command::StopSession => {
-                    tracing::info!("game closed; stopping recording");
+                    tracing::info!("stopping recording");
                     // No ffmpeg here means it crashed earlier, mid-segment.
                     let clean = self.stop_ffmpeg();
                     self.speed.reset();
@@ -298,10 +347,41 @@ impl Loop {
         }
     }
 
+    fn check_disk(&mut self) {
+        let dir = &self.s.capture.buffer_dir;
+        // RETAKE_TEST_FREE_MB_FILE names a file holding a number of MB: the drive then
+        // pretends to have that much free space, to test the low-disk path without filling a
+        // disk. Read on every poll, so a test can change it while Retake runs.
+        let fake = std::env::var_os("RETAKE_TEST_FREE_MB_FILE")
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024);
+        let Some(free) = fake.or_else(|| free_bytes(dir).ok()) else {
+            return;
+        };
+        match self.disk.on_free(free) {
+            Some(DiskEvent::Low) => {
+                tracing::error!(
+                    free_mb = free / (1024 * 1024),
+                    drive = %dir.display(),
+                    "disk almost full (under 2 GB free): recording stopped until there is 3 GB free"
+                );
+                let now = self.now();
+                let cmd = self.watcher.stop_now(now);
+                self.apply(cmd, now);
+            }
+            Some(DiskEvent::Ok) => tracing::info!("disk has space again; recording may resume"),
+            None => {}
+        }
+    }
+
     /// Stops ffmpeg gracefully, then the audio pump. Returns whether ffmpeg was running and
     /// stopped cleanly.
     fn stop_ffmpeg(&mut self) -> bool {
         let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
+        if let Some(a) = self.audio_ffmpeg.take() {
+            a.stop(GRACE);
+        }
         self.pump = None;
         clean
     }
@@ -328,7 +408,7 @@ impl Loop {
     /// recording stopped.
     fn audio_tracks(&mut self, run: u64) -> Vec<Track> {
         let a = &self.s.audio;
-        let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32)> = Vec::new();
+        let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32, u32)> = Vec::new();
         self.audio_pid = None;
         if a.game {
             let source = match (a.game_source, self.game_pids.first()) {
@@ -344,7 +424,7 @@ impl Loop {
                 }
                 _ => retake_audio::Source::DeviceLoopback,
             };
-            want.push(("game", Some(source), 0.0));
+            want.push(("game", Some(source), 0.0, a.game_delay_ms));
         }
         if a.mic {
             want.push((
@@ -353,6 +433,7 @@ impl Loop {
                     name: a.mic_device.clone(),
                 }),
                 a.mic_gate_db,
+                0,
             ));
         }
         if a.comms {
@@ -366,6 +447,7 @@ impl Loop {
                     "comms",
                     Some(retake_audio::Source::ProcessLoopback { pid }),
                     0.0,
+                    a.game_delay_ms,
                 )),
                 None => tracing::info!(
                     "audio.comms is on but Discord isn't running; no comms track this run"
@@ -373,13 +455,14 @@ impl Loop {
             }
         }
         let mut tracks = Vec::new();
-        for (name, source, gate_db) in want {
+        for (name, source, gate_db, delay_ms) in want {
             match OutPipe::create(&pipe_name(name, run)) {
                 Ok(pipe) => tracks.push(Track {
                     name,
                     pipe,
                     source,
                     gate_db,
+                    delay_ms,
                 }),
                 Err(e) => tracing::error!("{e:#}; recording without the {name} track"),
             }
@@ -482,12 +565,9 @@ impl Loop {
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, priority, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), ?priority, "ffmpeg recording");
-                if !tracks.is_empty() {
-                    match Pump::start(tracks, origin_us) {
-                        Ok(p) => self.pump = Some(p),
-                        Err(e) => tracing::error!("starting the audio pump: {e:#}"),
-                    }
-                }
+                let audio_dir = (!tracks.is_empty())
+                    .then(|| self.start_audio(tracks, origin_us))
+                    .flatten();
                 *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
                     run: self.run,
                     start,
@@ -495,6 +575,7 @@ impl Loop {
                     wrap: segment_count(self.s.capture.buffer_secs),
                     live: true,
                     torn: false,
+                    audio_dir,
                 });
                 self.ffmpeg = Some(f);
                 None
@@ -504,6 +585,40 @@ impl Loop {
                 self.watcher.on_ffmpeg_exit(now)
             }
         }
+    }
+
+    /// Starts the audio recorder and its pump for this run. Returns the audio ring folder, or
+    /// `None` (recording goes on without sound) if it couldn't start.
+    fn start_audio(&mut self, tracks: Vec<Track>, origin_us: i64) -> Option<std::path::PathBuf> {
+        let setup = self.current.clone()?;
+        let dir = setup.buffer_dir.join(AUDIO_DIR);
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| clear_dir(&dir).map(|_| ())) {
+            tracing::error!("preparing {}: {e}; recording without sound", dir.display());
+            return None;
+        }
+        let args = audio_capture_args(&setup);
+        tracing::info!(args = %args.join(" "), "audio ffmpeg command");
+        match Ffmpeg::spawn(
+            &self.s.job,
+            &self.s.ffmpeg,
+            &args,
+            self.s.capture.priority,
+            |_| {},
+        ) {
+            Ok(a) => {
+                tracing::info!(pid = a.pid(), "audio ffmpeg recording");
+                self.audio_ffmpeg = Some(a);
+            }
+            Err(e) => {
+                tracing::error!("starting the audio ffmpeg: {e:#}; recording without sound");
+                return None;
+            }
+        }
+        match Pump::start(tracks, origin_us) {
+            Ok(p) => self.pump = Some(p),
+            Err(e) => tracing::error!("starting the audio pump: {e:#}"),
+        }
+        Some(dir)
     }
 
     fn log_summary(&self) {
@@ -519,9 +634,26 @@ impl Loop {
         }
     }
 
+    fn log_diag(&self) {
+        let mb = |b: Option<u64>| b.map(|b| b / (1024 * 1024));
+        let (retake_mem, retake_handles) = crate::diag::own();
+        let f = self.ffmpeg.as_ref();
+        tracing::info!(
+            retake_mb = mb(retake_mem),
+            retake_handles,
+            ffmpeg_mb = mb(f.and_then(Ffmpeg::working_set)),
+            ffmpeg_handles = f.and_then(Ffmpeg::handle_count),
+            "diag"
+        );
+    }
+
     fn publish(&mut self) {
-        let warning = self.s.warning || self.session_warning || self.speed.behind();
-        let s = tray_status(self.watcher.phase(), warning);
+        let audio_lost = self.pump.as_ref().is_some_and(Pump::warning);
+        let warning = self.s.warning || self.session_warning || self.speed.behind() || audio_lost;
+        let mut s = tray_status(self.watcher.phase(), warning);
+        if self.disk.low() {
+            s = TrayStatus::Failed;
+        }
         if self.shown != Some(s) {
             tracing::info!(phase = ?self.watcher.phase(), status = ?s, "status");
             (self.s.notify)(s);

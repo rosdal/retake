@@ -35,6 +35,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+fn unix_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
+}
+
 static WHITE: AtomicBool = AtomicBool::new(false);
 static mut WINDOW: HWND = HWND(std::ptr::null_mut());
 
@@ -59,6 +65,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 };
                 FillRect(hdc, &rc, brush);
                 let _ = DeleteObject(brush.into());
+                // Fixed colour patches along the bottom (red, green, blue, mid-grey) to check
+                // the capture's colour matrix and range. COLORREF is 0x00BBGGRR.
+                for (i, c) in [0x0000_00FFu32, 0x0000_FF00, 0x00FF_0000, 0x0080_8080]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let b = CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
+                    let x = i as i32 * 90 + 10;
+                    let r = RECT {
+                        left: x,
+                        top: 300,
+                        right: x + 80,
+                        bottom: 350,
+                    };
+                    FillRect(hdc, &r, b);
+                    let _ = DeleteObject(b.into());
+                }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
@@ -110,6 +133,15 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
         let ev = CreateEventW(None, false, false, None)?;
         client.SetEventHandle(ev)?;
         let render: IAudioRenderClient = client.GetService()?;
+        let (mut def, mut min) = (0i64, 0i64);
+        let _ = client.GetDevicePeriod(Some(&mut def), Some(&mut min));
+        eprintln!(
+            "render: stream latency {:.1} ms, device period {:.1} ms (min {:.1}), buffer {} frames",
+            client.GetStreamLatency().unwrap_or(0) as f64 / 10_000.0,
+            def as f64 / 10_000.0,
+            min as f64 / 10_000.0,
+            client.GetBufferSize().unwrap_or(0)
+        );
         let size = client.GetBufferSize()?;
         client.Start()?;
         let start = Instant::now();
@@ -133,7 +165,9 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
                 click_left = 480; // 10 ms
                 phase = 0.0;
                 WHITE.store(true, Ordering::Relaxed);
+                let before = unix_us();
                 repaint();
+                eprintln!("click {before} painted {} padding {pad}", unix_us());
                 white_until = Some(Instant::now() + Duration::from_millis(100));
             }
             if white_until.is_some_and(|t| Instant::now() >= t) {
@@ -147,7 +181,7 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
                 let v = if click_left > 0 {
                     click_left -= 1;
                     phase += 2.0 * std::f32::consts::PI * 1_000.0 / 48_000.0;
-                    (phase.sin() * 12_000.0) as i16
+                    (phase.sin() * 6_000.0) as i16
                 } else {
                     0
                 };

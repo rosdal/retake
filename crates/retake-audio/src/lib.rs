@@ -9,4 +9,4 @@ mod clock;
 mod wasapi;
 
 pub use clock::{qpc_100ns, qpc_to_unix_us, unix_us};
-pub use wasapi::{Capture, Source, capture_devices};
+pub use wasapi::{Capture, Source, capture_devices, default_device_id};
