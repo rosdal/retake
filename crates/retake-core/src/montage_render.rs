@@ -336,7 +336,7 @@ pub fn render_args(
     };
     // YouTube: HEVC at 1440p60 (what YouTube gives its better encodes for); TikTok: H.264.
     let hevc: Option<[&str; 10]> =
-        (o.format == Format::Youtube && !o.preview).then(|| match o.encoder {
+        (o.format == Format::Youtube && !o.preview).then_some(match o.encoder {
             Encoder::Amf => [
                 "-c:v", "hevc_amf", "-quality", "quality", "-rc", "vbr_peak", "-b:v", "40M",
                 "-maxrate", "60M",
