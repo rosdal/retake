@@ -188,7 +188,7 @@ enum Action {
 }
 
 /// What a menu item (or the window) asks of the rest of Retake.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MediaAction {
     /// Run pending exports now (`export.when = "manual"`).
     ExportNow,
@@ -204,6 +204,8 @@ pub enum MediaAction {
     CopyDiagnostics,
     /// Export this clip with this preset now.
     Export(PathBuf, String),
+    /// A montage job from the window.
+    Montage(crate::montage::Job),
 }
 
 impl Action {

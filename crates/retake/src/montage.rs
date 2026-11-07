@@ -296,3 +296,131 @@ pub fn cli(ffmpeg: &Path, encoder: Encoder, clips: &Path, words: &[String]) -> R
     }
     Ok(())
 }
+
+/// What the window asks for; runs on a background thread, one at a time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Job {
+    /// A new project for this song (then a preview of it).
+    New {
+        song: PathBuf,
+        format: Format,
+        starred: bool,
+        length: Option<f64>,
+    },
+    /// Render a project: a preview, or the full montage.
+    Render { dir: PathBuf, preview: bool },
+    /// Rebuild the clip library from the clips folder.
+    Rescan,
+}
+
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a montage job is running.
+pub fn busy() -> bool {
+    BUSY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Starts `job` in the background; reports through the status board and a toast.
+pub fn run_in_background(
+    ffmpeg: PathBuf,
+    encoder: Encoder,
+    lib: Option<std::sync::Arc<Library>>,
+    clips: PathBuf,
+    job: Job,
+) {
+    use std::sync::atomic::Ordering;
+    if BUSY.swap(true, Ordering::AcqRel) {
+        crate::notify::toast("A montage is already being made; try again when it's done.");
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("montage".into())
+        .spawn(move || {
+            let r = run_job(&ffmpeg, encoder, lib.as_deref(), &clips, &job);
+            BUSY.store(false, Ordering::Release);
+            match r {
+                Ok(msg) => {
+                    crate::status::event(msg.clone());
+                    crate::notify::toast(&msg);
+                }
+                Err(e) => {
+                    tracing::warn!("montage: {e:#}");
+                    let msg = format!("Montage failed: {e:#}");
+                    crate::status::event(msg.clone());
+                    crate::notify::toast(&msg);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        BUSY.store(false, Ordering::Release);
+        tracing::warn!("starting the montage thread: {e}");
+    }
+}
+
+fn run_job(
+    ffmpeg: &Path,
+    encoder: Encoder,
+    lib: Option<&Library>,
+    clips: &Path,
+    job: &Job,
+) -> Result<String> {
+    let lib = lib.context("the clip library is unavailable")?;
+    match job {
+        Job::New {
+            song,
+            format,
+            starred,
+            length,
+        } => {
+            if lib.list().is_empty() {
+                lib.rescan(ffmpeg)?;
+            }
+            let pick = if *starred { Pick::Starred } else { Pick::Auto };
+            let name = song
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            crate::status::event(format!("Montage: analysing {name}"));
+            let dir = create(lib, &clips.join("montages"), song, *format, &pick, &name)?;
+            if let Some(l) = length {
+                let mut p = load(&dir)?;
+                p.length = l.clamp(5.0, 600.0);
+                save(&dir, &p)?;
+            }
+            let (out, _) = render(ffmpeg, encoder, Some(lib), &dir, true)?;
+            Ok(format!("Montage preview ready: {}", out.display()))
+        }
+        Job::Render { dir, preview } => {
+            crate::status::event(format!(
+                "Montage: rendering {}{}",
+                dir.file_name().unwrap_or_default().to_string_lossy(),
+                if *preview { " (preview)" } else { "" }
+            ));
+            let t = std::time::Instant::now();
+            let (out, _) = render(ffmpeg, encoder, Some(lib), dir, *preview)?;
+            Ok(format!(
+                "Montage ready in {:.0} s: {}",
+                t.elapsed().as_secs_f32(),
+                out.display()
+            ))
+        }
+        Job::Rescan => Ok(format!("Library rescanned: {} clips", lib.rescan(ffmpeg)?)),
+    }
+}
+
+/// Projects in `clips/montages`, newest first.
+pub fn projects(clips: &Path) -> Vec<(PathBuf, Project)> {
+    let Ok(rd) = std::fs::read_dir(clips.join("montages")) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(PathBuf, Project)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let d = e.path();
+            load(&d).ok().map(|p| (d, p))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v
+}

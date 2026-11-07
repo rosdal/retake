@@ -1,4 +1,4 @@
-//! The window: one plain Win32 window with Status, Clips, Settings and About tabs, made of
+//! The window: one plain Win32 window with Status, Clips, Montage, Settings and About tabs, made of
 //! classic controls with the system font. It lives on the tray thread (the tray's message loop
 //! drives it); closing it only hides it.
 
@@ -11,8 +11,9 @@ use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT,
-    LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW,
+    LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
     LVNI_SELECTED, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, TCIF_TEXT, TCITEMW,
     TCM_GETCURSEL, TCM_INSERTITEMW, TCN_SELCHANGE,
 };
@@ -30,7 +31,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
+use crate::library::Library;
+use crate::montage::Job;
 use crate::tray::{MediaAction, dispatch};
+use retake_core::montage::Format;
 
 /// What the window needs to know.
 pub struct UiSetup {
@@ -39,8 +43,8 @@ pub struct UiSetup {
     pub logs: PathBuf,
 }
 
-const W: i32 = 780;
-const H: i32 = 540;
+const W: i32 = 920;
+const H: i32 = 600;
 const TIMER: usize = 7;
 
 // Control ids.
@@ -57,6 +61,24 @@ const ID_VERTICAL: i32 = 124;
 const ID_FOLDER: i32 = 125;
 const ID_DELETE: i32 = 126;
 const ID_REFRESH: i32 = 127;
+const ID_STAR: i32 = 128;
+const ID_RESCAN: i32 = 129;
+const ID_SONG: i32 = 160;
+const ID_BROWSE: i32 = 161;
+const ID_FORMAT: i32 = 162;
+const ID_PICK: i32 = 163;
+const ID_LENGTH: i32 = 164;
+const ID_NEW_MONTAGE: i32 = 165;
+const ID_PROJECTS: i32 = 166;
+const ID_PCLIPS: i32 = 167;
+const ID_UP: i32 = 168;
+const ID_DOWN: i32 = 169;
+const ID_INCLUDE: i32 = 170;
+const ID_PREVIEW: i32 = 171;
+const ID_RENDER: i32 = 172;
+const ID_MONTAGE_FOLDER: i32 = 173;
+const ID_MONTAGE_REFRESH: i32 = 174;
+const ID_MONTAGE_MSG: i32 = 175;
 const ID_SAVE: i32 = 140;
 const ID_REVERT: i32 = 141;
 const ID_OPEN_CONFIG: i32 = 142;
@@ -153,10 +175,18 @@ struct Ui {
     _font: HFONT,
     tabs: HWND,
     /// Controls per tab, shown only when their tab is selected.
-    pages: [Vec<HWND>; 4],
+    pages: [Vec<HWND>; 5],
     status_text: HWND,
     pause: HWND,
     list: HWND,
+    library: Option<Library>,
+    song: HWND,
+    format: HWND,
+    pick: HWND,
+    length: HWND,
+    projects: HWND,
+    pclips: HWND,
+    montage_msg: HWND,
     fields: Vec<HWND>,
     settings_msg: HWND,
 }
@@ -326,7 +356,10 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
             H - 56,
             ID_TABS,
         );
-        for (i, name) in ["Status", "Clips", "Settings", "About"].iter().enumerate() {
+        for (i, name) in ["Status", "Clips", "Montage", "Settings", "About"]
+            .iter()
+            .enumerate()
+        {
             let mut n: Vec<u16> = name.encode_utf16().chain([0]).collect();
             let item = TCITEMW {
                 mask: TCIF_TEXT,
@@ -370,46 +403,186 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
             0,
             LVS_EX_FULLROWSELECT as isize,
         );
-        for (i, (name, width)) in [
-            ("Clip", 270),
-            ("Play", 70),
-            ("Graded", 60),
-            ("Size MB", 70),
-            ("Saved", 150),
+        add_columns(
+            list,
+            &[
+                ("Clip", 300),
+                ("★", 30),
+                ("Play", 70),
+                ("Graded", 60),
+                ("Used", 50),
+                ("Size MB", 70),
+                ("Saved", 150),
+            ],
+        );
+        let narrow = |b: HWND| {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                b,
+                None,
+                0,
+                0,
+                90,
+                28,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            );
+            b
+        };
+        let clip_btns: Vec<HWND> = [
+            ("Play", ID_PLAY),
+            ("Star", ID_STAR),
+            ("Regrade", ID_REGRADE),
+            ("Export share", ID_SHARE),
+            ("Export vertical", ID_VERTICAL),
+            ("Open folder", ID_FOLDER),
+            ("Delete", ID_DELETE),
+            ("Refresh", ID_REFRESH),
+            ("Rescan library", ID_RESCAN),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(k, (text, id))| narrow(btn(text, x0 + k as i32 * 94, by, *id)))
+        .collect();
+        // Montage: song and options, the projects, the selected project's clips.
+        let label = |text: &str, x: i32, y: i32, lw: i32| {
+            child(
+                w!("STATIC"),
+                text,
+                WINDOW_STYLE(0),
+                WINDOW_EX_STYLE(0),
+                x,
+                y + 4,
+                lw,
+                22,
+                0,
+            )
+        };
+        let combo = |x: i32, y: i32, cw: i32, id: i32, values: &[&str]| {
+            let c = child(
+                w!("COMBOBOX"),
+                "",
+                WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+                WINDOW_EX_STYLE(0),
+                x,
+                y,
+                cw,
+                200,
+                id,
+            );
+            for v in values {
+                let s: Vec<u16> = v.encode_utf16().chain([0]).collect();
+                send(c, CB_ADDSTRING, 0, s.as_ptr() as isize);
+            }
+            send(c, CB_SETCURSEL, 0, 0);
+            c
+        };
+        let edit = |text: &str, x: i32, y: i32, ew: i32, id: i32| {
+            child(
+                w!("EDIT"),
+                text,
+                WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                WS_EX_CLIENTEDGE,
+                x,
+                y,
+                ew,
+                24,
+                id,
+            )
+        };
+        let mut montage = Vec::new();
+        montage.push(label("Song", x0, y0, 60));
+        let song = edit("", x0 + 65, y0, 560, ID_SONG);
+        montage.push(song);
+        montage.push(btn("Browse…", x0 + 640, y0 - 2, ID_BROWSE));
+        let y1 = y0 + 34;
+        montage.push(label("Format", x0, y1, 60));
+        let format = combo(
+            x0 + 65,
+            y1,
+            150,
+            ID_FORMAT,
+            &["TikTok 9:16", "YouTube 16:9"],
+        );
+        montage.push(format);
+        montage.push(label("Clips", x0 + 230, y1, 45));
+        let pick = combo(x0 + 280, y1, 150, ID_PICK, &["Best kills", "Starred only"]);
+        montage.push(pick);
+        montage.push(label("Length (s)", x0 + 445, y1, 70));
+        let length = edit("", x0 + 520, y1, 60, ID_LENGTH);
+        montage.push(length);
+        montage.push(btn("New montage", x0 + 640, y1 - 2, ID_NEW_MONTAGE));
+        let y2 = y1 + 38;
+        let lv = |y: i32, lh: i32, id: i32| {
+            let l = child(
+                w!("SysListView32"),
+                "",
+                WS_TABSTOP | WS_BORDER | WINDOW_STYLE(LVS_REPORT | LVS_SHOWSELALWAYS),
+                WS_EX_CLIENTEDGE,
+                x0,
+                y,
+                cw,
+                lh,
+                id,
+            );
+            send(
+                l,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                0,
+                LVS_EX_FULLROWSELECT as isize,
+            );
+            l
+        };
+        let projects = lv(y2, 130, ID_PROJECTS);
+        add_columns(
+            projects,
+            &[
+                ("Montage", 330),
+                ("Format", 90),
+                ("Length", 60),
+                ("Clips", 60),
+                ("Rendered", 200),
+            ],
+        );
+        montage.push(projects);
+        let y3 = y2 + 140;
+        let pclips = lv(y3, by - 40 - y3, ID_PCLIPS);
+        add_columns(
+            pclips,
+            &[
+                ("#", 36),
+                ("Clip", 330),
+                ("Kills", 50),
+                ("Role", 70),
+                ("In montage", 80),
+                ("Moved", 60),
+            ],
+        );
+        montage.push(pclips);
+        let montage_msg = child(
+            w!("STATIC"),
+            "",
+            WINDOW_STYLE(0),
+            WINDOW_EX_STYLE(0),
+            x0,
+            by - 32,
+            cw,
+            24,
+            ID_MONTAGE_MSG,
+        );
+        montage.push(montage_msg);
+        for (k, (text, id)) in [
+            ("Up", ID_UP),
+            ("Down", ID_DOWN),
+            ("In / out", ID_INCLUDE),
+            ("Preview", ID_PREVIEW),
+            ("Render", ID_RENDER),
+            ("Open folder", ID_MONTAGE_FOLDER),
+            ("Refresh", ID_MONTAGE_REFRESH),
         ]
         .iter()
         .enumerate()
         {
-            let mut n: Vec<u16> = name.encode_utf16().chain([0]).collect();
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: *width,
-                pszText: windows::core::PWSTR(n.as_mut_ptr()),
-                ..Default::default()
-            };
-            send(list, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
-        }
-        let clip_btns = [
-            btn("Play", x0, by, ID_PLAY),
-            btn("Regrade", x0 + 100, by, ID_REGRADE),
-            btn("Export share", x0 + 200, by, ID_SHARE),
-            btn("Export vertical", x0 + 300, by, ID_VERTICAL),
-            btn("Open folder", x0 + 400, by, ID_FOLDER),
-            btn("Delete", x0 + 500, by, ID_DELETE),
-            btn("Refresh", x0 + 600, by, ID_REFRESH),
-        ];
-        for b in &clip_btns {
-            windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                *b,
-                None,
-                0,
-                0,
-                94,
-                28,
-                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-            )
-            .ok();
+            montage.push(narrow(btn(text, x0 + k as i32 * 94, by, *id)));
         }
         // Settings: two columns of label + control.
         let mut settings = Vec::new();
@@ -522,9 +695,13 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
         let pages = [
             vec![status_text, pause, save60, open_clips],
             std::iter::once(list).chain(clip_btns).collect(),
+            montage,
             settings,
             std::iter::once(about).chain(about_btns).collect(),
         ];
+        let library = Library::open(&setup.clips)
+            .inspect_err(|e| tracing::warn!("window: clip library unavailable: {e:#}"))
+            .ok();
         let ui = Ui {
             setup,
             hwnd,
@@ -534,6 +711,14 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
             status_text,
             pause,
             list,
+            library,
+            song,
+            format,
+            pick,
+            length,
+            projects,
+            pclips,
+            montage_msg,
             fields,
             settings_msg,
         };
@@ -642,20 +827,23 @@ fn list_clips(clips: &Path) -> Vec<(PathBuf, String, bool, u64, std::time::Syste
     out
 }
 
-fn fill_clips_of(ui: &Ui) {
-    let clips = list_clips(&ui.setup.clips);
-    send(ui.list, LVM_DELETEALLITEMS, 0, 0);
-    for (i, (p, play, graded, len, when)) in clips.iter().enumerate() {
-        let cells = [
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            play.clone(),
-            if *graded { "yes".into() } else { "".into() },
-            format!("{:.0}", *len as f64 / 1_048_576.0),
-            humantime(*when),
-        ];
+fn add_columns(list: HWND, cols: &[(&str, i32)]) {
+    for (i, (name, width)) in cols.iter().enumerate() {
+        let mut n: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let col = LVCOLUMNW {
+            mask: LVCF_TEXT | LVCF_WIDTH,
+            cx: *width,
+            pszText: windows::core::PWSTR(n.as_mut_ptr()),
+            ..Default::default()
+        };
+        send(list, LVM_INSERTCOLUMNW, i, (&raw const col) as isize);
+    }
+}
+
+/// Replaces a list view's rows.
+fn fill_rows(list: HWND, rows: &[Vec<String>]) {
+    send(list, LVM_DELETEALLITEMS, 0, 0);
+    for (i, cells) in rows.iter().enumerate() {
         for (c, text) in cells.iter().enumerate() {
             let mut t: Vec<u16> = text.encode_utf16().chain([0]).collect();
             let item = LVITEMW {
@@ -671,13 +859,67 @@ fn fill_clips_of(ui: &Ui) {
                 LVM_SETITEMTEXTW
             };
             send(
-                ui.list,
+                list,
                 msg,
                 if c == 0 { 0 } else { i },
                 (&raw const item) as isize,
             );
         }
     }
+}
+
+fn selected_row(list: HWND) -> Option<usize> {
+    let i = send(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+    usize::try_from(i).ok()
+}
+
+fn select_row(list: HWND, i: usize) {
+    let item = LVITEMW {
+        mask: LVIF_STATE,
+        state: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+            LVIS_SELECTED.0 | LVIS_FOCUSED.0,
+        ),
+        stateMask: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+            LVIS_SELECTED.0 | LVIS_FOCUSED.0,
+        ),
+        ..Default::default()
+    };
+    send(list, LVM_SETITEMSTATE, i, (&raw const item) as isize);
+    send(list, LVM_ENSUREVISIBLE, i, 0);
+}
+
+fn fill_clips_of(ui: &Ui) {
+    let clips = list_clips(&ui.setup.clips);
+    let lib = ui.library.as_ref().map(Library::list).unwrap_or_default();
+    let rows: Vec<Vec<String>> = clips
+        .iter()
+        .map(|(p, play, graded, len, when)| {
+            let l = lib.iter().find(|c| c.path == *p);
+            vec![
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                if l.is_some_and(|c| c.starred) {
+                    "★".into()
+                } else {
+                    String::new()
+                },
+                play.clone(),
+                if *graded { "yes".into() } else { String::new() },
+                l.map_or(String::new(), |c| {
+                    if c.used > 0 {
+                        c.used.to_string()
+                    } else {
+                        String::new()
+                    }
+                }),
+                format!("{:.0}", *len as f64 / 1_048_576.0),
+                humantime(*when),
+            ]
+        })
+        .collect();
+    fill_rows(ui.list, &rows);
     let paths = clips.into_iter().map(|c| c.0).collect();
     // The list is refilled under a shared borrow; store the paths after it.
     UI_CLIPS.with(|c| *c.borrow_mut() = paths);
@@ -699,11 +941,172 @@ fn humantime(t: std::time::SystemTime) -> String {
 }
 
 fn selected_clip(ui: &Ui) -> Option<PathBuf> {
-    let i = send(ui.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
-    if i < 0 {
+    let i = selected_row(ui.list)?;
+    UI_CLIPS.with(|c| c.borrow().get(i).cloned())
+}
+
+thread_local! {
+    /// The montage projects shown, in list order.
+    static UI_PROJECTS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Whether a montage job was running at the last timer tick.
+    static WAS_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn selected_project(ui: &Ui) -> Option<PathBuf> {
+    let i = selected_row(ui.projects)?;
+    UI_PROJECTS.with(|p| p.borrow().get(i).cloned())
+}
+
+fn rendered_of(dir: &Path) -> String {
+    let when = |f: &str| {
+        std::fs::metadata(dir.join(f))
+            .and_then(|m| m.modified())
+            .ok()
+            .map(humantime)
+    };
+    match (when("montage.mp4"), when("preview.mp4")) {
+        (Some(t), _) => t,
+        (None, Some(t)) => format!("preview {t}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn fill_projects(ui: &Ui) {
+    let keep = selected_project(ui);
+    let list = crate::montage::projects(&ui.setup.clips);
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|(d, p)| {
+            vec![
+                d.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                match p.format {
+                    Format::Tiktok => "TikTok 9:16".into(),
+                    Format::Youtube => "YouTube 16:9".into(),
+                },
+                format!("{:.0} s", p.length),
+                p.clips.iter().filter(|c| c.include).count().to_string(),
+                rendered_of(d),
+            ]
+        })
+        .collect();
+    fill_rows(ui.projects, &rows);
+    let dirs: Vec<PathBuf> = list.into_iter().map(|(d, _)| d).collect();
+    let sel = keep
+        .and_then(|k| dirs.iter().position(|d| *d == k))
+        .or(if dirs.is_empty() { None } else { Some(0) });
+    UI_PROJECTS.with(|p| *p.borrow_mut() = dirs);
+    if let Some(i) = sel {
+        select_row(ui.projects, i);
+    }
+    fill_project_clips(ui, None);
+    set_montage_msg(ui);
+}
+
+fn fill_project_clips(ui: &Ui, select: Option<usize>) {
+    let rows: Vec<Vec<String>> = selected_project(ui)
+        .and_then(|d| crate::montage::load(&d).ok())
+        .map(|p| {
+            p.clips
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    vec![
+                        (i + 1).to_string(),
+                        c.file
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        c.kills.len().to_string(),
+                        c.role.map_or(String::new(), |r| format!("{r:?}")),
+                        if c.include { "yes".into() } else { "no".into() },
+                        if c.manual {
+                            "yes".into()
+                        } else {
+                            String::new()
+                        },
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    fill_rows(ui.pclips, &rows);
+    if let Some(i) = select {
+        select_row(ui.pclips, i);
+    }
+}
+
+fn set_montage_msg(ui: &Ui) {
+    set_text(
+        ui.montage_msg,
+        if crate::montage::busy() {
+            "Working on a montage… (you can keep playing; you'll get a notification)"
+        } else {
+            "Pick a song and press New montage, or select a montage below to change and render it."
+        },
+    );
+}
+
+/// Applies `f` to the selected project's file and refreshes its clip list.
+fn edit_project(ui: &Ui, f: impl FnOnce(&mut retake_core::montage::Project, usize) -> usize) {
+    let (Some(dir), Some(i)) = (selected_project(ui), selected_row(ui.pclips)) else {
+        return;
+    };
+    let Ok(mut p) = crate::montage::load(&dir) else {
+        return;
+    };
+    let j = f(&mut p, i);
+    if let Err(e) = crate::montage::save(&dir, &p) {
+        tracing::warn!("saving the montage: {e:#}");
+    }
+    fill_project_clips(ui, Some(j));
+}
+
+fn browse_song(ui: &Ui) {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "Music\0*.mp3;*.wav;*.ogg;*.flac;*.m4a;*.aac;*.opus\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: ui.hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    // SAFETY: every buffer outlives the modal call.
+    if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        set_text(ui.song, &String::from_utf16_lossy(&buf[..n]));
+    }
+}
+
+fn new_montage(ui: &Ui) -> Option<MediaAction> {
+    let song = PathBuf::from(text_of(ui.song).trim().trim_matches('"'));
+    if !song.is_file() {
+        set_text(ui.montage_msg, "Pick a song first (Browse…).");
         return None;
     }
-    UI_CLIPS.with(|c| c.borrow().get(i as usize).cloned())
+    let format = if send(ui.format, CB_GETCURSEL, 0, 0) == 1 {
+        Format::Youtube
+    } else {
+        Format::Tiktok
+    };
+    let length = text_of(ui.length).trim().parse::<f64>().ok();
+    Some(MediaAction::Montage(Job::New {
+        song,
+        format,
+        starred: send(ui.pick, CB_GETCURSEL, 0, 0) == 1,
+        length,
+    }))
 }
 
 /// The current config file parsed (for the Settings tab), and its text.
@@ -866,6 +1269,47 @@ fn on_command(id: i32) {
                 }
             }
             ID_REFRESH => fill_clips_of(ui),
+            ID_STAR => {
+                if let (Some(p), Some(lib)) = (selected_clip(ui), ui.library.as_ref()) {
+                    let on = !lib.list().iter().any(|c| c.path == p && c.starred);
+                    if lib.list().iter().all(|c| c.path != p) {
+                        // Not in the library yet (saved before it existed): add it first.
+                        return Some(MediaAction::Montage(Job::Rescan));
+                    }
+                    if let Err(e) = lib.set_star(&p, on) {
+                        tracing::warn!("starring {}: {e:#}", p.display());
+                    }
+                    let i = selected_row(ui.list);
+                    fill_clips_of(ui);
+                    if let Some(i) = i {
+                        select_row(ui.list, i);
+                    }
+                }
+            }
+            ID_RESCAN => return Some(MediaAction::Montage(Job::Rescan)),
+            ID_BROWSE => browse_song(ui),
+            ID_NEW_MONTAGE => return new_montage(ui),
+            ID_UP => edit_project(ui, |p, i| p.move_clip(i, true)),
+            ID_DOWN => edit_project(ui, |p, i| p.move_clip(i, false)),
+            ID_INCLUDE => edit_project(ui, |p, i| {
+                if let Some(c) = p.clips.get_mut(i) {
+                    c.include = !c.include;
+                }
+                i
+            }),
+            ID_PREVIEW | ID_RENDER => {
+                return selected_project(ui).map(|dir| {
+                    MediaAction::Montage(Job::Render {
+                        dir,
+                        preview: id == ID_PREVIEW,
+                    })
+                });
+            }
+            ID_MONTAGE_FOLDER => {
+                let dir = selected_project(ui).unwrap_or_else(|| ui.setup.clips.join("montages"));
+                crate::tray::open_path(&dir);
+            }
+            ID_MONTAGE_REFRESH => fill_projects(ui),
             ID_SAVE => save_settings(ui),
             ID_REVERT => load_settings(ui),
             ID_OPEN_CONFIG => crate::tray::open_path(&ui.setup.config),
@@ -880,6 +1324,7 @@ fn on_command(id: i32) {
         UI.with(|u| {
             if let Some(ui) = u.borrow().as_ref() {
                 refresh_status(ui);
+                set_montage_msg(ui);
             }
         });
     }
@@ -900,9 +1345,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(ui) = u.borrow().as_ref()
                     // SAFETY: our own window.
                     && unsafe { IsWindowVisible(ui.hwnd) }.as_bool()
-                    && send(ui.tabs, TCM_GETCURSEL, 0, 0) == 0
                 {
-                    refresh_status(ui);
+                    match send(ui.tabs, TCM_GETCURSEL, 0, 0) {
+                        0 => refresh_status(ui),
+                        2 => {
+                            // A montage job finished (or started): show its result.
+                            let busy = crate::montage::busy();
+                            if WAS_BUSY.with(|b| b.replace(busy)) != busy {
+                                fill_projects(ui);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             });
             LRESULT(0)
@@ -915,9 +1369,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if let Some(ui) = u.borrow().as_ref() {
                         let page = send(ui.tabs, TCM_GETCURSEL, 0, 0).max(0) as usize;
                         select_page(ui, page);
-                        if page == 1 {
-                            fill_clips_of(ui);
+                        match page {
+                            1 => fill_clips_of(ui),
+                            2 => fill_projects(ui),
+                            _ => {}
                         }
+                    }
+                });
+            } else if hdr.idFrom == ID_PROJECTS as usize && hdr.code == LVN_ITEMCHANGED {
+                UI.with(|u| {
+                    if let Some(ui) = u.try_borrow().ok().as_ref().and_then(|b| b.as_ref()) {
+                        fill_project_clips(ui, None);
                     }
                 });
             }

@@ -140,6 +140,28 @@ pub struct Project {
 }
 
 impl Project {
+    /// Moves clip `i` one place up (`up`) or down, by hand: from then on the build follows
+    /// the project's order. Returns the clip's new index.
+    pub fn move_clip(&mut self, i: usize, up: bool) -> usize {
+        let j = if up {
+            i.checked_sub(1)
+        } else {
+            Some(i + 1).filter(|&j| j < self.clips.len())
+        };
+        let Some(j) = j.filter(|_| i < self.clips.len()) else {
+            return i;
+        };
+        self.clips.swap(i, j);
+        for k in [i, j] {
+            let c = &mut self.clips[k];
+            c.manual = true;
+            // A by-hand position frees the arranger's in/out for the new slot.
+            c.r#in = None;
+            c.out = None;
+        }
+        j
+    }
+
     pub fn new(format: Format, song: &Path, clips: &[LibClip]) -> Project {
         Project {
             format,
@@ -404,7 +426,10 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
             .then(b.kills[0].total_cmp(&a.kills[0]))
     });
     let mut build: Vec<ProjClip> = pool.iter().map(|c| (*c).clone()).collect();
-    build.sort_by(|a, b| a.score.total_cmp(&b.score));
+    // Rising score, unless clips were reordered by hand: then the project's order.
+    if !build.iter().any(|c| c.manual) {
+        build.sort_by(|a, b| a.score.total_cmp(&b.score));
+    }
 
     let mut placed = Vec::new();
     let mut t = 0.0;
@@ -625,6 +650,36 @@ mod tests {
         for x in placed.iter().filter(|x| x.role == Role::Build) {
             assert!(x.kills.len() <= 2);
         }
+    }
+
+    #[test]
+    fn moved_clips_keep_their_order_in_the_build() {
+        let a = analysis();
+        let mut p = project();
+        let builds = |p: &Project| -> Vec<String> {
+            arrange(p, &a)
+                .iter()
+                .filter(|x| x.role == Role::Build)
+                .map(|x| x.file.file_stem().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let before = builds(&p);
+        assert!(before.len() >= 2, "{before:?}");
+        // Move the second build clip above the first.
+        let pos = |p: &Project, n: &str| {
+            p.clips
+                .iter()
+                .position(|c| c.file.file_stem().unwrap() == n)
+                .unwrap()
+        };
+        let (i0, i1) = (pos(&p, &before[0]), pos(&p, &before[1]));
+        let mut i = i1;
+        while i > i0 {
+            i = p.move_clip(i, true);
+        }
+        let after = builds(&p);
+        assert_eq!(after[0], before[1], "{before:?} -> {after:?}");
+        assert_eq!(p.move_clip(0, true), 0, "the top clip stays put");
     }
 
     #[test]

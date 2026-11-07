@@ -709,6 +709,11 @@ fn main() -> ExitCode {
             Err(e) => tracing::error!("{e:#}"),
         }
         let action_recorder = slot.clone();
+        let (montage_ffmpeg, montage_library, montage_clips) = (
+            ffmpeg.clone(),
+            library.clone(),
+            config.clips.out_dir.clone(),
+        );
         tray::set_media_handler(move |a| match a {
             tray::MediaAction::ExportNow => media.export_now(),
             tray::MediaAction::Regrade(p) => media.regrade(&p),
@@ -736,6 +741,13 @@ fn main() -> ExitCode {
                 }),
                 Err(e) => notify::toast(&format!("Couldn't change Start with Windows: {e}")),
             },
+            tray::MediaAction::Montage(job) => montage::run_in_background(
+                montage_ffmpeg.clone(),
+                encoder,
+                montage_library.clone(),
+                montage_clips.clone(),
+                job,
+            ),
             tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {
                 Ok(()) => notify::toast("Diagnostics copied to the clipboard."),
                 Err(e) => notify::toast(&format!("Couldn't copy diagnostics: {e:#}")),
