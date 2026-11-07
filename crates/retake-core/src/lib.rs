@@ -13,6 +13,7 @@ pub mod ffmpeg_args;
 pub mod ffmpeg_caps;
 pub mod grade;
 pub mod hotkey;
+pub mod montage;
 pub mod progress;
 pub mod queue;
 pub mod quiet;
