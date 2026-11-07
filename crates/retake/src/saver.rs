@@ -42,6 +42,8 @@ pub struct Session {
     /// The audio ring (`buffer_dir/audio`) when this run records audio. Its index counts from
     /// the same `start`.
     pub audio_dir: Option<PathBuf>,
+    /// Counts game sessions (not ffmpeg restarts within one), for the session recording.
+    pub game_session: u64,
 }
 
 /// Written by the recorder, read by the saver. `None` while no run's segments are usable.
@@ -130,7 +132,7 @@ pub fn read_index(dir: &Path, start: Ms) -> Vec<Segment> {
 
 /// Copies with `File::open`, which shares read, write and delete access, so ffmpeg can keep
 /// rewriting the ring and replacing the index while we read. Don't use `fs::copy` here.
-fn copy_shared(src: &Path, dst: &Path) -> io::Result<u64> {
+pub fn copy_shared(src: &Path, dst: &Path) -> io::Result<u64> {
     let mut from = File::open(src)?;
     let mut to = File::create(dst)?;
     io::copy(&mut from, &mut to)
@@ -513,6 +515,7 @@ mod tests {
             live: true,
             torn: false,
             audio_dir: None,
+            game_session: 0,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -818,6 +821,7 @@ mod tests {
             live: true,
             torn: false,
             audio_dir: None,
+            game_session: 0,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();

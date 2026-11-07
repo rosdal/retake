@@ -17,7 +17,33 @@ const SCAN_HEIGHT: u32 = 120;
 
 /// Times (seconds from the start of `video`) at which a new kill-feed row appeared.
 pub fn scan(ffmpeg: &Path, job: &ChildJob, video: &Path) -> Result<Vec<f64>> {
-    let p = probe(ffmpeg, video)?;
+    let input = vec!["-i".to_owned(), video.to_string_lossy().into_owned()];
+    scan_input(ffmpeg, job, video, input)
+}
+
+/// Like [`scan`], over the segments named in a concat list (one pass over a whole session).
+pub fn scan_list(ffmpeg: &Path, job: &ChildJob, list: &Path) -> Result<Vec<f64>> {
+    let text = std::fs::read_to_string(list)?;
+    let first = retake_core::clip::parse_concat_list(&text)
+        .into_iter()
+        .next()
+        .context("empty segment list")?;
+    let first = list.parent().unwrap_or(Path::new(".")).join(first);
+    let input = ["-f", "concat", "-safe", "0", "-i"]
+        .map(String::from)
+        .into_iter()
+        .chain([list.to_string_lossy().into_owned()])
+        .collect();
+    scan_input(ffmpeg, job, &first, input)
+}
+
+fn scan_input(
+    ffmpeg: &Path,
+    job: &ChildJob,
+    sample: &Path,
+    input: Vec<String>,
+) -> Result<Vec<f64>> {
+    let p = probe(ffmpeg, sample)?;
     let (cw, ch, cx, cy) = feed_crop(p.width, p.height);
     let sh = SCAN_HEIGHT;
     let sw = ((u64::from(cw) * u64::from(sh) / u64::from(ch.max(1))) as u32 / 2 * 2).max(2);
@@ -27,8 +53,10 @@ pub fn scan(ffmpeg: &Path, job: &ChildJob, video: &Path) -> Result<Vec<f64>> {
         "-nostdin".into(),
         "-hwaccel".into(),
         "d3d11va".into(),
-        "-i".into(),
-        video.to_string_lossy().into_owned(),
+    ];
+    let mut args = args;
+    args.extend(input);
+    args.extend([
         "-map".into(),
         "0:v:0".into(),
         "-vf".into(),
@@ -36,7 +64,7 @@ pub fn scan(ffmpeg: &Path, job: &ChildJob, video: &Path) -> Result<Vec<f64>> {
         "-f".into(),
         "rawvideo".into(),
         "-".into(),
-    ];
+    ]);
     let out = job.run_output(ffmpeg, &args)?;
     if !out.status.success() {
         anyhow::bail!("scanning the kill feed: ffmpeg exited with {}", out.status);

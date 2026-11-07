@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_pump;
+mod autoclipper;
 mod background;
 mod child;
 mod clock;
@@ -18,6 +19,7 @@ mod pipe;
 mod procs;
 mod recorder;
 mod saver;
+mod session;
 mod setup_check;
 mod sound;
 mod sync_check;
@@ -455,6 +457,65 @@ fn main() -> ExitCode {
         instance::toast,
     );
     let saved_media = media.clone();
+
+    // Auto-clipping (Siege): keep the whole session's recording, then after the game closes
+    // read its Match Replays and cut the player's kills. Off when not asked for or not Siege:
+    // keeping the session doubles the disk writes while recording.
+    let is_siege = config
+        .game
+        .processes
+        .iter()
+        .any(|p| p.to_ascii_lowercase().starts_with("rainbowsix"));
+    let auto_on =
+        config.autoclip.enabled && config.autoclip.clip != config::ClipPlays::Off && is_siege;
+    let session_root = config.clips.out_dir.join("session");
+    let _keeper = if auto_on {
+        let told = std::sync::atomic::AtomicBool::new(false);
+        let clip_media = media.clone();
+        let setup = Arc::new(autoclipper::Setup {
+            ffmpeg: ffmpeg.clone(),
+            dissect: autoclipper::find_dissect(&exe_dir),
+            raw_dir: config.clips.out_dir.join("raw"),
+            min_play: config.autoclip.clip.min_play(),
+            on_clip: Box::new(move |p: &Path| clip_media.clip_saved(p)),
+            on_notice: Box::new(move |m: &str| {
+                if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    instance::toast(m);
+                }
+            }),
+        });
+        if setup.dissect.is_none() {
+            tracing::warn!("r6-dissect isn't next to retake.exe: auto-clipping can't read replays");
+        }
+        let submit = {
+            let jobs = jobs.clone();
+            let setup = setup.clone();
+            move |info: session::SessionInfo| {
+                let setup = setup.clone();
+                jobs.submit("auto-clip", move || match autoclipper::run(&setup, &info) {
+                    Ok(clips) => tracing::info!(clips = clips.len(), "auto-clipping done"),
+                    Err(e) => tracing::warn!("auto-clipping: {e:#}"),
+                });
+            }
+        };
+        // Sessions left from an earlier run (Retake quit before analysing them).
+        if let Ok(entries) = std::fs::read_dir(&session_root) {
+            for e in entries.flatten() {
+                if let Some(info) = session::read_info(&e.path()) {
+                    submit(info);
+                }
+            }
+        }
+        match session::Keeper::start(session.clone(), session_root, submit) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!("{e:#}; auto-clipping is off");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let paths = tray::TrayPaths {
         config: config_path,
