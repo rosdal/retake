@@ -502,29 +502,3 @@ impl canvas::Program<MontageMsg> for MontageView {
         }
     }
 }
-
-// ---- Small marks (the fonts carry Latin only, so these are drawn) -----------------------
-
-/// A filled dot.
-pub struct Dot(pub Color);
-
-impl<M> canvas::Program<M> for Dot {
-    type State = ();
-
-    fn draw(
-        &self,
-        _: &(),
-        renderer: &Renderer,
-        _: &Theme,
-        bounds: Rectangle,
-        _: Cursor,
-    ) -> Vec<Geometry> {
-        let mut f = Frame::new(renderer, bounds.size());
-        let r = bounds.width.min(bounds.height) / 2.0;
-        f.fill(
-            &Path::circle(Point::new(bounds.width / 2.0, bounds.height / 2.0), r),
-            self.0,
-        );
-        vec![f.into_geometry()]
-    }
-}

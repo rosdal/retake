@@ -233,6 +233,18 @@ pub enum MediaAction {
     Trim(PathBuf, f64, f64),
     /// Stop the running montage render.
     MontageCancel,
+    /// Open the window (a second start of retake.exe).
+    OpenWindow,
+}
+
+static NOTIFIER: Mutex<Option<TrayNotifier>> = Mutex::new(None);
+
+/// Runs `a` on the tray thread from any thread (once the tray exists).
+pub fn post(a: MediaAction) {
+    let n = *NOTIFIER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = n {
+        n.action(a);
+    }
 }
 
 /// Opens the styled window, or the plain one if it isn't installed.
@@ -554,7 +566,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let queued: Vec<MediaAction> =
                 std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
             for a in queued {
-                dispatch(a);
+                if a == MediaAction::OpenWindow {
+                    open_window();
+                } else {
+                    dispatch(a);
+                }
             }
             LRESULT(0)
         }
@@ -751,6 +767,7 @@ fn run_loop(hotkeys: &[HotkeySpec], on_ready: impl FnOnce(TrayNotifier)) -> Resu
     // SAFETY: our own window; the timer dies with it.
     unsafe { SetTimer(Some(hwnd), TOOLTIP_TIMER, 2_000, None) };
     tracing::info!("tray ready");
+    *NOTIFIER.lock().unwrap_or_else(|e| e.into_inner()) = Some(TrayNotifier(hwnd_raw));
     on_ready(TrayNotifier(hwnd_raw));
 
     let mut msg = MSG::default();

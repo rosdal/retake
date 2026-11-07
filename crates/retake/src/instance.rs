@@ -10,7 +10,28 @@ use windows::core::{PCWSTR, w};
 
 /// Signalled by `--save` (index 0, a standard clip) and `--save-full` (index 1, the whole
 /// buffer), in the order of the clip hotkeys.
-const SAVE_EVENTS: [PCWSTR; 2] = [w!("Local\\RetakeSave"), w!("Local\\RetakeSaveFull")];
+const SAVE_EVENTS: [PCWSTR; 3] = [
+    w!("Local\\RetakeSave"),
+    w!("Local\\RetakeSaveFull"),
+    // A second plain launch: open the window.
+    w!("Local\\RetakeOpenWindow"),
+];
+
+/// Index of the "open the window" event.
+pub const OPEN_WINDOW: usize = 2;
+
+/// Asks the running Retake to open its window. Returns false if none is running.
+pub fn signal_open_window() -> bool {
+    // SAFETY: plain Win32 calls; the handle is closed after use.
+    unsafe {
+        let Ok(h) = OpenEventW(EVENT_MODIFY_STATE, false, SAVE_EVENTS[OPEN_WINDOW]) else {
+            return false;
+        };
+        let ok = SetEvent(h).is_ok();
+        let _ = CloseHandle(h);
+        ok
+    }
+}
 
 /// Asks the running Retake for a clip. Returns false if none is running.
 pub fn signal_save(full: bool) -> bool {

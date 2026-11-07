@@ -2643,12 +2643,33 @@ impl App {
     }
 }
 
-/// A coloured status dot.
+/// A coloured status dot, drawn once per colour and size and kept.
 fn dot<'a>(colour: iced::Color, size: f32) -> Element<'a, Message> {
-    iced::widget::canvas(canvas::Dot(colour))
-        .width(size)
-        .height(size)
-        .into()
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Dots = HashMap<(u32, [u8; 4]), Handle>;
+    static CACHE: Mutex<Option<Dots>> = Mutex::new(None);
+    let px = size as u32 * 2;
+    let rgba = colour.into_rgba8();
+    let h = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry((px, rgba))
+        .or_insert_with(|| {
+            let c = px as f32 / 2.0;
+            let mut out = Vec::with_capacity((px * px * 4) as usize);
+            for y in 0..px {
+                for x in 0..px {
+                    let d = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt();
+                    let a = (c - d).clamp(0.0, 1.0);
+                    out.extend_from_slice(&[rgba[0], rgba[1], rgba[2], (a * 255.0) as u8]);
+                }
+            }
+            Handle::from_rgba(px, px, out)
+        })
+        .clone();
+    image(h).width(size).height(size).into()
 }
 
 /// A star (filled = starred), drawn once per size and kept.

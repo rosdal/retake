@@ -62,6 +62,12 @@ pub fn game_of(clip: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A clip path as the library compares it: backslashes, lower case (Windows paths are
+/// case-insensitive, and the same file can be written with either separator).
+fn key(p: &Path) -> String {
+    p.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
 impl Library {
     pub fn open(clips: &Path) -> Result<Library> {
         std::fs::create_dir_all(clips)?;
@@ -176,8 +182,8 @@ impl Library {
     /// Stars (or unstars) a clip.
     pub fn set_star(&self, clip: &Path, on: bool) -> Result<()> {
         self.conn().execute(
-            "UPDATE clips SET starred = ?2 WHERE path = ?1",
-            params![clip.to_string_lossy(), i64::from(on)],
+            r"UPDATE clips SET starred = ?2 WHERE lower(replace(path, '/', '\')) = ?1",
+            params![key(clip), i64::from(on)],
         )?;
         Ok(())
     }
@@ -196,8 +202,8 @@ impl Library {
         let conn = self.conn();
         for c in clips {
             conn.execute(
-                "UPDATE clips SET used = used + 1 WHERE path = ?1",
-                params![c.to_string_lossy()],
+                r"UPDATE clips SET used = used + 1 WHERE lower(replace(path, '/', '\')) = ?1",
+                params![key(c)],
             )?;
         }
         Ok(())
@@ -264,6 +270,21 @@ mod tests {
         std::fs::remove_file(clip.with_extension("json")).unwrap();
         lib.add_with_game(&no_ffmpeg, &clip, "").unwrap();
         assert_eq!(lib.list()[0].game, "cs2");
+    }
+
+    #[test]
+    fn stars_find_the_clip_however_its_path_is_written() {
+        let d = tempfile::tempdir().unwrap();
+        let lib = Library::open(d.path()).unwrap();
+        let raw = d.path().join("raw");
+        std::fs::create_dir_all(&raw).unwrap();
+        let clip = raw.join("Mixed.mkv");
+        std::fs::write(&clip, b"x").unwrap();
+        lib.add_with_game(&d.path().join("ffmpeg.exe"), &clip, "")
+            .unwrap();
+        let other = PathBuf::from(clip.to_string_lossy().replace('\\', "/").to_uppercase());
+        lib.set_star(&other, true).unwrap();
+        assert!(lib.list()[0].starred);
     }
 
     #[test]

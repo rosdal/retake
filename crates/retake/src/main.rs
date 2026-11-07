@@ -373,7 +373,10 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             };
         }
-        instance::toast("Retake is already running.");
+        // A second start opens the running Retake's window.
+        if !instance::signal_open_window() {
+            instance::toast("Retake is already running.");
+        }
         return ExitCode::SUCCESS;
     };
     if args.save.is_some() {
@@ -870,6 +873,7 @@ fn main() -> ExitCode {
                 }
             }
             tray::MediaAction::OpenLite => ui::show(),
+            tray::MediaAction::OpenWindow => {}
             tray::MediaAction::MontageCancel => montage::cancel(),
             tray::MediaAction::Trim(clip, from, to) => {
                 let (ff, lib, jobs, clips) = (
@@ -961,6 +965,10 @@ fn main() -> ExitCode {
     let on_hotkey = Arc::new(on_hotkey);
     let remote = on_hotkey.clone();
     if let Err(e) = instance::listen_for_saves(move |i| {
+        if i == instance::OPEN_WINDOW {
+            tray::post(tray::MediaAction::OpenWindow);
+            return;
+        }
         tracing::info!(full = i == 1, "clip requested by retake.exe --save");
         remote(i);
     }) {

@@ -49,7 +49,7 @@ pub fn start_status_writer(setup: StatusSetup) {
             let mut last = String::new();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if !window_running() {
+                if !window_open() {
                     continue;
                 }
                 let b = crate::status::get();
@@ -111,6 +111,28 @@ fn game_foreground() -> bool {
 }
 
 static WINDOW: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Whether the styled window is open (started by us or by hand: its single-instance mutex).
+fn window_open() -> bool {
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    if window_running() {
+        return true;
+    }
+    // SAFETY: plain call; the handle is closed at once.
+    unsafe {
+        match OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            windows::core::w!("Local\\RetakeWindow"),
+        ) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
 
 fn window_running() -> bool {
     let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
