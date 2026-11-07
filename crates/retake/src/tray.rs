@@ -641,7 +641,7 @@ const ICON_SIZE: u32 = 32;
 /// Retake's mark with the status colour as its dot, as 32-bit BGRA rows top to bottom.
 fn icon_pixels(rgb: [u8; 3]) -> Vec<u8> {
     let mut px = retake_core::logo::rgba(ICON_SIZE, rgb, true);
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
     px
