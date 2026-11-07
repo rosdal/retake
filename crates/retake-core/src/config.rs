@@ -27,6 +27,15 @@ pub struct Config {
     pub grade: Grade,
     pub export: Export,
     pub motion_blur: MotionBlur,
+    pub safety: Safety,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Safety {
+    /// The strictest anti-cheat footprint: game audio from the output device (no game process
+    /// id used at all) and the game's settings file is never read.
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -579,6 +588,12 @@ preset = \"fast\""
         ] {
             assert!(load_str(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn strict_safety_is_off_by_default() {
+        assert!(!load_str("").unwrap().safety.strict);
+        assert!(load_str("[safety]\nstrict = true").unwrap().safety.strict);
     }
 
     #[test]

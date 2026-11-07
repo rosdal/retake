@@ -24,12 +24,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, HICON, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage,
-    RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CONTEXTMENU, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, HICON, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
+    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CONTEXTMENU, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_NULL,
+    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -44,8 +44,12 @@ pub struct TrayPaths {
 const WM_TRAY_STATUS: u32 = WM_APP + 2;
 /// Mouse messages from the notification-area icon.
 const WM_TRAY_ICON: u32 = WM_APP + 4;
+/// Quit, posted from another thread.
+const WM_TRAY_QUIT: u32 = WM_APP + 6;
 /// Our single icon's id.
 const ICON_ID: u32 = 1;
+/// Timer id for refreshing the tooltip every 2 s.
+const TOOLTIP_TIMER: usize = 1;
 
 /// One hotkey to register; `label` is the config text, used in warnings.
 pub struct HotkeySpec {
@@ -75,6 +79,23 @@ fn status_from_wparam(w: usize) -> Option<TrayStatus> {
 /// is a second tooltip line; it turns an idle icon yellow but never hides red (recording).
 fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
     const YELLOW: [u8; 3] = [234, 179, 8];
+    const BLUE: [u8; 3] = [37, 99, 235];
+    let board = crate::status::get();
+    if !board.state.is_empty() && problem.is_none() {
+        let rgb = match s {
+            TrayStatus::Recording => [220, 38, 38],
+            TrayStatus::Warning => YELLOW,
+            TrayStatus::Failed => [185, 28, 28],
+            TrayStatus::Idle if board.exporting => BLUE,
+            TrayStatus::Idle => [140, 140, 140],
+        };
+        let mut tip = format!("Retake — {}", crate::status::tooltip_detail(&board));
+        if let Some(w) = board.warnings.first() {
+            tip.push('\n');
+            tip.push_str(w);
+        }
+        return (rgb, tip);
+    }
     let (rgb, tip) = match s {
         TrayStatus::Idle => ([140, 140, 140], "Retake — idle"),
         TrayStatus::Recording => ([220, 38, 38], "Retake — recording"),
@@ -130,6 +151,19 @@ impl TrayNotifier {
         };
     }
 
+    /// Asks the tray loop to quit (from any thread): Retake shuts down cleanly.
+    pub fn quit(&self) {
+        // SAFETY: the window lives for the whole run; posting is thread-safe.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(self.0 as *mut _)),
+                WM_TRAY_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+
     /// Remembers `path` for "Open last clip"; the menu enables that item from then on.
     pub fn clip_saved(&self, path: PathBuf) {
         *LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
@@ -146,15 +180,30 @@ enum Action {
     OpenLastClip = 5,
     ExportNow = 6,
     RegradeLast = 7,
+    OpenWindow = 8,
+    PauseResume = 9,
+    SaveFull = 10,
+    Autostart = 11,
+    CopyDiagnostics = 12,
 }
 
-/// What the menu asks of the grading and export queue.
+/// What a menu item (or the window) asks of the rest of Retake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaAction {
     /// Run pending exports now (`export.when = "manual"`).
     ExportNow,
     /// Grade this clip again.
     Regrade(PathBuf),
+    /// Pause (`true`) or resume recording.
+    Pause(bool),
+    /// Save the whole buffer, like the full-buffer hotkey.
+    SaveFull,
+    /// Turn "Start with Windows" on or off.
+    Autostart(bool),
+    /// Copy version, config and recent log lines to the clipboard.
+    CopyDiagnostics,
+    /// Export this clip with this preset now.
+    Export(PathBuf, String),
 }
 
 impl Action {
@@ -167,6 +216,11 @@ impl Action {
             Self::OpenLastClip,
             Self::ExportNow,
             Self::RegradeLast,
+            Self::OpenWindow,
+            Self::PauseResume,
+            Self::SaveFull,
+            Self::Autostart,
+            Self::CopyDiagnostics,
         ]
         .into_iter()
         .find(|a| *a as usize == id)
@@ -175,14 +229,29 @@ impl Action {
 
 /// The menu, top to bottom: `None` is a separator, the bool says whether the item is enabled.
 fn menu_items(have_clip: bool) -> Vec<Option<(Action, &'static str, bool)>> {
+    let paused = crate::status::get().paused;
     vec![
+        Some((Action::OpenWindow, "Open Retake", true)),
+        None,
+        Some((
+            Action::PauseResume,
+            if paused {
+                "Resume recording"
+            } else {
+                "Pause recording"
+            },
+            true,
+        )),
+        Some((Action::SaveFull, "Save last 60 s", true)),
         Some((Action::OpenLastClip, "Open last clip", have_clip)),
         Some((Action::RegradeLast, "Regrade last clip", have_clip)),
         Some((Action::ExportNow, "Export pending now", true)),
         None,
-        Some((Action::OpenConfig, "Open config", true)),
         Some((Action::OpenClips, "Open clips folder", true)),
+        Some((Action::OpenConfig, "Open config", true)),
         Some((Action::OpenLogs, "Open logs", true)),
+        Some((Action::CopyDiagnostics, "Copy diagnostics", true)),
+        Some((Action::Autostart, "Start with Windows", true)),
         None,
         Some((Action::Quit, "Quit", true)),
     ]
@@ -214,7 +283,8 @@ pub fn set_media_handler(f: impl Fn(MediaAction) + 'static) {
     ON_MEDIA.with(|m| *m.borrow_mut() = Some(Box::new(f)));
 }
 
-fn media(a: MediaAction) {
+/// Hands a menu or window action to the handler set with [`set_media_handler`].
+pub fn dispatch(a: MediaAction) {
     ON_MEDIA.with(|m| {
         if let Some(f) = m.borrow().as_ref() {
             f(a);
@@ -231,6 +301,8 @@ thread_local! {
     static ON_POWER: RefCell<Option<PowerHandler>> = const { RefCell::new(None) };
     /// Called for the menu's grading and export items.
     static ON_MEDIA: RefCell<Option<MediaHandler>> = const { RefCell::new(None) };
+    /// The last status shown, to refresh the tooltip.
+    static LAST_STATUS: Cell<Option<TrayStatus>> = const { Cell::new(None) };
 }
 
 /// Sets what happens on sleep (`true`) and resume (`false`). Call on the tray thread, e.g. from
@@ -245,6 +317,11 @@ fn run_exit_hook() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Opens a file or folder with its default program.
+pub fn open_path(path: &std::path::Path) {
+    open(path, false);
 }
 
 fn open(path: &std::path::Path, fallback_notepad: bool) {
@@ -319,11 +396,16 @@ fn on_menu(action: Action) {
                 open(&p, false);
             }
         }
-        Action::ExportNow => media(MediaAction::ExportNow),
+        Action::ExportNow => dispatch(MediaAction::ExportNow),
+        Action::OpenWindow => crate::ui::show(),
+        Action::PauseResume => dispatch(MediaAction::Pause(!crate::status::get().paused)),
+        Action::SaveFull => dispatch(MediaAction::SaveFull),
+        Action::Autostart => dispatch(MediaAction::Autostart(!crate::autostart::enabled())),
+        Action::CopyDiagnostics => dispatch(MediaAction::CopyDiagnostics),
         Action::RegradeLast => {
             let last = LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(p) = last {
-                media(MediaAction::Regrade(p));
+                dispatch(MediaAction::Regrade(p));
             }
         }
         Action::Quit => {
@@ -347,11 +429,14 @@ fn show_menu(hwnd: HWND) -> Option<Action> {
             let r = match item {
                 None => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
                 Some((action, label, enabled)) => {
-                    let flags = if enabled {
+                    let mut flags = if enabled {
                         MF_STRING
                     } else {
                         MF_STRING | MF_GRAYED
                     };
+                    if action == Action::Autostart && crate::autostart::enabled() {
+                        flags |= MF_CHECKED;
+                    }
                     AppendMenuW(menu, flags, action as usize, &HSTRING::from(label))
                 }
             };
@@ -383,7 +468,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_TRAY_ICON => {
             // Without NOTIFYICON_VERSION_4 the low word of lParam is the mouse message.
             let mouse = (lparam.0 & 0xFFFF) as u32;
-            if matches!(mouse, WM_RBUTTONUP | WM_LBUTTONUP | WM_CONTEXTMENU)
+            if mouse == WM_LBUTTONUP {
+                crate::ui::show();
+            } else if matches!(mouse, WM_RBUTTONUP | WM_CONTEXTMENU)
                 && let Some(a) = show_menu(hwnd)
             {
                 on_menu(a);
@@ -392,6 +479,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_TRAY_STATUS => {
             if let Some(s) = status_from_wparam(wparam.0) {
+                LAST_STATUS.set(Some(s));
+                set_status(s);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TOOLTIP_TIMER => {
+            // The tooltip's detail line (fps, clips this session, queue) changes without a
+            // status change.
+            if let Some(s) = LAST_STATUS.get() {
                 set_status(s);
             }
             LRESULT(0)
@@ -404,6 +500,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     (st.on_hotkey)(wparam.0);
                 }
             });
+            LRESULT(0)
+        }
+        WM_TRAY_QUIT => {
+            tracing::info!("quitting to apply new settings");
+            // SAFETY: called on the message-loop thread.
+            unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
@@ -596,6 +698,8 @@ fn run_loop(hotkeys: &[HotkeySpec], on_ready: impl FnOnce(TrayNotifier)) -> Resu
         bail!("Shell_NotifyIconW(NIM_ADD) failed: the tray icon could not be created");
     }
     SHOWN.with(|sh| *sh.borrow_mut() = Some(shown));
+    // SAFETY: our own window; the timer dies with it.
+    unsafe { SetTimer(Some(hwnd), TOOLTIP_TIMER, 2_000, None) };
     tracing::info!("tray ready");
     on_ready(TrayNotifier(hwnd_raw));
 
@@ -674,26 +778,32 @@ mod tests {
     }
 
     #[test]
-    fn last_clip_item_is_enabled_only_with_a_clip() {
-        let first = |have| menu_items(have)[0].unwrap();
+    fn clip_items_are_enabled_only_with_a_clip() {
+        let item = |have, a| {
+            menu_items(have)
+                .into_iter()
+                .flatten()
+                .find(|i| i.0 == a)
+                .unwrap()
+        };
         assert_eq!(
-            first(false),
+            item(false, Action::OpenLastClip),
             (Action::OpenLastClip, "Open last clip", false)
         );
-        assert!(first(true).2);
+        assert!(item(true, Action::OpenLastClip).2);
+        assert!(!item(false, Action::RegradeLast).2);
+        assert!(item(false, Action::ExportNow).2);
         let actions: Vec<_> = menu_items(true)
             .into_iter()
             .flatten()
             .map(|i| i.0)
             .collect();
-        assert_eq!(actions.len(), 7);
+        assert_eq!(actions.first(), Some(&Action::OpenWindow));
         assert_eq!(actions.last(), Some(&Action::Quit));
-        // Regrade needs a clip; exporting pending work doesn't.
-        let items: Vec<_> = menu_items(false).into_iter().flatten().collect();
-        assert!(items.iter().any(|i| i.0 == Action::RegradeLast && !i.2));
-        assert!(items.iter().any(|i| i.0 == Action::ExportNow && i.2));
+        for a in &actions {
+            assert_eq!(Action::from_id(*a as usize), Some(*a));
+        }
     }
-
     #[test]
     fn tooltip_is_cut_and_terminated() {
         let b = tip_buffer("Retake — idle");

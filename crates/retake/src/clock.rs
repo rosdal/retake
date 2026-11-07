@@ -34,6 +34,31 @@ pub fn local_stamp() -> Stamp {
     }
 }
 
+/// The local date and time of a Unix time in seconds.
+pub fn stamp_of_unix(secs: i64) -> Stamp {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let v = secs * 10_000_000 + 116_444_736_000_000_000;
+    let ft = FILETIME {
+        dwLowDateTime: v as u32,
+        dwHighDateTime: (v >> 32) as u32,
+    };
+    let (mut utc, mut t) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    // SAFETY: valid in/out structs.
+    unsafe {
+        let _ = FileTimeToSystemTime(&ft, &mut utc);
+        let _ = SystemTimeToTzSpecificLocalTime(None, &utc, &mut t);
+    }
+    Stamp {
+        year: t.wYear,
+        month: t.wMonth as u8,
+        day: t.wDay as u8,
+        hour: t.wHour as u8,
+        minute: t.wMinute as u8,
+        second: t.wSecond as u8,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

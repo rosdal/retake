@@ -2,10 +2,13 @@
 
 mod audio_pump;
 mod autoclipper;
+mod autostart;
 mod background;
 mod child;
 mod clock;
+mod config_watch;
 mod diag;
+mod diagnostics;
 mod display;
 mod drive;
 mod ffmpeg;
@@ -15,6 +18,7 @@ mod instance;
 mod killfeed;
 mod logging;
 mod media;
+mod notify;
 mod pipe;
 mod procs;
 mod recorder;
@@ -22,9 +26,11 @@ mod saver;
 mod session;
 mod setup_check;
 mod sound;
+mod status;
 mod sync_check;
 mod sysinfo;
 mod tray;
+mod ui;
 mod window;
 
 use std::cell::RefCell;
@@ -53,6 +59,10 @@ struct Args {
     console: bool,
     /// `--diag`: log memory and handle counts every 5 minutes.
     diag: bool,
+    /// `--autostart`: started with Windows; wait before watching for the game.
+    autostart: bool,
+    /// `--restarted`: relaunched to apply a new config; wait for the old instance to quit.
+    restarted: bool,
     /// `--save` / `--save-full`: ask the running Retake for a clip, then exit.
     save: Option<bool>,
     dummy_child: bool,
@@ -64,6 +74,8 @@ fn parse_args() -> Args {
     let mut args = Args {
         console: false,
         diag: false,
+        autostart: false,
+        restarted: false,
         save: None,
         dummy_child: false,
         unknown: Vec::new(),
@@ -72,6 +84,8 @@ fn parse_args() -> Args {
         match a.as_str() {
             "--console" => args.console = true,
             "--diag" => args.diag = true,
+            autostart::ARG => args.autostart = true,
+            config_watch::RESTARTED => args.restarted = true,
             "--save" => args.save = Some(false),
             "--save-full" => args.save = Some(true),
             "--dummy-child" => args.dummy_child = true,
@@ -251,7 +265,18 @@ fn main() -> ExitCode {
     }
 
     // Before logging, so a second launch doesn't write into the running instance's log.
-    let Some(instance) = SingleInstance::acquire() else {
+    // A relaunch waits (up to 15 s) for the old instance to let go of the lock.
+    let mut instance = SingleInstance::acquire();
+    if args.restarted {
+        for _ in 0..60 {
+            if instance.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            instance = SingleInstance::acquire();
+        }
+    }
+    let Some(instance) = instance else {
         if let Some(full) = args.save {
             return if instance::signal_save(full) {
                 ExitCode::SUCCESS
@@ -402,6 +427,7 @@ fn main() -> ExitCode {
         }
     }
     let (press_tx, press_rx) = mpsc::channel();
+    let ui_press_tx = press_tx.clone();
     let cue = config.clips.sound_cue;
     let hotkey_tx = press_tx.clone();
     let hotkey_session = session.clone();
@@ -434,8 +460,16 @@ fn main() -> ExitCode {
         Err(e) => return fatal(&format!("{e:#}")),
     };
     let jobs = background.submitter();
+    let strict = config.safety.strict;
+    if strict {
+        tracing::info!(
+            "strict safety: device audio loopback, the game's settings file is not read"
+        );
+    }
     let check_gate = quiet.clone();
-    jobs.submit("setup check", move || setup_check::run(&check_gate));
+    if !strict {
+        jobs.submit("setup check", move || setup_check::run(&check_gate));
+    }
 
     // Grading and exports: queued per saved clip, run only while the game is closed.
     let grader = grader::Grader {
@@ -454,7 +488,7 @@ fn main() -> ExitCode {
         config.export.when,
         config.export.presets.clone(),
         config.clips.max_raw_gb,
-        instance::toast,
+        notify::toast,
     );
     let saved_media = media.clone();
 
@@ -480,7 +514,7 @@ fn main() -> ExitCode {
             on_clip: Box::new(move |p: &Path| clip_media.clip_saved(p)),
             on_notice: Box::new(move |m: &str| {
                 if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    instance::toast(m);
+                    notify::toast(m);
                 }
             }),
         });
@@ -517,6 +551,13 @@ fn main() -> ExitCode {
         None
     };
 
+    let diag_config = config_path.clone();
+    let watch_config = config_path.clone();
+    ui::init(ui::UiSetup {
+        config: config_path.clone(),
+        clips: config.clips.out_dir.clone(),
+        logs: logging::log_dir(),
+    });
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -528,7 +569,10 @@ fn main() -> ExitCode {
     let saver_slot = saver.clone();
     let setup_job = job.clone();
     let capture = config.capture.clone();
-    let audio = config.audio.clone();
+    let mut audio = config.audio.clone();
+    if config.safety.strict {
+        audio.game_source = config::GameSource::Device;
+    }
     let diag = args.diag;
     let processes = config.game.processes.clone();
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
@@ -548,16 +592,58 @@ fn main() -> ExitCode {
                     sound::play_saved();
                 }
                 saved_media.clip_saved(p);
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                status::update(|b| {
+                    b.clips_today += 1;
+                    b.clips_session += 1;
+                });
+                status::event(format!("Clip saved  {name}"));
             }),
-            on_failed: Box::new(|why: &str| instance::toast(&format!("Clip not saved: {why}"))),
+            on_failed: Box::new(|why: &str| {
+                status::event(format!("Clip not saved: {why}"));
+                notify::toast(&format!("Clip not saved: {why}"));
+            }),
         };
         match Saver::start(saver_setup, press_tx, press_rx) {
             Ok(s) => *saver_slot.borrow_mut() = Some(s),
             Err(e) => tracing::error!("{e:#}"),
         }
+        let action_recorder = slot.clone();
         tray::set_media_handler(move |a| match a {
             tray::MediaAction::ExportNow => media.export_now(),
             tray::MediaAction::Regrade(p) => media.regrade(&p),
+            tray::MediaAction::Export(p, preset) => media.export(&p, &preset),
+            tray::MediaAction::Pause(on) => {
+                if let Some(r) = action_recorder.borrow().as_ref() {
+                    r.pause(on);
+                }
+            }
+            tray::MediaAction::SaveFull => {
+                let p = Press {
+                    at: clock::now_ms(),
+                    stamp: clock::local_stamp(),
+                    kind: Kind::Full,
+                };
+                if ui_press_tx.send(SaverMsg::Press(p)).is_err() {
+                    tracing::warn!("saver is not running; save ignored");
+                }
+            }
+            tray::MediaAction::Autostart(on) => match autostart::set(on) {
+                Ok(()) => notify::toast(if on {
+                    "Retake now starts with Windows."
+                } else {
+                    "Retake no longer starts with Windows."
+                }),
+                Err(e) => notify::toast(&format!("Couldn't change Start with Windows: {e}")),
+            },
+            tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {
+                Ok(()) => notify::toast("Diagnostics copied to the clipboard."),
+                Err(e) => notify::toast(&format!("Couldn't copy diagnostics: {e:#}")),
+            },
         });
         let setup = recorder::Setup {
             ffmpeg,
@@ -572,10 +658,19 @@ fn main() -> ExitCode {
             session,
             quiet: quiet.clone(),
             on_session_end: Box::new(move || {
-                let gate = quiet.clone();
-                jobs.submit("setup check", move || setup_check::run(&gate));
+                if !strict {
+                    let gate = quiet.clone();
+                    jobs.submit("setup check", move || setup_check::run(&gate));
+                }
             }),
+            start_delay_ms: if args.autostart {
+                autostart::DELAY_MS
+            } else {
+                0
+            },
         };
+        let watch_notifier = notifier;
+        config_watch::start(watch_config.clone(), move || watch_notifier.quit());
         match Recorder::start(setup) {
             Ok(r) => {
                 *slot.borrow_mut() = Some(r);

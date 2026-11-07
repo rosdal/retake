@@ -111,3 +111,7 @@ apply_to        = ["share", "vertical"]   # never "edit": keep slow-mo frames
 output_fps      = 60
 amount          = 1.0           # 0.2–0.3 low, 0.5 medium, 1.0 normal, >1 heavy
 weighting       = "gaussian_sym" # equal | gaussian_sym | pyramid
+[safety]
+# The strictest anti-cheat footprint: game audio comes from the output device (no
+# game process id is used at all) and the game's settings file is never read.
+strict        = false
