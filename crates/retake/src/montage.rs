@@ -599,3 +599,171 @@ mod tests {
         assert!(octave * 3 >= results.len() * 2, "octave-tolerant below 2/3");
     }
 }
+
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use retake_core::montage::{Placed, Role, Seg, Style};
+
+    const W: u32 = 90;
+    const H: u32 = 160;
+
+    fn ffmpeg() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin\ffmpeg.exe")
+    }
+
+    fn run(args: &[String]) {
+        let o = std::process::Command::new(ffmpeg())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    /// A frame of `video` at `at` seconds as tiny RGB.
+    fn frame(video: &Path, at: f64) -> Vec<u8> {
+        let o = std::process::Command::new(ffmpeg())
+            .args(["-v", "error", "-ss", &format!("{at:.3}"), "-i"])
+            .arg(video)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale={W}:{H}:flags=area"),
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(o.stdout.len(), (W * H * 3) as usize);
+        o.stdout
+    }
+
+    /// Renders a fixed montage from synthetic footage (a moving test pattern and a tone) and
+    /// compares three frames with the stored ones in `tests/golden/` (mean difference under
+    /// 4/255; hardware encoders differ slightly). `RETAKE_BLESS=1` rewrites them.
+    /// `cargo test -p retake --release -- --ignored golden`
+    #[test]
+    #[ignore]
+    fn montage_frames_match_the_golden_ones() {
+        let d = tempfile::tempdir().unwrap();
+        let clip = d.path().join("clip.mkv");
+        let song = d.path().join("song.wav");
+        run(&s(&[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=1280x720:r=60:d=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:d=6",
+            "-c:v",
+            "libx264",
+            "-qp",
+            "0",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .into_iter()
+        .chain([clip.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>());
+        run(
+            &s(&["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=220:d=8"])
+                .into_iter()
+                .chain([song.to_string_lossy().into_owned()])
+                .collect::<Vec<_>>(),
+        );
+        let placed = vec![
+            Placed {
+                file: clip.clone(),
+                role: Role::Build,
+                segs: vec![Seg {
+                    out0: 0.0,
+                    out1: 1.5,
+                    src0: 0.5,
+                    src1: 2.0,
+                }],
+                kills: vec![(1.8, 1.3)],
+            },
+            Placed {
+                file: clip.clone(),
+                role: Role::Drop,
+                segs: vec![
+                    Seg {
+                        out0: 1.5,
+                        out1: 2.0,
+                        src0: 3.0,
+                        src1: 3.5,
+                    },
+                    Seg {
+                        out0: 2.0,
+                        out1: 3.0,
+                        src0: 3.5,
+                        src1: 3.85,
+                    },
+                ],
+                kills: vec![(3.5, 2.0)],
+            },
+        ];
+        let sources = vec![(
+            clip.clone(),
+            retake_core::montage_render::Source {
+                fps: 60.0,
+                width: 1280,
+                height: 720,
+                has_audio: true,
+            },
+        )];
+        let opts = RenderOpts {
+            format: Format::Tiktok,
+            preview: false,
+            encoder: Encoder::X264,
+            look: None,
+            clip_looks: Vec::new(),
+            game_db: -10.0,
+            killfeed: false,
+            style: Style {
+                interpolation: retake_core::montage::Interpolation::Off,
+                ..Style::default()
+            },
+        };
+        let out = d.path().join("out.mp4");
+        let args = render_args(&placed, &sources, &song, 0.0, 3.0, &opts, &out);
+        run(&args);
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden");
+        let bless = std::env::var_os("RETAKE_BLESS").is_some();
+        for (i, at) in [0.4, 1.3, 2.5].iter().enumerate() {
+            let got = frame(&out, *at);
+            let file = golden.join(format!("montage-{i}.rgb"));
+            if bless || !file.exists() {
+                std::fs::create_dir_all(&golden).unwrap();
+                std::fs::write(&file, &got).unwrap();
+                continue;
+            }
+            let want = std::fs::read(&file).unwrap();
+            let diff: f64 = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| f64::from(a.abs_diff(*b)))
+                .sum::<f64>()
+                / got.len() as f64;
+            assert!(
+                diff < 4.0,
+                "frame {i} at {at} s differs by {diff:.2}/255 on average"
+            );
+        }
+    }
+}
