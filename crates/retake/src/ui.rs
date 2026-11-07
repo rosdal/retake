@@ -1414,7 +1414,7 @@ fn add_game(ui: &Ui) {
     }
 }
 
-fn delete_clip(p: &Path) {
+pub fn delete_clip(p: &Path) {
     let stem = p
         .file_stem()
         .unwrap_or_default()

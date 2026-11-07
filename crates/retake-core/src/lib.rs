@@ -5,6 +5,7 @@ pub mod autoconf;
 pub mod buffer;
 pub mod clip;
 pub mod config;
+pub mod control;
 pub mod cue;
 pub mod disk;
 pub mod display;

@@ -241,6 +241,7 @@ impl Loop {
                 match processes() {
                     Ok(procs) => {
                         let (pids, game) = self.detect(&procs);
+                        crate::current_game::set_pids(pids.clone());
                         self.game_pids = pids;
                         if crate::current_game::get().map(|g| g.id)
                             != game.as_ref().map(|g| g.id.clone())

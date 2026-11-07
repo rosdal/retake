@@ -46,6 +46,9 @@ const WM_TRAY_STATUS: u32 = WM_APP + 2;
 const WM_TRAY_ICON: u32 = WM_APP + 4;
 /// Quit, posted from another thread.
 const WM_TRAY_QUIT: u32 = WM_APP + 6;
+/// Actions queued from other threads (the control pipe).
+const WM_TRAY_ACTION: u32 = WM_APP + 8;
+static PENDING: Mutex<Vec<MediaAction>> = Mutex::new(Vec::new());
 /// Our single icon's id.
 const ICON_ID: u32 = 1;
 /// Timer id for refreshing the tooltip every 2 s.
@@ -164,6 +167,20 @@ impl TrayNotifier {
         };
     }
 
+    /// Runs `a` on the tray thread (from any thread).
+    pub fn action(&self, a: MediaAction) {
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(a);
+        // SAFETY: the window lives for the whole run; posting is thread-safe.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(self.0 as *mut _)),
+                WM_TRAY_ACTION,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+
     /// Remembers `path` for "Open last clip"; the menu enables that item from then on.
     pub fn clip_saved(&self, path: PathBuf) {
         *LAST_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
@@ -206,6 +223,31 @@ pub enum MediaAction {
     Export(PathBuf, String),
     /// A montage job from the window.
     Montage(crate::montage::Job),
+    /// Star or unstar a clip in the library.
+    Star(PathBuf, bool),
+    /// Move a clip (and its graded files) to the Recycle Bin.
+    Delete(PathBuf),
+    /// Open the plain window.
+    OpenLite,
+}
+
+/// Opens the styled window, or the plain one if it isn't installed.
+fn open_window() {
+    let config = WINDOW_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match config {
+        Some(c) => crate::control::open_window(&c),
+        None => crate::ui::show(),
+    }
+}
+
+static WINDOW_CONFIG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Tells the tray where config.toml is (the styled window is started with it).
+pub fn set_window_config(p: PathBuf) {
+    *WINDOW_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
 }
 
 impl Action {
@@ -399,7 +441,7 @@ fn on_menu(action: Action) {
             }
         }
         Action::ExportNow => dispatch(MediaAction::ExportNow),
-        Action::OpenWindow => crate::ui::show(),
+        Action::OpenWindow => open_window(),
         Action::PauseResume => dispatch(MediaAction::Pause(!crate::status::get().paused)),
         Action::SaveFull => dispatch(MediaAction::SaveFull),
         Action::Autostart => dispatch(MediaAction::Autostart(!crate::autostart::enabled())),
@@ -471,7 +513,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // Without NOTIFYICON_VERSION_4 the low word of lParam is the mouse message.
             let mouse = (lparam.0 & 0xFFFF) as u32;
             if mouse == WM_LBUTTONUP {
-                crate::ui::show();
+                open_window();
             } else if matches!(mouse, WM_RBUTTONUP | WM_CONTEXTMENU)
                 && let Some(a) = show_menu(hwnd)
             {
@@ -502,6 +544,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     (st.on_hotkey)(wparam.0);
                 }
             });
+            LRESULT(0)
+        }
+        WM_TRAY_ACTION => {
+            let queued: Vec<MediaAction> =
+                std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+            for a in queued {
+                dispatch(a);
+            }
             LRESULT(0)
         }
         WM_TRAY_QUIT => {

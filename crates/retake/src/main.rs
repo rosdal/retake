@@ -7,6 +7,7 @@ mod background;
 mod child;
 mod clock;
 mod config_watch;
+mod control;
 mod current_game;
 mod diag;
 mod diagnostics;
@@ -33,6 +34,7 @@ mod sound;
 mod status;
 mod sync_check;
 mod sysinfo;
+mod thumbs;
 mod tray;
 mod ui;
 mod window;
@@ -584,6 +586,9 @@ fn main() -> ExitCode {
     let saved_media = media.clone();
     let saved_library = library.clone();
     let saved_ffmpeg = ffmpeg.clone();
+    let saved_jobs = jobs.clone();
+    let saved_clips = config.clips.out_dir.clone();
+    thumbs::queue_missing(&jobs, &ffmpeg, &config.clips.out_dir);
 
     // Auto-clipping: while a game with automatic clips runs, keep the whole session's
     // recording; after it closes, find the player's kills (Siege's replays, CS2's and League's
@@ -623,11 +628,13 @@ fn main() -> ExitCode {
             on_clip: {
                 let lib = library.clone();
                 let ff = ffmpeg.clone();
+                let (thumb_jobs, thumb_clips) = (jobs.clone(), config.clips.out_dir.clone());
                 Box::new(move |p: &Path| {
                     clip_media.clip_saved(p);
                     if let Some(l) = &lib {
                         let _ = l.add(&ff, p);
                     }
+                    thumbs::queue(&thumb_jobs, &ff, &thumb_clips, p);
                 })
             },
             on_notice: Box::new(move |m: &str| {
@@ -676,6 +683,13 @@ fn main() -> ExitCode {
         clips: config.clips.out_dir.clone(),
         logs: logging::log_dir(),
     });
+    tray::set_window_config(config_path.clone());
+    control::start_status_writer(control::StatusSetup {
+        clips_dir: config.clips.out_dir.clone(),
+        config: config_path.clone(),
+        hotkey: config.clips.hotkey.clone(),
+    });
+    let control_clips = config.clips.out_dir.clone();
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -720,6 +734,7 @@ fn main() -> ExitCode {
                 if let Some(lib) = &saved_library {
                     let _ = lib.add(&saved_ffmpeg, p);
                 }
+                thumbs::queue(&saved_jobs, &saved_ffmpeg, &saved_clips, p);
                 let name = p
                     .file_name()
                     .unwrap_or_default()
@@ -782,6 +797,20 @@ fn main() -> ExitCode {
                 montage_looks.clone(),
                 job,
             ),
+            tray::MediaAction::Star(p, on) => {
+                if let Some(l) = &montage_library
+                    && let Err(e) = l.set_star(&p, on)
+                {
+                    tracing::warn!("starring {}: {e:#}", p.display());
+                }
+            }
+            tray::MediaAction::Delete(p) => {
+                ui::delete_clip(&p);
+                if let Some(l) = &montage_library {
+                    let _ = l.list();
+                }
+            }
+            tray::MediaAction::OpenLite => ui::show(),
             tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {
                 Ok(()) => notify::toast("Diagnostics copied to the clipboard."),
                 Err(e) => notify::toast(&format!("Couldn't copy diagnostics: {e:#}")),
@@ -812,6 +841,7 @@ fn main() -> ExitCode {
             },
         };
         let watch_notifier = notifier;
+        control::start_pipe(control_clips.clone(), notifier);
         config_watch::start(watch_config.clone(), move || watch_notifier.quit());
         match Recorder::start(setup) {
             Ok(r) => {

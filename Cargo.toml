@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/retake", "crates/retake-audio", "crates/retake-core"]
+members = ["crates/retake", "crates/retake-audio", "crates/retake-core", "crates/retake-ui"]
 
 [workspace.package]
 version = "0.3.0"
