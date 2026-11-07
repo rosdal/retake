@@ -788,7 +788,14 @@ hotkey = \"Alt+Shift+K\""
     fn encoder_must_be_known() {
         let c = load_str("[capture]\nencoder = \"qsv\"").unwrap();
         assert_eq!(c.capture.encoder, EncoderSetting::Qsv);
-        let e = load_str("[capture]\nencoder = \"x264\"")
+        assert_eq!(
+            load_str("[capture]\nencoder = \"x264\"")
+                .unwrap()
+                .capture
+                .encoder,
+            EncoderSetting::X264
+        );
+        let e = load_str("[capture]\nencoder = \"x265\"")
             .unwrap_err()
             .to_string();
         assert!(e.contains("capture.encoder"), "{e}");

@@ -587,18 +587,27 @@ impl Loop {
                 fps: pick_fps(cap.fps, 0),
                 check: Err("no monitors found on the primary GPU".into()),
             });
-        self.session_warning = match check {
-            Ok(warnings) => {
-                for w in &warnings {
-                    tracing::warn!("{w}");
+        // CPU encoding is for testing: at most 60 fps, and always a warning.
+        let cpu = self.s.encoder == Encoder::X264;
+        let fps = if cpu { fps.min(60) } else { fps };
+        if cpu {
+            tracing::warn!(
+                "no hardware encoder: recording with the CPU (x264, {fps} fps) for testing only; it costs game performance"
+            );
+        }
+        self.session_warning = cpu
+            || match check {
+                Ok(warnings) => {
+                    for w in &warnings {
+                        tracing::warn!("{w}");
+                    }
+                    !warnings.is_empty()
                 }
-                !warnings.is_empty()
-            }
-            Err(e) => {
-                tracing::warn!("{e}");
-                true
-            }
-        };
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    true
+                }
+            };
         tracing::info!(
             output,
             fps,

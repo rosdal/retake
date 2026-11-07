@@ -400,7 +400,7 @@ fn main() -> ExitCode {
     // An explicit monitor must exist, and its warnings hold for every session. With "auto"
     // the recorder picks and checks the monitor per session: the primary's warnings here
     // could be about a monitor it never records.
-    let warnings = if config.capture.output == Auto::Auto {
+    let mut warnings = if config.capture.output == Auto::Auto {
         Vec::new()
     } else {
         match choice.check {
@@ -408,6 +408,7 @@ fn main() -> ExitCode {
             Err(e) => return fatal(&e),
         }
     };
+    warnings.extend(retake_core::games::Rules::from_config(&config).loosened());
     for w in &warnings {
         tracing::warn!("{w}");
     }

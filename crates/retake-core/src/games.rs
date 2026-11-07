@@ -428,6 +428,32 @@ impl Rules {
         })
     }
 
+    /// Warnings for games whose anti-cheat default was loosened in `[games.<id>]`.
+    pub fn loosened(&self) -> Vec<String> {
+        BUILTIN
+            .iter()
+            .filter(|p| p.anticheat.strict_by_default())
+            .filter(|p| {
+                self.overrides
+                    .get(p.id)
+                    .is_some_and(|o| o.strict == Some(false))
+            })
+            .map(|p| {
+                format!(
+                    "{}: strict safety is off although {} is a kernel-level anti-cheat; \
+                     game audio is captured by process id. Turn it back on if unsure.",
+                    p.name,
+                    p.anticheat.name()
+                )
+            })
+            .collect()
+    }
+
+    /// Whether an exe is already recorded (built-in, a user game or `[game] processes`).
+    pub fn knows(&self, exe: &str) -> bool {
+        self.identify(exe).is_some()
+    }
+
     /// The default profile for a fullscreen app.
     pub fn fullscreen_game(&self, exe: &str) -> Game {
         let mut g = resolve(&DEFAULT, "other", self.overrides.get("other"), self.strict);
@@ -583,6 +609,34 @@ mod tests {
         let (w, h, x, y) = crop_px(SIEGE_FEED, 1920, 1080);
         let (sw, sh, sx, sy) = crate::autoclip::feed_crop(1920, 1080);
         assert!(w.abs_diff(sw) <= 2 && h.abs_diff(sh) <= 2 && x.abs_diff(sx) <= 2 && y == sy);
+    }
+
+    #[test]
+    fn loosening_a_vanguard_game_warns() {
+        let mut r = Rules {
+            builtin: true,
+            ..Default::default()
+        };
+        assert!(r.loosened().is_empty());
+        r.overrides.insert(
+            "cs2".into(),
+            Override {
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(r.loosened().is_empty(), "CS2's default isn't strict");
+        r.overrides.insert(
+            "lol".into(),
+            Override {
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        let w = r.loosened();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("League of Legends") && w[0].contains("Vanguard"));
+        assert!(r.knows("cs2.exe") && !r.knows("notepad.exe"));
     }
 
     #[test]

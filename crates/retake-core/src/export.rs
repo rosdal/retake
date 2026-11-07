@@ -166,6 +166,16 @@ fn hevc10(enc: Encoder) -> Vec<String> {
             "14",
         ]),
         Encoder::Qsv => s(&["-c:v", "hevc_qsv", "-profile:v", "main10", "-q:v", "14"]),
+        Encoder::X264 => s(&[
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            "main10",
+            "-preset",
+            "fast",
+            "-x265-params",
+            "qp=14:log-level=error",
+        ]),
     }
 }
 
@@ -198,6 +208,10 @@ fn h264(enc: Encoder) -> Vec<String> {
             "30M",
         ]),
         Encoder::Qsv => s(&["-c:v", "h264_qsv", "-b:v", "20M", "-maxrate", "30M"]),
+        Encoder::X264 => s(&[
+            "-c:v", "libx264", "-preset", "medium", "-b:v", "20M", "-maxrate", "30M", "-bufsize",
+            "40M",
+        ]),
     }
 }
 

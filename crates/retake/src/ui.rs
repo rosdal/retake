@@ -81,6 +81,9 @@ const ID_MONTAGE_REFRESH: i32 = 174;
 const ID_MONTAGE_MSG: i32 = 175;
 const ID_MONTAGE_GAME: i32 = 176;
 const ID_CLIPS_GAME: i32 = 177;
+const ID_ADD_GAME: i32 = 144;
+/// Menu ids of "Add game…"'s process list start here.
+const ID_ADD_GAME_ITEM: i32 = 1000;
 const ID_SAVE: i32 = 140;
 const ID_REVERT: i32 = 141;
 const ID_OPEN_CONFIG: i32 = 142;
@@ -117,7 +120,7 @@ const FIELDS: &[(&str, Field)] = &[
         Field::Combo(
             "capture",
             "encoder",
-            &["\"auto\"", "\"amf\"", "\"nvenc\"", "\"qsv\""],
+            &["\"auto\"", "\"amf\"", "\"nvenc\"", "\"qsv\"", "\"x264\""],
         ),
     ),
     (
@@ -167,6 +170,10 @@ const FIELDS: &[(&str, Field)] = &[
     (
         "Motion blur on share/vertical",
         Field::Check("motion_blur", "enabled"),
+    ),
+    (
+        "Record any fullscreen app",
+        Field::Check("game", "any_fullscreen"),
     ),
 ];
 
@@ -685,6 +692,7 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
         settings.push(btn("Save", x0, by, ID_SAVE));
         settings.push(btn("Revert", x0 + 140, by, ID_REVERT));
         settings.push(btn("Open config file", x0 + 280, by, ID_OPEN_CONFIG));
+        settings.push(btn("Add game\u{2026}", x0 + 420, by, ID_ADD_GAME));
         // About
         let about = child(
             w!("EDIT"),
@@ -1290,6 +1298,122 @@ fn save_settings(ui: &Ui) {
     }
 }
 
+/// Exe names of running apps with a visible window that Retake doesn't record yet.
+fn addable_processes(config: &Path) -> Vec<String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lparam` is the Vec passed below, alive for the enumeration.
+        let pids = unsafe { &mut *(lparam.0 as *mut Vec<u32>) };
+        // SAFETY: plain queries on a window handle Windows gave us.
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() && GetWindowTextLengthW(hwnd) > 0 {
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                pids.push(pid);
+            }
+        }
+        true.into()
+    }
+    let mut pids: Vec<u32> = Vec::new();
+    // SAFETY: `pids` outlives the synchronous enumeration.
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut pids as isize)) };
+    let rules = read_config(config)
+        .1
+        .map(|c| retake_core::games::Rules::from_config(&c))
+        .unwrap_or_default();
+    let mut names: Vec<String> = crate::procs::processes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(p, _)| pids.contains(p))
+        .map(|(_, n)| n)
+        .filter(|n| retake_core::games::fullscreen_counts(n) && !rules.knows(n))
+        .filter(|n| {
+            // Windows' own apps aren't games.
+            ![
+                "TextInputHost.exe",
+                "SystemSettings.exe",
+                "WindowsTerminal.exe",
+                "Code.exe",
+            ]
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(n))
+        })
+        .collect();
+    names.sort_by_key(|n| n.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    names
+}
+
+/// "Add game…": a menu of running apps; the pick becomes `[games.<id>]` in config.toml.
+fn add_game(ui: &Ui) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, MF_GRAYED, MF_STRING,
+        TPM_RETURNCMD, TrackPopupMenu,
+    };
+    let names = addable_processes(&ui.setup.config);
+    // SAFETY: a menu we create, show and destroy here.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        if names.is_empty() {
+            let _ = AppendMenuW(
+                menu,
+                MF_GRAYED,
+                0,
+                w!("Start the game first, then try again"),
+            );
+        }
+        for (i, n) in names.iter().enumerate() {
+            let _ = AppendMenuW(menu, MF_STRING, ID_ADD_GAME_ITEM as usize + i, &wstr(n));
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD, pt.x, pt.y, None, ui.hwnd, None);
+        let _ = DestroyMenu(menu);
+        cmd.0
+    };
+    let Some(exe) = usize::try_from(picked - ID_ADD_GAME_ITEM)
+        .ok()
+        .filter(|_| picked >= ID_ADD_GAME_ITEM)
+        .and_then(|i| names.get(i))
+    else {
+        return;
+    };
+    let path = &ui.setup.config;
+    let (text, _) = read_config(path);
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        set_text(ui.settings_msg, "config.toml can't be read.");
+        return;
+    };
+    let id = retake_core::games::id_for_exe(exe);
+    let name = exe.rsplit_once('.').map_or(exe.as_str(), |(s, _)| s);
+    if doc.get("games").is_none() {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        doc["games"] = toml_edit::Item::Table(t);
+    }
+    let mut exes = toml_edit::Array::new();
+    exes.push(exe.as_str());
+    doc["games"][&id]["name"] = toml_edit::value(name);
+    doc["games"][&id]["exes"] = toml_edit::value(exes);
+    let new = doc.to_string();
+    if let Err(e) = config::load_str(&new) {
+        set_text(ui.settings_msg, &format!("Not added: {e}"));
+        return;
+    }
+    match std::fs::write(path, new) {
+        Ok(()) => set_text(
+            ui.settings_msg,
+            &format!(
+                "Added {name}. Retake restarts to record it (after the match if a game runs)."
+            ),
+        ),
+        Err(e) => set_text(ui.settings_msg, &format!("Not added: {e}")),
+    }
+}
+
 fn delete_clip(p: &Path) {
     let stem = p
         .file_stem()
@@ -1391,6 +1515,7 @@ fn on_command(id: i32) {
             ID_SAVE => save_settings(ui),
             ID_REVERT => load_settings(ui),
             ID_OPEN_CONFIG => crate::tray::open_path(&ui.setup.config),
+            ID_ADD_GAME => add_game(ui),
             ID_OPEN_LOGS => crate::tray::open_path(&ui.setup.logs),
             ID_COPY_DIAG => return Some(MediaAction::CopyDiagnostics),
             _ => {}

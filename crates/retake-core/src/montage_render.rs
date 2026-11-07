@@ -261,6 +261,10 @@ pub fn render_args(
             "-look_ahead",
             "0",
         ],
+        Encoder::X264 => [
+            "-c:v", "libx264", "-preset", "medium", "-b:v", "16M", "-maxrate", "24M", "-bufsize",
+            "32M",
+        ],
     };
     a.extend(enc.map(String::from));
     a.extend(["-c:a", "aac", "-b:a", "256k", "-r"].map(String::from));
