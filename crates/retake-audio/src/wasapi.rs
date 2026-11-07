@@ -511,8 +511,12 @@ mod tests {
             |_, _| {},
         )
         .err();
-        // On a machine without any microphone this still errors, just with "none".
-        let e = e.expect("a missing mic must fail").to_string();
-        assert!(e.contains("no such mic 1234"), "{e}");
+        // On a machine without any microphone this still errors, just with "none"; on a CI
+        // runner without the audio service the enumerator itself fails first.
+        let e = format!("{:#}", e.expect("a missing mic must fail"));
+        assert!(
+            e.contains("no such mic 1234") || e.contains("enumerator"),
+            "{e}"
+        );
     }
 }
