@@ -69,6 +69,7 @@ pub fn start_status_writer(setup: StatusSetup) {
                     exporting: b.exporting,
                     paused: b.paused,
                     montage_busy: crate::montage::busy(),
+                    montage_progress: crate::montage::progress(),
                     warnings: b.warnings.clone(),
                     events: b.events.iter().cloned().collect(),
                     clips_dir: setup.clips_dir.clone(),
@@ -198,6 +199,7 @@ pub fn action_of(c: Command, clips: &Path) -> Option<MediaAction> {
         Command::MontageRender { dir, preview } => {
             MediaAction::Montage(Job::Render { dir, preview })
         }
+        Command::MontageCancel => MediaAction::MontageCancel,
         Command::CopyDiagnostics => MediaAction::CopyDiagnostics,
         Command::Autostart { on } => MediaAction::Autostart(on),
         Command::OpenLite => MediaAction::OpenLite,

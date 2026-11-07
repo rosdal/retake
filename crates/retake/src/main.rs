@@ -870,6 +870,7 @@ fn main() -> ExitCode {
                 }
             }
             tray::MediaAction::OpenLite => ui::show(),
+            tray::MediaAction::MontageCancel => montage::cancel(),
             tray::MediaAction::Trim(clip, from, to) => {
                 let (ff, lib, jobs, clips) = (
                     montage_ffmpeg.clone(),

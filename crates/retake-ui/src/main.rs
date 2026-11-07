@@ -147,6 +147,34 @@ impl std::fmt::Display for Named2 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransitionChoice(retake_core::montage::Transitions);
+
+impl std::fmt::Display for TransitionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use retake_core::montage::Transitions as T;
+        f.write_str(match self.0 {
+            T::Cuts => "Cuts only",
+            T::MostlyCuts => "Mostly cuts",
+            T::Flashy => "Flashy",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterpChoice(retake_core::montage::Interpolation);
+
+impl std::fmt::Display for InterpChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use retake_core::montage::Interpolation as I;
+        f.write_str(match self.0 {
+            I::Auto => "Smooth slow-mo: auto",
+            I::Always => "Smooth slow-mo: always",
+            I::Off => "Smooth slow-mo: off",
+        })
+    }
+}
+
 /// The player's state (clip view and montage preview).
 #[derive(Debug, Clone)]
 struct Player {
@@ -280,6 +308,13 @@ enum Message {
     StyleBpm(String),
     StyleStart(String),
     ApplyStyle,
+    StyleSlowmo(f32),
+    StyleBlur(f32),
+    StyleShake(f32),
+    StylePunch(f32),
+    StyleTransitions(TransitionChoice),
+    StyleInterpolation(InterpChoice),
+    CancelRender,
     RemoveFromMontage,
     SettingsQuery(String),
     SettingToggle(usize, bool),
@@ -1078,6 +1113,16 @@ impl App {
                 });
                 Task::none()
             }
+            Message::StyleSlowmo(v) => self.style_edit(|s| s.slowmo = f64::from(v)),
+            Message::StyleBlur(v) => self.style_edit(|s| s.blur = f64::from(v)),
+            Message::StyleShake(v) => self.style_edit(|s| s.shake = f64::from(v)),
+            Message::StylePunch(v) => self.style_edit(|s| s.punch = f64::from(v)),
+            Message::StyleTransitions(c) => self.style_edit(|s| s.transitions = c.0),
+            Message::StyleInterpolation(c) => self.style_edit(|s| s.interpolation = c.0),
+            Message::CancelRender => {
+                self.send(Command::MontageCancel);
+                Task::none()
+            }
             Message::RemoveFromMontage => {
                 let sel = self.editor.as_ref().and_then(|e| e.selected);
                 if let Some(i) = sel {
@@ -1176,6 +1221,15 @@ impl App {
             }
             Message::Key(key, m) => self.on_key(key, m),
         }
+    }
+
+    /// Changes the montage's style and saves it (sliders save as they move).
+    fn style_edit(&mut self, f: impl FnOnce(&mut retake_core::montage::Style)) -> Task<Message> {
+        self.edit_montage(|p| {
+            f(&mut p.style);
+            p.style = p.style.clamped();
+        });
+        Task::none()
     }
 
     fn set_field(&mut self, i: usize, v: &str) {
@@ -2151,6 +2205,115 @@ impl App {
         .spacing(8)
         .align_y(Alignment::Center)
         .wrap();
+        let progress: Element<'a, Message> =
+            match self.status.as_ref().and_then(|s| s.montage_progress) {
+                Some(p) if busy => row![
+                    iced::widget::progress_bar(0.0..=1.0, p)
+                        .height(10)
+                        .style(|_| iced::widget::progress_bar::Style {
+                            background: iced::Background::Color(style::RAISED),
+                            bar: iced::Background::Color(style::ACCENT),
+                            border: iced::Border {
+                                radius: 5.0.into(),
+                                ..Default::default()
+                            },
+                        }),
+                    text(format!("{:.0} %", p * 100.0))
+                        .size(13)
+                        .color(style::MUTED),
+                    button(text("Cancel"))
+                        .on_press(Message::CancelRender)
+                        .padding([13, 16])
+                        .style(style::danger),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .into(),
+                _ => Space::with_height(0).into(),
+            };
+        let st = m.project.style;
+        let slider_row = |label: &'static str,
+                          value: f32,
+                          range: std::ops::RangeInclusive<f32>,
+                          step: f32,
+                          shown: String,
+                          on: fn(f32) -> Message| {
+            row![
+                text(label).size(13).width(130),
+                iced::widget::slider(range, value, on)
+                    .step(step)
+                    .width(Length::Fill),
+                text(shown).size(13).color(style::MUTED).width(56),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+        };
+        use retake_core::montage::{Interpolation as I, Transitions as T};
+        let effects = container(
+            column![
+                text("Style").size(15).font(style::GROTESK_BOLD),
+                slider_row(
+                    "Slow-mo on the drop",
+                    st.slowmo as f32,
+                    0.2..=0.6,
+                    0.05,
+                    format!("{:.2}x", st.slowmo),
+                    Message::StyleSlowmo
+                ),
+                slider_row(
+                    "Motion blur",
+                    st.blur as f32,
+                    0.0..=1.5,
+                    0.1,
+                    format!("{:.1}", st.blur),
+                    Message::StyleBlur
+                ),
+                slider_row(
+                    "Shake on kills",
+                    st.shake as f32,
+                    0.0..=1.0,
+                    0.1,
+                    format!("{:.1}", st.shake),
+                    Message::StyleShake
+                ),
+                slider_row(
+                    "Zoom punch",
+                    st.punch as f32,
+                    0.0..=0.15,
+                    0.01,
+                    format!("{:.0} %", st.punch * 100.0),
+                    Message::StylePunch
+                ),
+                row![
+                    pick_list(
+                        [
+                            TransitionChoice(T::Cuts),
+                            TransitionChoice(T::MostlyCuts),
+                            TransitionChoice(T::Flashy)
+                        ],
+                        Some(TransitionChoice(st.transitions)),
+                        Message::StyleTransitions
+                    )
+                    .padding(13),
+                    pick_list(
+                        [
+                            InterpChoice(I::Auto),
+                            InterpChoice(I::Always),
+                            InterpChoice(I::Off)
+                        ],
+                        Some(InterpChoice(st.interpolation)),
+                        Message::StyleInterpolation
+                    )
+                    .padding(13),
+                ]
+                .spacing(10)
+                .wrap(),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(Length::Fill)
+        .style(style::panel);
         let status = if busy {
             text("Working on a montage… you can keep playing; Retake tells you when it's done.")
                 .color(style::ACCENT)
@@ -2177,8 +2340,9 @@ impl App {
             .color(style::MUTED),
             timeline,
             status,
+            progress,
             scrollable(
-                column![style_panel, actions, preview]
+                column![style_panel, effects, actions, preview]
                     .spacing(12)
                     .padding(iced::Padding {
                         right: 16.0,

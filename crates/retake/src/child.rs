@@ -129,6 +129,16 @@ impl ChildJob {
 }
 
 impl ChildJob {
+    /// Puts an already spawned child in this job, so it dies with Retake.
+    pub fn adopt(&self, child: &std::process::Child) {
+        // SAFETY: both handles are valid for the duration of the call.
+        if let Err(e) =
+            unsafe { AssignProcessToJobObject(self.handle, HANDLE(child.as_raw_handle())) }
+        {
+            tracing::warn!("a child runs outside Retake's job: {e}");
+        }
+    }
+
     /// Runs `exe args…` to completion in this job (so it dies with Retake), with no window, at
     /// below-normal priority, and returns its output.
     pub fn run_output<S: AsRef<OsStr>>(

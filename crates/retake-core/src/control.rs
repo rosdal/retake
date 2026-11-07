@@ -52,6 +52,8 @@ pub enum Command {
         dir: PathBuf,
         preview: bool,
     },
+    /// Stop the montage render that is running.
+    MontageCancel,
     CopyDiagnostics,
     Autostart {
         on: bool,
@@ -114,6 +116,8 @@ pub struct Status {
     pub exporting: bool,
     pub paused: bool,
     pub montage_busy: bool,
+    /// How far the running montage render is, 0–1.
+    pub montage_progress: Option<f32>,
     pub warnings: Vec<String>,
     pub events: Vec<(String, String)>,
     pub clips_dir: PathBuf,

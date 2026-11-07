@@ -128,6 +128,90 @@ pub fn create(
     Ok(dir)
 }
 
+static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Render progress in thousandths (u32::MAX = no render running).
+static PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// How far the running render is, 0–1.
+pub fn progress() -> Option<f32> {
+    let p = PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+    (p != u32::MAX).then(|| p as f32 / 1000.0)
+}
+
+/// Stops the running render (it fails with "cancelled").
+pub fn cancel() {
+    if progress().is_some() {
+        CANCEL.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Runs the render, following ffmpeg's `-progress` output (`out_time_us=` against the
+/// montage length), and stops it when cancelled.
+fn run_with_progress(ffmpeg: &Path, args: &[String], length: f64) -> Result<()> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+    use std::sync::atomic::Ordering;
+    let mut full: Vec<String> = vec!["-progress".into(), "pipe:1".into(), "-nostats".into()];
+    full.extend(args.iter().cloned());
+    let mut child = std::process::Command::new(ffmpeg)
+        .args(&full)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+        .creation_flags(0x0800_0000 | 0x0000_4000)
+        .spawn()
+        .context("starting ffmpeg")?;
+    job().adopt(&child);
+    CANCEL.store(false, Ordering::Release);
+    PROGRESS.store(0, Ordering::Relaxed);
+    let stderr = child.stderr.take();
+    let errors = std::thread::spawn(move || {
+        let mut last: Vec<String> = Vec::new();
+        if let Some(e) = stderr {
+            for l in std::io::BufReader::new(e).lines().map_while(Result::ok) {
+                if !l.trim().is_empty() {
+                    last.push(l);
+                    if last.len() > 6 {
+                        last.remove(0);
+                    }
+                }
+            }
+        }
+        last
+    });
+    let mut cancelled = false;
+    if let Some(out) = child.stdout.take() {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if let Some(us) = line
+                .strip_prefix("out_time_us=")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+            {
+                let p = (us / 1e6 / length.max(0.1)).clamp(0.0, 1.0);
+                PROGRESS.store((p * 1000.0) as u32, Ordering::Relaxed);
+            }
+            if CANCEL.load(Ordering::Acquire) {
+                let _ = child.kill();
+                cancelled = true;
+                break;
+            }
+        }
+    }
+    let status = child.wait()?;
+    PROGRESS.store(u32::MAX, Ordering::Relaxed);
+    let last = errors.join().unwrap_or_default();
+    if cancelled {
+        bail!("cancelled");
+    }
+    if !status.success() {
+        bail!(
+            "rendering the montage: ffmpeg exited with {status}: {}",
+            last.join(" / ")
+        );
+    }
+    Ok(())
+}
+
 /// A punchier version of the built-in look for montages.
 fn montage_look() -> Cube {
     let base = builtin_look(33);
@@ -203,21 +287,10 @@ pub fn render(
             .collect(),
         game_db: -10.0,
         killfeed: true,
+        style: p.style,
     };
     let args = render_args(&placed, &sources, &p.song, start, p.length, &opts, &out);
-    let o = job().run_output(ffmpeg, &args)?;
-    if !o.status.success() {
-        let err = String::from_utf8_lossy(&o.stderr);
-        bail!(
-            "rendering the montage: ffmpeg exited with {}: {}",
-            o.status,
-            err.lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(6)
-                .collect::<Vec<_>>()
-                .join(" / ")
-        );
-    }
+    run_with_progress(ffmpeg, &args, p.length)?;
     // A Resolve timeline of the same arrangement, for polishing by hand.
     let name = dir
         .file_name()
@@ -375,6 +448,10 @@ pub fn run_in_background(
                 Ok(msg) => {
                     crate::status::event(msg.clone());
                     crate::notify::toast(&msg);
+                }
+                Err(e) if e.to_string() == "cancelled" => {
+                    crate::status::event("Montage cancelled");
+                    crate::notify::toast("Montage cancelled.");
                 }
                 Err(e) => {
                     tracing::warn!("montage: {e:#}");

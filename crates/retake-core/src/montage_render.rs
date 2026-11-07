@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::autoconf::Encoder;
-use crate::montage::{Format, MAX_SPEED, Placed};
+use crate::montage::{Format, Interpolation, MAX_SPEED, Placed, Role, Style, Transitions};
 
 /// Output frame rate.
 pub const FPS: u32 = 60;
@@ -32,7 +32,16 @@ pub struct RenderOpts {
     /// Vertical montages: show the source's kill feed (which the 9:16 crop cuts off) near
     /// the top of the frame.
     pub killfeed: bool,
+    /// Speeds, blur, shakes and transitions.
+    pub style: Style,
 }
+
+/// How long a zoom whip lasts on each side of the cut into the drop.
+const WHIP: f64 = 0.12;
+/// How much a zoom whip zooms in.
+const WHIP_ZOOM: f64 = 0.35;
+/// How long a flash cut lasts.
+const FLASH: f64 = 0.07;
 
 /// Facts about a source clip.
 #[derive(Debug, Clone, Copy)]
@@ -86,15 +95,22 @@ pub fn render_args(
     let mut vlabels = Vec::new();
     let mut alabels = Vec::new();
     let mut n = 0usize;
-    for x in placed {
+    let style = o.style.clamped();
+    for (pi, x) in placed.iter().enumerate() {
         let i = input_of(&x.file);
+        // The zoom whip runs from the end of the clip before the drop into the drop.
+        let whip = style.transitions != Transitions::Cuts;
+        let whip_out = whip && placed.get(pi + 1).is_some_and(|nx| nx.role == Role::Drop);
+        let whip_in = whip && x.role == Role::Drop && pi > 0;
+        let flash = style.transitions == Transitions::Flashy && pi > 0;
         let src = sources.get(i).map(|s| s.1).unwrap_or(Source {
             fps: 60.0,
             width: 1920,
             height: 1080,
             has_audio: false,
         });
-        for s in &x.segs {
+        let last_seg = x.segs.len().saturating_sub(1);
+        for (si, s) in x.segs.iter().enumerate() {
             let v = s.speed();
             let dur = s.out1 - s.out0;
             // The feed region is see-through when empty, so it shows only while a kill's row
@@ -132,21 +148,30 @@ pub fn render_args(
             }
             // Frames the source has per output second at this speed.
             let have = src.fps * v;
-            if !o.preview && have < f64::from(FPS) * 0.9 {
+            let interpolate = match style.interpolation {
+                Interpolation::Auto => have < f64::from(FPS) * 0.9,
+                Interpolation::Always => v < 1.0 - 1e-9,
+                Interpolation::Off => false,
+            };
+            if !o.preview && interpolate {
                 let _ = write!(
                     chain,
                     ",minterpolate=fps={FPS}:mi_mode=mci:mc_mode=obmc:me_mode=bidir"
                 );
-            } else if !o.preview && v > 1.2 {
-                // Blend the frames a fast part skips, then pick the output rate.
-                let blend = ((src.fps * v / f64::from(FPS)).round() as usize).clamp(2, 8);
+            } else if !o.preview && v > 1.2 && style.blur > 0.0 {
+                // Blend the frames a fast part skips (more with more blur), then pick the
+                // output rate.
+                let blend =
+                    ((src.fps * v / f64::from(FPS) * style.blur).round() as usize).clamp(2, 8);
                 let _ = write!(chain, ",tmix=frames={blend}");
             }
             let _ = write!(chain, ",fps={FPS}");
             let _ = write!(chain, ",scale={w}:{h}:flags=lanczos,setsar=1");
-            if !o.preview {
+            if !o.preview && (style.shake > 0.0 || style.punch > 0.0) {
                 // A shake and a pump on each kill inside this piece (t is piece-local).
                 // Inclusive: a kill on a cut gets the effect on both sides of it.
+                let (sx, sy) = (16.0 * style.shake, 13.0 * style.shake);
+                let pump = style.punch;
                 for &(_, at) in x
                     .kills
                     .iter()
@@ -155,7 +180,31 @@ pub fn render_args(
                     let t = at - s.out0;
                     let _ = write!(
                         chain,
-                        ",scale=w='iw*(1+0.07*exp(-pow((t-{t:.3})*9,2)))':h=-2:eval=frame,crop={w}:{h}:'(iw-{w})/2+10*sin((t-{t:.3})*90)*exp(-abs(t-{t:.3})*14)':'(ih-{h})/2+8*cos((t-{t:.3})*80)*exp(-abs(t-{t:.3})*14)'"
+                        ",scale=w='iw*(1+{pump:.3}*exp(-pow((t-{t:.3})*9,2)))':h=-2:eval=frame,crop={w}:{h}:'(iw-{w})/2+{sx:.1}*sin((t-{t:.3})*90)*exp(-abs(t-{t:.3})*14)':'(ih-{h})/2+{sy:.1}*cos((t-{t:.3})*80)*exp(-abs(t-{t:.3})*14)'"
+                    );
+                }
+            }
+            if !o.preview {
+                // Transitions. Out of the clip before the drop: zoom in fast over its last
+                // frames; into the drop: start zoomed and settle.
+                if whip_out && si == last_seg && dur > WHIP {
+                    let a = dur - WHIP;
+                    let _ = write!(
+                        chain,
+                        ",scale=w='iw*(1+{WHIP_ZOOM}*pow(clip((t-{a:.3})/{WHIP},0,1),2))':h=-2:eval=frame,crop={w}:{h}"
+                    );
+                }
+                if whip_in && si == 0 && dur > WHIP {
+                    let _ = write!(
+                        chain,
+                        ",scale=w='iw*(1+{WHIP_ZOOM}*pow(clip(1-t/{WHIP},0,1),2))':h=-2:eval=frame,crop={w}:{h}"
+                    );
+                }
+                // Flashy: a short brightness spike at the start of every new clip.
+                if flash && si == 0 {
+                    let _ = write!(
+                        chain,
+                        ",eq=brightness='0.35*clip(1-t/{FLASH},0,1)':eval=frame"
                     );
                 }
             }
@@ -342,6 +391,7 @@ mod tests {
             encoder: Encoder::Amf,
             look: Some(PathBuf::from(r"D:\c\look.cube")),
             clip_looks: Vec::new(),
+            style: Style::default(),
             game_db: -10.0,
             killfeed: true,
         }
@@ -379,6 +429,51 @@ mod tests {
         assert!(g.contains("aevalsrc=0:d=0.4688"));
         assert!(g.contains("atempo=0.64000"));
         assert!(a.windows(2).any(|w| w == ["-ss", "30.000"]));
+    }
+
+    #[test]
+    fn the_style_drives_effects_and_transitions() {
+        let base = |style: Style| {
+            let mut o = opts(false);
+            o.style = style;
+            let args = render_args(
+                &placed(),
+                &sources(60.0),
+                Path::new("s.mp3"),
+                0.0,
+                25.0,
+                &o,
+                Path::new("o.mp4"),
+            );
+            graph(&args).to_owned()
+        };
+        let def = base(Style::default());
+        // Mostly cuts: a zoom whip into the drop (out of the clip before, into the drop).
+        assert_eq!(def.matches("pow(clip((t-").count(), 1, "{def}");
+        assert_eq!(def.matches("pow(clip(1-t/").count(), 1, "{def}");
+        assert!(!def.contains("eq=brightness"));
+        let cuts = base(Style {
+            transitions: Transitions::Cuts,
+            ..Style::default()
+        });
+        assert!(!cuts.contains("pow(clip("));
+        let flashy = base(Style {
+            transitions: Transitions::Flashy,
+            ..Style::default()
+        });
+        assert_eq!(flashy.matches("eq=brightness").count(), placed().len() - 1);
+        // No shake or punch: no per-kill rescale; no interpolation when it's off.
+        let calm = base(Style {
+            shake: 0.0,
+            punch: 0.0,
+            interpolation: Interpolation::Off,
+            ..Style::default()
+        });
+        assert!(!calm.contains("exp(-pow") && !calm.contains("minterpolate"));
+        assert!(
+            def.contains("minterpolate"),
+            "60 fps sources slowed down are interpolated"
+        );
     }
 
     #[test]

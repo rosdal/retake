@@ -142,6 +142,76 @@ pub struct Project {
     #[serde(default)]
     pub bpm: Option<f64>,
     pub clips: Vec<ProjClip>,
+    /// How the montage looks: speeds, blur, shakes, transitions.
+    #[serde(default)]
+    pub style: Style,
+}
+
+/// Transitions between clips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transitions {
+    /// Hard cuts on the beat everywhere.
+    Cuts,
+    /// Hard cuts, and a zoom whip into the drop.
+    #[default]
+    MostlyCuts,
+    /// Zoom whips into the drop and a flash on every cut.
+    Flashy,
+}
+
+/// When slow parts get interpolated frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Interpolation {
+    /// Where the source has fewer real frames than the output needs.
+    #[default]
+    Auto,
+    /// Every slowed part.
+    Always,
+    Off,
+}
+
+/// The montage's style (the Montage tab's style panel).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Style {
+    /// Speed of the deep slow-mo after the drop's first kill (0.2–0.6).
+    pub slowmo: f64,
+    /// Motion blur on fast parts (0 = off, 1.5 = heavy).
+    pub blur: f64,
+    /// Shake on kills (0–1).
+    pub shake: f64,
+    /// Zoom punch on kills, as a fraction (0–0.15).
+    pub punch: f64,
+    pub transitions: Transitions,
+    pub interpolation: Interpolation,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            slowmo: DROP_SLOWMO,
+            blur: 0.8,
+            shake: 0.6,
+            punch: 0.07,
+            transitions: Transitions::MostlyCuts,
+            interpolation: Interpolation::Auto,
+        }
+    }
+}
+
+impl Style {
+    /// The style with every value inside its range.
+    pub fn clamped(self) -> Style {
+        Style {
+            slowmo: self.slowmo.clamp(0.2, 0.6),
+            blur: self.blur.clamp(0.0, 1.5),
+            shake: self.shake.clamp(0.0, 1.0),
+            punch: self.punch.clamp(0.0, 0.15),
+            ..self
+        }
+    }
 }
 
 impl Project {
@@ -175,6 +245,7 @@ impl Project {
             length: format.default_length(),
             bpm: None,
             clips: clips.iter().map(proj_clip).collect(),
+            style: Style::default(),
         }
     }
 
@@ -289,6 +360,7 @@ fn beat_for(beats: &[f64], from_out: f64, src0: f64, src1: f64, after: f64) -> O
 /// Places one clip from output time `t0` (a beat): each kill on its own beat, speeds within
 /// limits; a kill that can't fit is left out (the clip stays). Ends on the beat after its
 /// last kill. `first_on` forces the first kill onto that exact beat (the drop).
+#[allow(clippy::too_many_arguments)]
 fn place(
     c: &ProjClip,
     role: Role,
@@ -297,6 +369,7 @@ fn place(
     lead: f64,
     first_on: Option<f64>,
     limit: f64,
+    slowmo: f64,
 ) -> Option<Placed> {
     let mut kills: Vec<f64> = c
         .kills
@@ -355,7 +428,7 @@ fn place(
         if role == Role::Drop && i == 0 {
             let next = beats.iter().copied().find(|&x| x > out + 1e-9);
             if let Some(nb) = next.filter(|&nb| nb <= limit) {
-                let s1 = (src + DROP_SLOWMO * (nb - out)).min(c.duration);
+                let s1 = (src + slowmo * (nb - out)).min(c.duration);
                 segs.push(Seg {
                     out0: out,
                     out1: nb,
@@ -394,6 +467,7 @@ fn place(
 /// a quick hook, a build in rising score order, the best multi-kill with its first kill on
 /// the drop, and an outro if time remains. Output times are seconds from the montage start.
 pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
+    let slowmo = p.style.clamped().slowmo;
     let start = p.song_start.unwrap_or_else(|| song.window_start(p.length));
     let beats: Vec<f64> = song
         .beats
@@ -458,6 +532,7 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
             0.6,
             None,
             (drop_out - drop_lead_room).max(1.0),
+            slowmo,
         )
     {
         t = x.end();
@@ -475,6 +550,7 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
             1.0,
             None,
             drop_out - drop_lead_room,
+            slowmo,
         ) {
             t = x.end();
             placed.push(x);
@@ -486,7 +562,7 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
             .copied()
             .min_by(|a, b| (a - drop_out).abs().total_cmp(&(b - drop_out).abs()));
         if let Some(on) = on.filter(|&on| on > t)
-            && let Some(x) = place(d, Role::Drop, &beats, t, 1.5, Some(on), p.length)
+            && let Some(x) = place(d, Role::Drop, &beats, t, 1.5, Some(on), p.length, slowmo)
         {
             t = x.end();
             placed.push(x);
@@ -501,7 +577,7 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
         if p.length - t < 1.0 {
             break;
         }
-        if let Some(x) = place(b, Role::Outro, &beats, t, 0.8, None, p.length) {
+        if let Some(x) = place(b, Role::Outro, &beats, t, 0.8, None, p.length, slowmo) {
             t = x.end();
             placed.push(x);
         }
@@ -696,6 +772,22 @@ mod tests {
         let after = builds(&p);
         assert_eq!(after[0], before[1], "{before:?} -> {after:?}");
         assert_eq!(p.move_clip(0, true), 0, "the top clip stays put");
+    }
+
+    #[test]
+    fn the_style_sets_the_drop_slowmo() {
+        let a = analysis();
+        let mut p = project();
+        p.style.slowmo = 0.5;
+        let placed = arrange(&p, &a);
+        let drop = placed.iter().find(|x| x.role == Role::Drop).unwrap();
+        assert!(drop.segs.iter().any(|s| (s.speed() - 0.5).abs() < 1e-6));
+        // Out-of-range values are clamped, and old projects without a style get the default.
+        p.style.slowmo = 5.0;
+        assert_eq!(p.style.clamped().slowmo, 0.6);
+        let old = p.to_toml().replace("[style]", "[ignored]");
+        let back = Project::from_toml(old.split("[ignored]").next().unwrap());
+        assert_eq!(back.map(|b| b.style), Ok(Style::default()));
     }
 
     #[test]

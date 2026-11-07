@@ -231,6 +231,8 @@ pub enum MediaAction {
     OpenLite,
     /// Keep a range of a clip as a new clip.
     Trim(PathBuf, f64, f64),
+    /// Stop the running montage render.
+    MontageCancel,
 }
 
 /// Opens the styled window, or the plain one if it isn't installed.
