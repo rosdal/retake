@@ -43,6 +43,20 @@ pub struct ClipJob {
     pub to: Ms,
 }
 
+/// A clip asked for after recording stopped (the game closed or crashed) would mostly cover
+/// time with nothing recorded. It is moved back to end where the recording ended, so F9 right
+/// after a crash still saves the moment of the crash.
+pub fn after_stop(job: &ClipJob, recording_end: Ms) -> ClipJob {
+    let mut j = job.clone();
+    if j.to > recording_end {
+        let shift = j.to - recording_end;
+        j.to = recording_end;
+        j.from = j.from.saturating_sub(shift);
+        j.press = j.press.saturating_sub(shift);
+    }
+    j
+}
+
 /// How much shorter than the buffer a merged clip must stay: the segment being written plus
 /// the wait for the last one to close (the same 4 s `config` requires beyond the rolls).
 pub const MERGE_MARGIN: Ms = 4_000;
@@ -395,6 +409,29 @@ mod mux_tests {
             Path::new("o.mkv"),
         );
         assert!(a.contains(&r"concat:D:\w\000.ts|D:\w\001.ts".to_string()));
+    }
+
+    #[test]
+    fn a_press_after_the_recording_ended_saves_its_last_seconds() {
+        let job = ClipJob {
+            id: 1,
+            kind: Kind::Normal,
+            press: 100_000,
+            stamp: Stamp {
+                year: 2026,
+                month: 11,
+                day: 7,
+                hour: 1,
+                minute: 0,
+                second: 0,
+            },
+            from: 85_000,
+            to: 103_000,
+        };
+        let j = after_stop(&job, 80_000);
+        assert_eq!((j.from, j.to, j.press), (62_000, 80_000, 77_000));
+        // Recording still covers the clip: unchanged.
+        assert_eq!(after_stop(&job, 200_000), job);
     }
 
     #[test]

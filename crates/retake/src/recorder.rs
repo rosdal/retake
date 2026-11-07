@@ -285,7 +285,7 @@ impl Loop {
                     cmd = self.spawn(now);
                 }
                 Command::StopSession => {
-                    tracing::info!("game closed; stopping recording");
+                    tracing::info!("stopping recording");
                     // No ffmpeg here means it crashed earlier, mid-segment.
                     let clean = self.stop_ffmpeg();
                     self.speed.reset();

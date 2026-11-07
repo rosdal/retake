@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use retake_core::Ms;
 use retake_core::clip::{
-    ClipJob, Kind, Press, Scheduler, clip_name, concat_list, numbered, parse_concat_list,
-    ts_join_args, ts_mux_args,
+    ClipJob, Kind, Press, Scheduler, after_stop, clip_name, concat_list, numbered,
+    parse_concat_list, ts_join_args, ts_mux_args,
 };
 use retake_core::ffmpeg_args::INDEX_FILE;
 use retake_core::segments::{SEGMENT_MS, Segment, parse_index, select, still_intact, writing_file};
@@ -159,6 +159,14 @@ pub fn save(
 ) -> Result<PathBuf> {
     let s = current(slot).context("not recording; no clip saved")?;
     let listed = read_index(&s.buffer_dir, s.start);
+    let moved;
+    let job = match listed.last() {
+        Some(last) if !s.live && job.to > last.end => {
+            moved = after_stop(job, last.end);
+            &moved
+        }
+        _ => job,
+    };
     // A torn stop leaves the slot after the newest half-written, like a live run.
     let writing = if s.live || s.torn {
         writing_file(&listed, s.wrap)
@@ -220,6 +228,9 @@ pub fn save(
     let list = work.0.join("list.txt");
     fs::write(&list, concat_list(&kept_names)).context("writing concat list")?;
 
+    // The clips folder may have been moved or deleted since startup; recreate it if the drive
+    // is still there (if not, this fails and the save reports it).
+    fs::create_dir_all(&dirs.raw).with_context(|| format!("creating {}", dirs.raw.display()))?;
     let name = clip_name(job.stamp, job.kind);
     let mut out = dirs.raw.join(&name);
     let mut n = 2;
