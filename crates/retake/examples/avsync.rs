@@ -181,7 +181,7 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
                 let v = if click_left > 0 {
                     click_left -= 1;
                     phase += 2.0 * std::f32::consts::PI * 1_000.0 / 48_000.0;
-                    (phase.sin() * 12_000.0) as i16
+                    (phase.sin() * 6_000.0) as i16
                 } else {
                     0
                 };
