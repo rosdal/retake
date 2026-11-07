@@ -1,10 +1,14 @@
-//! Which monitor Siege's window is on. Only the list of top-level windows and the process id
-//! each belongs to are read: Siege's process is never opened (anti-cheat rule 1).
+//! Which monitor the game's window is on, and whether the foreground app is fullscreen. Only
+//! the list of top-level windows and the process id each belongs to are read: no game's
+//! process is ever opened (anti-cheat rule 1).
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetShellWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindowVisible,
 };
 use windows::core::BOOL;
 
@@ -51,6 +55,38 @@ pub fn game_monitor(pids: &[u32]) -> Option<isize> {
     // SAFETY: a plain query on a window handle.
     let m = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     (!m.is_invalid()).then_some(m.0 as isize)
+}
+
+/// The process id of the foreground window if it covers its whole monitor (borderless or
+/// exclusive fullscreen), else `None`. The desktop itself never counts.
+pub fn fullscreen_pid() -> Option<u32> {
+    // SAFETY: plain queries on window and monitor handles Windows gives us.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() || hwnd == GetShellWindow() || !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).ok()?;
+        let m = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(m, &mut mi).as_bool() {
+            return None;
+        }
+        let mr = mi.rcMonitor;
+        if !retake_core::games::covers_monitor(
+            (r.left, r.top, r.right, r.bottom),
+            (mr.left, mr.top, mr.right, mr.bottom),
+        ) {
+            return None;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (pid != 0).then_some(pid)
+    }
 }
 
 #[cfg(test)]

@@ -45,7 +45,8 @@ pub struct Setup {
     /// `--diag`: log memory and handle counts every 5 minutes.
     pub diag: bool,
     pub encoder: Encoder,
-    pub processes: Vec<String>,
+    /// Which processes are games, and their profiles.
+    pub rules: retake_core::games::Rules,
     /// A startup warning (monitor refresh, HDR) keeps the icon yellow.
     pub warning: bool,
     pub job: Arc<ChildJob>,
@@ -56,6 +57,8 @@ pub struct Setup {
     pub quiet: SharedGate,
     /// Called when a recording session ends (the game closed).
     pub on_session_end: Box<dyn Fn() + Send>,
+    /// Wait this long before watching for the game (started with Windows).
+    pub start_delay_ms: u64,
 }
 
 enum Event {
@@ -63,6 +66,8 @@ enum Event {
     Stats(u64, Stats),
     /// The PC is going to sleep (`true`) or has resumed (`false`).
     Power(bool),
+    /// Pause (`true`) or resume (`false`) recording, from the tray or the window.
+    Pause(bool),
     Shutdown,
 }
 
@@ -94,6 +99,12 @@ impl Recorder {
     pub fn power(&self, suspending: bool) {
         let _ = self.tx.send(Event::Power(suspending));
     }
+
+    /// Pauses (`true`) or resumes (`false`) recording. A pause lasts until resumed or until
+    /// the game is next launched.
+    pub fn pause(&self, paused: bool) {
+        let _ = self.tx.send(Event::Pause(paused));
+    }
 }
 
 impl Drop for Recorder {
@@ -117,6 +128,8 @@ struct Loop {
     outputs: Vec<OutputInfo>,
     /// Siege's process ids at the last poll.
     game_pids: Vec<u32>,
+    /// Exe names that are games (built-in list, user games, `[game] processes`).
+    exes: Vec<String>,
     /// The current session's monitor has a warning (refresh, HDR).
     session_warning: bool,
     /// The monitor Siege's window has moved to, and on how many polls in a row.
@@ -135,6 +148,12 @@ struct Loop {
     disk: DiskGuard,
     /// The PC is going to sleep: recording stops until it resumes.
     suspended: bool,
+    /// Paused from the tray or window: no recording until resumed or the game restarts.
+    paused: bool,
+    /// Whether the game was running at the last poll (a pause ends when it starts again).
+    was_running: bool,
+    /// Free space on the buffer drive at the last check, in bytes.
+    free: Option<u64>,
     /// Counts ffmpeg starts; tags stats so a previous run's late lines are ignored.
     run: u64,
     last_stats: Option<Stats>,
@@ -143,7 +162,9 @@ struct Loop {
 
 impl Loop {
     fn new(s: Setup, stats_tx: Sender<Event>) -> Loop {
+        let exes = s.rules.exes();
         Loop {
+            exes,
             s,
             stats_tx,
             epoch: Instant::now(),
@@ -161,6 +182,9 @@ impl Loop {
             disk: DiskGuard::new(),
             game_session: 0,
             suspended: false,
+            paused: false,
+            was_running: false,
+            free: None,
             run: 0,
             last_stats: None,
             shown: None,
@@ -172,13 +196,32 @@ impl Loop {
     }
 
     fn run(mut self, rx: Receiver<Event>) {
-        let mut next_poll: Ms = 0;
+        let mut next_poll: Ms = self.s.start_delay_ms;
+        if next_poll > 0 {
+            tracing::info!(
+                secs = next_poll / 1000,
+                "started with Windows; watching for the game shortly"
+            );
+        }
         let mut next_summary: Ms = SUMMARY_EVERY;
         let mut next_diag: Ms = 0;
         self.publish();
         loop {
             match rx.recv_timeout(TICK) {
                 Ok(Event::Stats(run, st)) => self.on_stats(run, st),
+                Ok(Event::Pause(p)) => {
+                    self.paused = p;
+                    crate::status::update(|b| b.paused = p);
+                    if p {
+                        tracing::info!("recording paused");
+                        crate::status::event("Recording paused");
+                        let cmd = self.watcher.stop_now(self.now());
+                        self.apply(cmd, self.now());
+                    } else {
+                        tracing::info!("recording resumed");
+                        crate::status::event("Recording resumed");
+                    }
+                }
                 Ok(Event::Power(suspending)) => {
                     self.suspended = suspending;
                     if suspending {
@@ -197,16 +240,34 @@ impl Loop {
                 next_poll = now + POLL;
                 match processes() {
                     Ok(procs) => {
-                        self.game_pids = procs
-                            .iter()
-                            .filter(|(_, n)| game_running([n.as_str()], &self.s.processes))
-                            .map(|(p, _)| *p)
-                            .collect();
+                        let (pids, game) = self.detect(&procs);
+                        crate::current_game::set_pids(pids.clone());
+                        self.game_pids = pids;
+                        if crate::current_game::get().map(|g| g.id)
+                            != game.as_ref().map(|g| g.id.clone())
+                        {
+                            if let Some(g) = &game {
+                                tracing::info!(game = %g.name, anticheat = g.anticheat.name(), strict = g.strict, method = ?g.method, "game detected");
+                            }
+                            crate::current_game::set(game);
+                        }
                         let running = !self.game_pids.is_empty();
+                        crate::notify::game_running(running);
+                        // A pause lasts until the game is launched again.
+                        if running && !self.was_running && self.paused {
+                            self.paused = false;
+                            crate::status::update(|b| b.paused = false);
+                            tracing::info!("game launched; pause over");
+                        }
+                        if running && !self.was_running {
+                            crate::status::update(|b| b.clips_session = 0);
+                        }
+                        self.was_running = running;
                         self.check_disk();
                         // Low disk or sleep: the watcher sees "no game" and stops the session
                         // (and won't start one) through its normal path.
-                        let may_record = running && !self.disk.low() && !self.suspended;
+                        let may_record =
+                            running && !self.disk.low() && !self.suspended && !self.paused;
                         let changed = self
                             .s
                             .quiet
@@ -363,6 +424,7 @@ impl Loop {
         let Some(free) = fake.or_else(|| free_bytes(dir).ok()) else {
             return;
         };
+        self.free = Some(free);
         match self.disk.on_free(free) {
             Some(DiskEvent::Low) => {
                 tracing::error!(
@@ -390,6 +452,33 @@ impl Loop {
         clean
     }
 
+    /// The running game's process ids and profile: known exe names first, then (if turned on)
+    /// a fullscreen foreground app. Only the process list and window list are read.
+    fn detect(&self, procs: &[(u32, String)]) -> (Vec<u32>, Option<retake_core::games::Game>) {
+        let exes = &self.exes;
+        let pids: Vec<u32> = procs
+            .iter()
+            .filter(|(_, n)| game_running([n.as_str()], exes))
+            .map(|(p, _)| *p)
+            .collect();
+        let game = procs
+            .iter()
+            .filter(|(p, _)| pids.contains(p))
+            .find_map(|(_, n)| self.s.rules.identify(n));
+        if game.is_some() || !self.s.rules.any_fullscreen {
+            return (pids, game);
+        }
+        let Some(pid) = crate::window::fullscreen_pid() else {
+            return (Vec::new(), None);
+        };
+        match procs.iter().find(|(p, _)| *p == pid) {
+            Some((_, n)) if retake_core::games::fullscreen_counts(n) => {
+                (vec![pid], Some(self.s.rules.fullscreen_game(n)))
+            }
+            _ => (Vec::new(), None),
+        }
+    }
+
     /// A game restarted mid-session has a new process id; process loopback on the old one
     /// would record silence, so the run restarts on the new one.
     fn follow_game_pid(&mut self, now: Ms) {
@@ -415,7 +504,14 @@ impl Loop {
         let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32, u32)> = Vec::new();
         self.audio_pid = None;
         if a.game {
-            let source = match (a.game_source, self.game_pids.first()) {
+            // Strict safety for this game (Vanguard games by default): device audio only.
+            let strict = crate::current_game::get().is_some_and(|g| g.strict);
+            let game_source = if strict {
+                GameSource::Device
+            } else {
+                a.game_source
+            };
+            let source = match (game_source, self.game_pids.first()) {
                 (GameSource::Process, Some(&pid)) if process_loopback_supported() => {
                     self.audio_pid = Some(pid);
                     retake_audio::Source::ProcessLoopback { pid }
@@ -492,18 +588,27 @@ impl Loop {
                 fps: pick_fps(cap.fps, 0),
                 check: Err("no monitors found on the primary GPU".into()),
             });
-        self.session_warning = match check {
-            Ok(warnings) => {
-                for w in &warnings {
-                    tracing::warn!("{w}");
+        // CPU encoding is for testing: at most 60 fps, and always a warning.
+        let cpu = self.s.encoder == Encoder::X264;
+        let fps = if cpu { fps.min(60) } else { fps };
+        if cpu {
+            tracing::warn!(
+                "no hardware encoder: recording with the CPU (x264, {fps} fps) for testing only; it costs game performance"
+            );
+        }
+        self.session_warning = cpu
+            || match check {
+                Ok(warnings) => {
+                    for w in &warnings {
+                        tracing::warn!("{w}");
+                    }
+                    !warnings.is_empty()
                 }
-                !warnings.is_empty()
-            }
-            Err(e) => {
-                tracing::warn!("{e}");
-                true
-            }
-        };
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    true
+                }
+            };
         tracing::info!(
             output,
             fps,
@@ -639,6 +744,57 @@ impl Loop {
         }
     }
 
+    /// Writes what the recorder is doing to the status board (Status tab, tray tooltip).
+    fn update_board(&self, audio_lost: bool) {
+        let phase = self.watcher.phase();
+        let state = if self.paused {
+            "Paused".to_owned()
+        } else if self.disk.low() {
+            "Stopped: disk almost full".to_owned()
+        } else if self.suspended {
+            "Stopped: PC asleep".to_owned()
+        } else {
+            match phase {
+                Phase::Idle => "Idle".to_owned(),
+                Phase::Starting => "Starting".to_owned(),
+                Phase::Recording | Phase::Stopping => "Recording".to_owned(),
+                Phase::Failed => "Recording failed".to_owned(),
+            }
+        };
+        let game = self
+            .game_pids
+            .first()
+            .and_then(|_| crate::current_game::get().map(|g| g.name));
+        let capture = self
+            .current
+            .as_ref()
+            .map(|c| format!("HEVC {} fps ({})", c.fps, c.encoder))
+            .unwrap_or_default();
+        let speed = self.last_stats.map_or(0.0, |s| s.speed);
+        let mut warnings = Vec::new();
+        if self.speed.behind() {
+            warnings.push("The encoder is falling behind".to_owned());
+        }
+        if audio_lost {
+            warnings
+                .push("An audio source is missing (recording silence on that track)".to_owned());
+        }
+        if self.session_warning {
+            warnings.push("The game's monitor has a warning; see the log".to_owned());
+        }
+        let buffer = self.s.capture.buffer_secs;
+        let free = self.free.map(|b| b / (1024 * 1024 * 1024));
+        crate::status::update(|b| {
+            b.state = state;
+            b.game = game;
+            b.capture = capture;
+            b.speed = speed;
+            b.buffer_secs = buffer;
+            b.disk_free_gb = free;
+            b.warnings = warnings;
+        });
+    }
+
     fn log_diag(&self) {
         let mb = |b: Option<u64>| b.map(|b| b / (1024 * 1024));
         let (retake_mem, retake_handles) = crate::diag::own();
@@ -659,6 +815,7 @@ impl Loop {
         if self.disk.low() {
             s = TrayStatus::Failed;
         }
+        self.update_board(audio_lost);
         if self.shown != Some(s) {
             tracing::info!(phase = ?self.watcher.phase(), status = ?s, "status");
             (self.s.notify)(s);

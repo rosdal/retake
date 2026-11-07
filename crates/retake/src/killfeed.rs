@@ -18,11 +18,17 @@ const SCAN_HEIGHT: u32 = 120;
 /// Times (seconds from the start of `video`) at which a new kill-feed row appeared.
 pub fn scan(ffmpeg: &Path, job: &ChildJob, video: &Path) -> Result<Vec<f64>> {
     let input = vec!["-i".to_owned(), video.to_string_lossy().into_owned()];
-    scan_input(ffmpeg, job, video, input)
+    scan_input(ffmpeg, job, video, input, None)
 }
 
 /// Like [`scan`], over the segments named in a concat list (one pass over a whole session).
-pub fn scan_list(ffmpeg: &Path, job: &ChildJob, list: &Path) -> Result<Vec<f64>> {
+/// `region` is the game's kill feed as fractions; `None` = Siege's.
+pub fn scan_list(
+    ffmpeg: &Path,
+    job: &ChildJob,
+    list: &Path,
+    region: Option<retake_core::games::Rect>,
+) -> Result<Vec<f64>> {
     let text = std::fs::read_to_string(list)?;
     let first = retake_core::clip::parse_concat_list(&text)
         .into_iter()
@@ -34,7 +40,7 @@ pub fn scan_list(ffmpeg: &Path, job: &ChildJob, list: &Path) -> Result<Vec<f64>>
         .into_iter()
         .chain([list.to_string_lossy().into_owned()])
         .collect();
-    scan_input(ffmpeg, job, &first, input)
+    scan_input(ffmpeg, job, &first, input, region)
 }
 
 fn scan_input(
@@ -42,9 +48,13 @@ fn scan_input(
     job: &ChildJob,
     sample: &Path,
     input: Vec<String>,
+    region: Option<retake_core::games::Rect>,
 ) -> Result<Vec<f64>> {
     let p = probe(ffmpeg, sample)?;
-    let (cw, ch, cx, cy) = feed_crop(p.width, p.height);
+    let (cw, ch, cx, cy) = region.map_or_else(
+        || feed_crop(p.width, p.height),
+        |r| retake_core::games::crop_px(r, p.width, p.height),
+    );
     let sh = SCAN_HEIGHT;
     let sw = ((u64::from(cw) * u64::from(sh) / u64::from(ch.max(1))) as u32 / 2 * 2).max(2);
     let args: Vec<String> = vec![

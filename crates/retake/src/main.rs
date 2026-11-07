@@ -2,19 +2,29 @@
 
 mod audio_pump;
 mod autoclipper;
+mod autostart;
 mod background;
 mod child;
 mod clock;
+mod config_watch;
+mod control;
+mod current_game;
 mod diag;
+mod diagnostics;
 mod display;
 mod drive;
+mod events;
 mod ffmpeg;
 mod ffmpeg_proc;
 mod grader;
 mod instance;
 mod killfeed;
+mod library;
 mod logging;
 mod media;
+mod montage;
+mod net;
+mod notify;
 mod pipe;
 mod procs;
 mod recorder;
@@ -22,13 +32,18 @@ mod saver;
 mod session;
 mod setup_check;
 mod sound;
+mod status;
 mod sync_check;
 mod sysinfo;
+mod thumbs;
 mod tray;
+mod trim;
+mod ui;
+mod updater;
 mod window;
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
@@ -53,6 +68,10 @@ struct Args {
     console: bool,
     /// `--diag`: log memory and handle counts every 5 minutes.
     diag: bool,
+    /// `--autostart`: started with Windows; wait before watching for the game.
+    autostart: bool,
+    /// `--restarted`: relaunched to apply a new config; wait for the old instance to quit.
+    restarted: bool,
     /// `--save` / `--save-full`: ask the running Retake for a clip, then exit.
     save: Option<bool>,
     dummy_child: bool,
@@ -64,6 +83,8 @@ fn parse_args() -> Args {
     let mut args = Args {
         console: false,
         diag: false,
+        autostart: false,
+        restarted: false,
         save: None,
         dummy_child: false,
         unknown: Vec::new(),
@@ -72,6 +93,8 @@ fn parse_args() -> Args {
         match a.as_str() {
             "--console" => args.console = true,
             "--diag" => args.diag = true,
+            autostart::ARG => args.autostart = true,
+            config_watch::RESTARTED => args.restarted = true,
             "--save" => args.save = Some(false),
             "--save-full" => args.save = Some(true),
             "--dummy-child" => args.dummy_child = true,
@@ -185,6 +208,7 @@ fn grade_main(words: &[String]) -> ExitCode {
             grade: config.grade.clone(),
             blur: config.motion_blur.clone(),
             out_dir: config.clips.out_dir.clone(),
+            rules: retake_core::games::Rules::from_config(&config),
         };
         for clip in &clips {
             let t = std::time::Instant::now();
@@ -199,7 +223,7 @@ fn grade_main(words: &[String]) -> ExitCode {
             }
             for &p in &presets {
                 let t = std::time::Instant::now();
-                let out = g.export(clip, p)?;
+                let out = g.export(clip, p, false)?;
                 println!(
                     "exported {} -> {} in {:.1} s",
                     p.name(),
@@ -227,6 +251,85 @@ fn main() -> ExitCode {
     if words.first().is_some_and(|w| w == "grade") {
         return grade_main(&words[1..]);
     }
+    if words.first().is_some_and(|w| w == "thumbs") {
+        // `retake.exe thumbs`: makes the window's thumbnails for every clip now.
+        attach_console();
+        let r = (|| -> Result<usize> {
+            let exe = std::env::current_exe()?;
+            let dir = exe.parent().unwrap_or(Path::new("."));
+            let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+            let config = config::load_file(&dir.join("config.toml"), &pick_root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ff = ffmpeg::locate(dir)?;
+            let clips = &config.clips.out_dir;
+            let mut n = 0;
+            for e in std::fs::read_dir(clips.join("raw"))?.flatten() {
+                let p = e.path();
+                let stem = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                if p.extension().is_some_and(|x| x == "mkv") && !stem.ends_with("_graded") {
+                    thumbs::make(&ff, clips, &p)?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })();
+        return match r {
+            Ok(n) => {
+                println!("thumbnails for {n} clips");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("thumbs: {e:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    if words.first().is_some_and(|w| w == "montage") {
+        attach_console();
+        let r = (|| -> Result<()> {
+            let exe = std::env::current_exe()?;
+            let dir = exe.parent().unwrap_or(Path::new("."));
+            ensure_config(&dir.join("config.toml"))?;
+            let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+            let config = config::load_file(&dir.join("config.toml"), &pick_root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (vendor, _) = display::adapter()?;
+            let encoder =
+                pick_encoder(config.capture.encoder, vendor).map_err(|e| anyhow::anyhow!(e))?;
+            montage::cli(
+                &ffmpeg::locate(dir)?,
+                encoder,
+                &config.clips.out_dir,
+                &montage::looks_of(&config),
+                &words[1..],
+            )
+        })();
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("montage: {e:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    if words.first().is_some_and(|w| w == "write-look") {
+        // The built-in look as a .cube file (for the release zip, or to edit in Resolve).
+        let out = words
+            .get(1)
+            .map_or_else(|| PathBuf::from("siege.cube"), PathBuf::from);
+        let cube = retake_core::grade::builtin_look(33).write("Retake Siege look");
+        if let Some(dir) = out.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        return match std::fs::write(&out, cube) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
+    }
     if words.first().is_some_and(|w| w == "scan-feed") {
         attach_console();
         let exe = std::env::current_exe().unwrap_or_default();
@@ -251,7 +354,18 @@ fn main() -> ExitCode {
     }
 
     // Before logging, so a second launch doesn't write into the running instance's log.
-    let Some(instance) = SingleInstance::acquire() else {
+    // A relaunch waits (up to 15 s) for the old instance to let go of the lock.
+    let mut instance = SingleInstance::acquire();
+    if args.restarted {
+        for _ in 0..60 {
+            if instance.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            instance = SingleInstance::acquire();
+        }
+    }
+    let Some(instance) = instance else {
         if let Some(full) = args.save {
             return if instance::signal_save(full) {
                 ExitCode::SUCCESS
@@ -259,7 +373,10 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             };
         }
-        instance::toast("Retake is already running.");
+        // A second start opens the running Retake's window.
+        if !instance::signal_open_window() {
+            instance::toast("Retake is already running.");
+        }
         return ExitCode::SUCCESS;
     };
     if args.save.is_some() {
@@ -306,6 +423,21 @@ fn main() -> ExitCode {
     };
     tracing::info!(path = %config_path.display(), "config loaded");
 
+    // A downloaded update installs now, before anything records (never while a game runs).
+    if config.update.check {
+        let rules = retake_core::games::Rules::from_config(&config);
+        let exes = rules.exes();
+        let game_running = procs::processes().is_ok_and(|p| {
+            p.iter()
+                .any(|(_, n)| exes.iter().any(|e| e.eq_ignore_ascii_case(n)))
+        });
+        if updater::install_pending(game_running) {
+            drop(instance);
+            drop(guard);
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let (vendor, outputs) = match display::adapter() {
         Ok(a) => a,
         Err(e) => return fatal(&format!("Listing monitors: {e:#}")),
@@ -329,7 +461,7 @@ fn main() -> ExitCode {
     // An explicit monitor must exist, and its warnings hold for every session. With "auto"
     // the recorder picks and checks the monitor per session: the primary's warnings here
     // could be about a monitor it never records.
-    let warnings = if config.capture.output == Auto::Auto {
+    let mut warnings = if config.capture.output == Auto::Auto {
         Vec::new()
     } else {
         match choice.check {
@@ -337,6 +469,7 @@ fn main() -> ExitCode {
             Err(e) => return fatal(&e),
         }
     };
+    warnings.extend(retake_core::games::Rules::from_config(&config).loosened());
     for w in &warnings {
         tracing::warn!("{w}");
     }
@@ -401,11 +534,51 @@ fn main() -> ExitCode {
             Err(e) => return fatal(&format!("clips hotkey {label}: {e}")),
         }
     }
+    // The star hotkey (montages): stars the newest clip in the library.
+    let star_index = specs.len();
+    if !config.clips.hotkey_star.is_empty()
+        && let Ok(key) = retake_core::hotkey::parse(&config.clips.hotkey_star)
+    {
+        specs.push(tray::HotkeySpec {
+            label: config.clips.hotkey_star.clone(),
+            key,
+        });
+    }
+    let library = match library::Library::open(&config.clips.out_dir) {
+        Ok(l) => Some(Arc::new(l)),
+        Err(e) => {
+            tracing::warn!("clip library unavailable: {e:#}");
+            None
+        }
+    };
+    let star_library = library.clone();
     let (press_tx, press_rx) = mpsc::channel();
+    let ui_press_tx = press_tx.clone();
     let cue = config.clips.sound_cue;
     let hotkey_tx = press_tx.clone();
     let hotkey_session = session.clone();
     let on_hotkey = move |i: usize| {
+        if i == star_index {
+            let starred = star_library.as_ref().map(|l| l.star_last());
+            match starred {
+                Some(Ok(Some(p))) => {
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    tracing::info!(clip = %name, "starred");
+                    status::event(format!("★ starred  {name}"));
+                    if cue {
+                        sound::play_saved();
+                    }
+                }
+                Some(Ok(None)) => tracing::info!("star hotkey: no clip yet"),
+                Some(Err(e)) => tracing::warn!("starring: {e:#}"),
+                None => {}
+            }
+            return;
+        }
         let Some(&kind) = kinds.get(i) else { return };
         let p = Press {
             at: clock::now_ms(),
@@ -434,8 +607,22 @@ fn main() -> ExitCode {
         Err(e) => return fatal(&format!("{e:#}")),
     };
     let jobs = background.submitter();
+    // The setup check reads Siege's settings file: only when Siege isn't under strict safety.
+    let strict = retake_core::games::Rules::from_config(&config)
+        .builtin_game("siege")
+        .is_none_or(|g| g.strict);
+    if strict {
+        tracing::info!(
+            "strict safety: device audio loopback, the game's settings file is not read"
+        );
+    }
+    if config.update.check {
+        updater::start(quiet.clone(), |m: &str| notify::toast(m));
+    }
     let check_gate = quiet.clone();
-    jobs.submit("setup check", move || setup_check::run(&check_gate));
+    if !strict {
+        jobs.submit("setup check", move || setup_check::run(&check_gate));
+    }
 
     // Grading and exports: queued per saved clip, run only while the game is closed.
     let grader = grader::Grader {
@@ -444,6 +631,7 @@ fn main() -> ExitCode {
         grade: config.grade.clone(),
         blur: config.motion_blur.clone(),
         out_dir: config.clips.out_dir.clone(),
+        rules: retake_core::games::Rules::from_config(&config),
     };
     if let Err(e) = grader.look() {
         return fatal(&format!("grade.look: {e:#}"));
@@ -454,21 +642,40 @@ fn main() -> ExitCode {
         config.export.when,
         config.export.presets.clone(),
         config.clips.max_raw_gb,
-        instance::toast,
+        notify::toast,
     );
     let saved_media = media.clone();
+    let saved_library = library.clone();
+    let saved_ffmpeg = ffmpeg.clone();
+    let saved_jobs = jobs.clone();
+    let saved_clips = config.clips.out_dir.clone();
+    thumbs::queue_missing(&jobs, &ffmpeg, &config.clips.out_dir);
 
-    // Auto-clipping (Siege): keep the whole session's recording, then after the game closes
-    // read its Match Replays and cut the player's kills. Off when not asked for or not Siege:
+    // Auto-clipping: while a game with automatic clips runs, keep the whole session's
+    // recording; after it closes, find the player's kills (Siege's replays, CS2's and League's
+    // events, or the kill feed) and cut them. Games without automatic clips keep nothing:
     // keeping the session doubles the disk writes while recording.
-    let is_siege = config
-        .game
-        .processes
-        .iter()
-        .any(|p| p.to_ascii_lowercase().starts_with("rainbowsix"));
-    let auto_on =
-        config.autoclip.enabled && config.autoclip.clip != config::ClipPlays::Off && is_siege;
+    let auto_on = config.autoclip.enabled && config.autoclip.clip != config::ClipPlays::Off;
     let session_root = config.clips.out_dir.join("session");
+    if auto_on {
+        let rules = retake_core::games::Rules::from_config(&config);
+        if rules.builtin_game("cs2").is_some_and(|g| g.autoclip) {
+            let cs2_running = procs::processes()
+                .map(|p| p.iter().any(|(_, n)| n.eq_ignore_ascii_case("cs2.exe")))
+                .unwrap_or(true);
+            if !events::install_cs2_cfg(&session_root, cs2_running).is_empty() {
+                notify::toast(
+                    "Retake added its Game State Integration file to CS2, for automatic kill clips. Restart CS2 if it's open.",
+                );
+            }
+            events::start_gsi(session_root.clone());
+        }
+        if rules.builtin_game("lol").is_some_and(|g| g.autoclip) {
+            events::start_league(session_root.clone());
+        }
+        // Events older than a day belong to no session any more.
+        events::trim(&session_root, events::unix_now() - 24 * 3_600_000);
+    }
     let _keeper = if auto_on {
         let told = std::sync::atomic::AtomicBool::new(false);
         let clip_media = media.clone();
@@ -477,10 +684,23 @@ fn main() -> ExitCode {
             dissect: autoclipper::find_dissect(&exe_dir),
             raw_dir: config.clips.out_dir.join("raw"),
             min_play: config.autoclip.clip.min_play(),
-            on_clip: Box::new(move |p: &Path| clip_media.clip_saved(p)),
+            rules: retake_core::games::Rules::from_config(&config),
+            session_root: session_root.clone(),
+            on_clip: {
+                let lib = library.clone();
+                let ff = ffmpeg.clone();
+                let (thumb_jobs, thumb_clips) = (jobs.clone(), config.clips.out_dir.clone());
+                Box::new(move |p: &Path| {
+                    clip_media.clip_saved(p);
+                    if let Some(l) = &lib {
+                        let _ = l.add(&ff, p);
+                    }
+                    thumbs::queue(&thumb_jobs, &ff, &thumb_clips, p);
+                })
+            },
             on_notice: Box::new(move |m: &str| {
                 if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    instance::toast(m);
+                    notify::toast(m);
                 }
             }),
         });
@@ -517,6 +737,20 @@ fn main() -> ExitCode {
         None
     };
 
+    let diag_config = config_path.clone();
+    let watch_config = config_path.clone();
+    ui::init(ui::UiSetup {
+        config: config_path.clone(),
+        clips: config.clips.out_dir.clone(),
+        logs: logging::log_dir(),
+    });
+    tray::set_window_config(config_path.clone());
+    control::start_status_writer(control::StatusSetup {
+        clips_dir: config.clips.out_dir.clone(),
+        config: config_path.clone(),
+        hotkey: config.clips.hotkey.clone(),
+    });
+    let control_clips = config.clips.out_dir.clone();
     let paths = tray::TrayPaths {
         config: config_path,
         clips: config.clips.out_dir.clone(),
@@ -528,9 +762,12 @@ fn main() -> ExitCode {
     let saver_slot = saver.clone();
     let setup_job = job.clone();
     let capture = config.capture.clone();
-    let audio = config.audio.clone();
+    let mut audio = config.audio.clone();
+    if config.safety.strict {
+        audio.game_source = config::GameSource::Device;
+    }
     let diag = args.diag;
-    let processes = config.game.processes.clone();
+    let rules = retake_core::games::Rules::from_config(&config);
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
     let on_ready = move |notifier: tray::TrayNotifier| {
@@ -547,17 +784,122 @@ fn main() -> ExitCode {
                 if cue {
                     sound::play_saved();
                 }
+                // Manual clips record their game too (grading after the match needs it).
+                let side = p.with_extension("json");
+                if !side.exists()
+                    && let Some(g) = current_game::get()
+                {
+                    let _ = std::fs::write(&side, serde_json::json!({ "game": g.id }).to_string());
+                }
                 saved_media.clip_saved(p);
+                if let Some(lib) = &saved_library {
+                    let _ = lib.add(&saved_ffmpeg, p);
+                }
+                thumbs::queue(&saved_jobs, &saved_ffmpeg, &saved_clips, p);
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                status::update(|b| {
+                    b.clips_today += 1;
+                    b.clips_session += 1;
+                });
+                status::event(format!("Clip saved  {name}"));
             }),
-            on_failed: Box::new(|why: &str| instance::toast(&format!("Clip not saved: {why}"))),
+            on_failed: Box::new(|why: &str| {
+                status::event(format!("Clip not saved: {why}"));
+                notify::toast(&format!("Clip not saved: {why}"));
+            }),
         };
         match Saver::start(saver_setup, press_tx, press_rx) {
             Ok(s) => *saver_slot.borrow_mut() = Some(s),
             Err(e) => tracing::error!("{e:#}"),
         }
+        let action_recorder = slot.clone();
+        let (montage_ffmpeg, montage_library, montage_clips, montage_looks) = (
+            ffmpeg.clone(),
+            library.clone(),
+            config.clips.out_dir.clone(),
+            montage::looks_of(&config),
+        );
+        let trim_jobs = jobs.clone();
         tray::set_media_handler(move |a| match a {
             tray::MediaAction::ExportNow => media.export_now(),
             tray::MediaAction::Regrade(p) => media.regrade(&p),
+            tray::MediaAction::Export(p, preset) => media.export(&p, &preset),
+            tray::MediaAction::Pause(on) => {
+                if let Some(r) = action_recorder.borrow().as_ref() {
+                    r.pause(on);
+                }
+            }
+            tray::MediaAction::SaveFull => {
+                let p = Press {
+                    at: clock::now_ms(),
+                    stamp: clock::local_stamp(),
+                    kind: Kind::Full,
+                };
+                if ui_press_tx.send(SaverMsg::Press(p)).is_err() {
+                    tracing::warn!("saver is not running; save ignored");
+                }
+            }
+            tray::MediaAction::Autostart(on) => match autostart::set(on) {
+                Ok(()) => notify::toast(if on {
+                    "Retake now starts with Windows."
+                } else {
+                    "Retake no longer starts with Windows."
+                }),
+                Err(e) => notify::toast(&format!("Couldn't change Start with Windows: {e}")),
+            },
+            tray::MediaAction::Montage(job) => montage::run_in_background(
+                montage_ffmpeg.clone(),
+                encoder,
+                montage_library.clone(),
+                montage_clips.clone(),
+                montage_looks.clone(),
+                job,
+            ),
+            tray::MediaAction::Star(p, on) => {
+                if let Some(l) = &montage_library
+                    && let Err(e) = l.set_star(&p, on)
+                {
+                    tracing::warn!("starring {}: {e:#}", p.display());
+                }
+            }
+            tray::MediaAction::Delete(p) => {
+                ui::delete_clip(&p);
+                if let Some(l) = &montage_library {
+                    let _ = l.list();
+                }
+            }
+            tray::MediaAction::OpenLite => ui::show(),
+            tray::MediaAction::OpenWindow => {}
+            tray::MediaAction::MontageCancel => montage::cancel(),
+            tray::MediaAction::Trim(clip, from, to) => {
+                let (ff, lib, jobs, clips) = (
+                    montage_ffmpeg.clone(),
+                    montage_library.clone(),
+                    trim_jobs.clone(),
+                    montage_clips.clone(),
+                );
+                std::thread::spawn(move || match trim::trim(&ff, &clip, from, to) {
+                    Ok(out) => {
+                        if let Some(l) = &lib {
+                            let _ = l.add(&ff, &out);
+                        }
+                        thumbs::queue(&jobs, &ff, &clips, &out);
+                        status::event(format!(
+                            "Trimmed  {}",
+                            out.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                    Err(e) => notify::toast(&format!("Couldn't trim the clip: {e:#}")),
+                });
+            }
+            tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {
+                Ok(()) => notify::toast("Diagnostics copied to the clipboard."),
+                Err(e) => notify::toast(&format!("Couldn't copy diagnostics: {e:#}")),
+            },
         });
         let setup = recorder::Setup {
             ffmpeg,
@@ -565,17 +907,27 @@ fn main() -> ExitCode {
             capture,
             audio,
             diag,
-            processes,
+            rules,
             warning,
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),
             session,
             quiet: quiet.clone(),
             on_session_end: Box::new(move || {
-                let gate = quiet.clone();
-                jobs.submit("setup check", move || setup_check::run(&gate));
+                if !strict {
+                    let gate = quiet.clone();
+                    jobs.submit("setup check", move || setup_check::run(&gate));
+                }
             }),
+            start_delay_ms: if args.autostart {
+                autostart::DELAY_MS
+            } else {
+                0
+            },
         };
+        let watch_notifier = notifier;
+        control::start_pipe(control_clips.clone(), notifier);
+        config_watch::start(watch_config.clone(), move || watch_notifier.quit());
         match Recorder::start(setup) {
             Ok(r) => {
                 *slot.borrow_mut() = Some(r);
@@ -613,6 +965,10 @@ fn main() -> ExitCode {
     let on_hotkey = Arc::new(on_hotkey);
     let remote = on_hotkey.clone();
     if let Err(e) = instance::listen_for_saves(move |i| {
+        if i == instance::OPEN_WINDOW {
+            tray::post(tray::MediaAction::OpenWindow);
+            return;
+        }
         tracing::info!(full = i == 1, "clip requested by retake.exe --save");
         remote(i);
     }) {

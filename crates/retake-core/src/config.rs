@@ -27,12 +27,38 @@ pub struct Config {
     pub grade: Grade,
     pub export: Export,
     pub motion_blur: MotionBlur,
+    pub safety: Safety,
+    pub update: Update,
+    /// `[games.<id>]`: per-game changes (see `games::Override`).
+    #[serde(default)]
+    pub games: std::collections::BTreeMap<String, crate::games::Override>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Safety {
+    /// The strictest anti-cheat footprint: game audio from the output device (no game process
+    /// id used at all) and the game's settings file is never read.
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    /// Look for a new release once a day (only while no game runs) and install it at the
+    /// next start.
+    pub check: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Game {
+    /// More exe names to record (the default profile), on top of the built-in games.
     pub processes: Vec<String>,
+    /// Record the games in Retake's built-in game list without setup.
+    pub builtin: bool,
+    /// Treat any fullscreen app (not Explorer or a browser) as a game.
+    pub any_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -110,6 +136,8 @@ pub struct Clips {
     pub post_roll: u32,
     pub hotkey: String,
     pub hotkey_full: String,
+    /// Stars the newest clip for montages; "" = no star hotkey.
+    pub hotkey_star: String,
     pub sound_cue: bool,
     /// Delete the oldest raw clips that already have a graded version once raw clips take
     /// more than this many GB. 0 = off.
@@ -344,6 +372,16 @@ pub fn validate(c: &Config) -> Vec<String> {
             "clips.hotkey_full = {}: must differ from clips.hotkey",
             clips.hotkey_full
         ));
+    }
+    if !clips.hotkey_star.is_empty() {
+        match crate::hotkey::parse(&clips.hotkey_star) {
+            Ok(k) if parsed.contains(&k) => errs.push(format!(
+                "clips.hotkey_star = {}: must differ from the clip hotkeys",
+                clips.hotkey_star
+            )),
+            Ok(_) => {}
+            Err(e) => errs.push(format!("clips.hotkey_star = {}: {e}", clips.hotkey_star)),
+        }
     }
     if c.audio.game_delay_ms > 500 {
         errs.push(format!(
@@ -582,6 +620,12 @@ preset = \"fast\""
     }
 
     #[test]
+    fn strict_safety_is_off_by_default() {
+        assert!(!load_str("").unwrap().safety.strict);
+        assert!(load_str("[safety]\nstrict = true").unwrap().safety.strict);
+    }
+
+    #[test]
     fn game_source_defaults_to_process() {
         assert_eq!(load_str("").unwrap().audio.game_source, GameSource::Process);
         let c = load_str("[audio]\ngame_source = \"device\"").unwrap();
@@ -753,7 +797,14 @@ hotkey = \"Alt+Shift+K\""
     fn encoder_must_be_known() {
         let c = load_str("[capture]\nencoder = \"qsv\"").unwrap();
         assert_eq!(c.capture.encoder, EncoderSetting::Qsv);
-        let e = load_str("[capture]\nencoder = \"x264\"")
+        assert_eq!(
+            load_str("[capture]\nencoder = \"x264\"")
+                .unwrap()
+                .capture
+                .encoder,
+            EncoderSetting::X264
+        );
+        let e = load_str("[capture]\nencoder = \"x265\"")
             .unwrap_err()
             .to_string();
         assert!(e.contains("capture.encoder"), "{e}");

@@ -4,8 +4,22 @@
 # Relative paths are resolved against the folder this file is in.
 
 [game]
-# Record only while one of these processes is running.
-processes     = ["RainbowSix.exe", "RainbowSix_Vulkan.exe"]
+# Retake records the games in its built-in list (Siege, CS2, Valorant, League, Apex,
+# Fortnite, Overwatch, Call of Duty, PUBG and more) with no setup.
+builtin        = true
+# More games: their exe names, e.g. ["MyGame.exe"]. Or use Settings → Add game….
+processes      = []
+# Record any app that covers a whole monitor (not Explorer or a browser) as a game.
+any_fullscreen = false
+
+# Per-game changes, e.g.:
+# [games.valorant]
+# autoclip = true            # automatic kill clips (kill-feed games are off until checked)
+# strict   = false           # Vanguard games are strict by default; loosen with care
+# look     = "C:/looks/valorant.cube"
+# feed     = [0.70, 0.04, 0.29, 0.22]   # kill-feed region as fractions [x, y, w, h]
+# hud      = [[0.0, 0.0, 0.25, 0.08]]   # HUD areas left out of grading statistics
+# crop_center = 0.5          # centre of the 9:16 crop (ultrawide / off-centre HUDs)
 
 [capture]
 # Monitor index for ddagrab, or "auto": the monitor Siege's window is on
@@ -63,6 +77,8 @@ post_roll     = 3
 # Standard clip and full-buffer hotkeys.
 hotkey        = "F9"
 hotkey_full   = "Ctrl+F9"
+# Stars the newest clip for montages ("" = off).
+hotkey_star   = "F10"
 # Play a short sound when a clip is saved.
 sound_cue     = true
 # Once raw clips take more than this many GB, delete the oldest ones that already
@@ -111,3 +127,12 @@ apply_to        = ["share", "vertical"]   # never "edit": keep slow-mo frames
 output_fps      = 60
 amount          = 1.0           # 0.2–0.3 low, 0.5 medium, 1.0 normal, >1 heavy
 weighting       = "gaussian_sym" # equal | gaussian_sym | pyramid
+[safety]
+# The strictest anti-cheat footprint: game audio comes from the output device (no
+# game process id is used at all) and the game's settings file is never read.
+strict        = false
+
+[update]
+# Look for a new Retake once a day (only while no game runs); it downloads in the
+# background and installs the next time Retake starts. Never during a match.
+check = true

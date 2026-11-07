@@ -7,3 +7,5 @@ crates/*/config.toml
 third_party/presentmon/
 /bench/
 third_party/r6-dissect/
+installer/*.ico
+installer/Retake-Setup-*.exe

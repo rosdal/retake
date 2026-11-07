@@ -10,7 +10,11 @@ Install it, play, and your best plays are already saved as clean, graded clips. 
 </div>
 
 > [!NOTE]
-> Retake is in early development. This README describes what Retake is being built to do.
+> Retake is young. Recording, clips, automatic Siege clips, grading, montages and the window
+> work; automatic clips for other games and the NVIDIA/Intel encoders are built but still
+> being checked against real matches and hardware.
+
+<p align="center"><img src="docs/ui/library.png" alt="Retake's library: clip thumbnails with kill counts, stars and game badges" width="820"></p>
  
 ---
 
@@ -35,7 +39,8 @@ Most clippers make you choose: lightweight but manual (ShadowPlay, Adrenalin, OB
 | **Edit-ready** | 120–240 fps, near-lossless HEVC (AV1 later), game / mic / Discord on separate tracks, kill markers for your editor. |
 | **Montages (optional)** | Pick a song and some clips; Retake puts your best play on the drop, lands every kill on a beat, and adds speed ramps, slow-mo and motion blur. Exports 9:16 for TikTok or 16:9 for YouTube, plus a DaVinci Resolve timeline. Never automatic; your clips stay untouched. |
 | **Any game, any GPU** | Works with any game. AMD (AMF), NVIDIA (NVENC) and Intel (QSV) hardware encoders. |
-| **Simple interface** | One window and a tray icon. No terminal, no config files to edit. |
+| **A real app** | A dark, fast window: your recording state, a thumbnail library with hover previews, a clip player with kill markers and trim handles, and a montage timeline with the song's waveform and beats. It's a separate process that only runs while open and stops drawing while you play. |
+| **Updates itself** | Installed copies check once a day while no game runs and update at the next start, never during a match. |
 
 ## How it works
  
@@ -81,7 +86,11 @@ No third-party tool can be guaranteed safe with every anti-cheat. If you're unsu
 
 ## Install
  
-Not released yet. When it is: download the installer from [Releases](../../releases), run it, and start a game. There is nothing to configure.
+Download `Retake-Setup-<version>.exe` from [Releases](../../releases) and run it: no admin rights, nothing to configure. Start a game and Retake records it; press `F9` for a clip, or let it clip your kills after the match. A portable zip is there too.
+
+| Home | Clip view | Montage |
+| --- | --- | --- |
+| ![Home](docs/ui/home.png) | ![Clip view](docs/ui/clip.png) | ![Montage editor](docs/ui/montage.png) |
 
 ## Development
  
@@ -93,7 +102,7 @@ cargo test
 cargo run -- --console       # runs with logs in the terminal
 ```
  
-The workspace is split into `retake` (the app), `retake-core` (pure, tested logic), `retake-audio` (WASAPI capture) and `retake-detect` (play detection).
+The workspace is split into `retake` (the background service: recording, tray, jobs), `retake-ui` (the window, a separate process started only while it's open), `retake-core` (pure, tested logic) and `retake-audio` (WASAPI capture). `cargo run -p retake-ui -- --screen library` opens the window on a screen without the service.
  
 ## FAQ
  
@@ -116,8 +125,10 @@ Retake is built to avoid everything anti-cheat systems look for; see [Anti-cheat
  
 - [FFmpeg](https://ffmpeg.org) for capture, encoding and filtering
 - [r6-dissect](https://github.com/redraskal/r6-dissect) for Rainbow Six Siege replay parsing
-- [native-windows-gui](https://github.com/gabdube/native-windows-gui) for the interface
+- [iced](https://github.com/iced-rs/iced) for the window, with [Inter](https://rsms.me/inter/) and [Space Grotesk](https://github.com/floriankarsten/space-grotesk) (SIL Open Font License)
+- [Inno Setup](https://jrsoftware.org/isinfo.php) for the installer
 - [blur](https://github.com/f0e/blur) and the frame-blending community for motion-blur techniques
+
 ## License
  
-To be decided before the first release. Bundled third-party components keep their own licences; see `THIRD_PARTY_LICENSES.txt` in each release.
+MIT (see `LICENSE`). Bundled third-party components keep their own licences; see `THIRD_PARTY_LICENSES.txt` and the font licences in each release.

@@ -98,6 +98,16 @@ pub fn input_args(c: &CaptureSetup) -> Vec<String> {
             ));
             a
         }
+        Encoder::X264 => {
+            // CPU encoding: the frames come down from the GPU.
+            let mut a = strs(&["-init_hw_device", "d3d11va", "-filter_complex"]);
+            a.push(format!(
+                "{},hwdownload,format=bgra,format=yuv420p{}",
+                ddagrab(c),
+                video_label(c)
+            ));
+            a
+        }
     }
 }
 
@@ -108,7 +118,14 @@ pub fn encoder_args(c: &CaptureSetup) -> Vec<String> {
         Codec::Av1 => "av1",
     };
     let gop = (c.fps * SEGMENT_SECS).to_string();
-    let mut a = vec!["-c:v".to_owned(), format!("{codec}_{}", c.encoder)];
+    let mut a = vec![
+        "-c:v".to_owned(),
+        if c.encoder == Encoder::X264 {
+            "libx264".to_owned()
+        } else {
+            format!("{codec}_{}", c.encoder)
+        },
+    ];
     match c.encoder {
         Encoder::Amf => {
             let quality = match c.preset {
@@ -155,6 +172,12 @@ pub fn encoder_args(c: &CaptureSetup) -> Vec<String> {
                 "-init_qpP".into(),
                 c.qp_p.to_string(),
             ]);
+        }
+        Encoder::X264 => {
+            // The fastest CPU preset whatever the setting: anything slower takes frames from
+            // the game.
+            a.extend(strs(&["-preset", "ultrafast", "-tune", "zerolatency"]));
+            a.extend(["-qp".into(), c.qp_p.to_string()]);
         }
     }
     a.extend(["-g".into(), gop, "-bf".into(), "0".into()]);
@@ -521,6 +544,40 @@ mod tests {
                 "-init_qpI",
                 "16",
                 "-init_qpP",
+                "18",
+                "-g",
+                "240",
+                "-bf",
+                "0",
+            ]
+        );
+    }
+
+    #[test]
+    fn x264_downloads_frames_and_uses_a_fixed_qp() {
+        let c = CaptureSetup {
+            encoder: Encoder::X264,
+            ..amf()
+        };
+        assert_eq!(
+            input_args(&c),
+            [
+                "-init_hw_device",
+                "d3d11va",
+                "-filter_complex",
+                "ddagrab=output_idx=0:framerate=120:draw_mouse=0,hwdownload,format=bgra,format=yuv420p",
+            ]
+        );
+        assert_eq!(
+            encoder_args(&c),
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-qp",
                 "18",
                 "-g",
                 "240",

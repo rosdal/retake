@@ -45,6 +45,15 @@ jobs:
           name: retake-exe
           path: target/release/retake.exe
 
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   r6-dissect:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -75,3 +84,45 @@ jobs:
         with:
           name: r6-dissect
           path: third_party/r6-dissect/r6-dissect.exe
+
+  installer:
+    # Builds the installer and checks a silent per-user install and uninstall.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p retake -p retake-ui
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          cargo run -q -p retake-core --example logo installer
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target/release/retake.exe, target/release/retake-ui.exe, README.md, LICENSE $dist/
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp /DVersion=0.0.1 "/DSource=$dist" installer/retake.iss
+          if ($LASTEXITCODE) { throw 'ISCC failed' }
+
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'RetakeInstall'
+          Start-Process installer/Retake-Setup-0.0.1.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$dir", '/TASKS=autostart' -Wait
+          foreach ($f in 'retake.exe', 'retake-ui.exe', 'unins000.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "$f was not installed" }
+          }
+          $run = Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Retake
+          if ($run -notlike "*retake.exe*--autostart*") { throw "autostart value is '$run'" }
+          if (Get-Process retake -ErrorAction SilentlyContinue) { throw 'a silent install must not start Retake without /LAUNCH=1' }
+          Start-Process (Join-Path $dir 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path (Join-Path $dir 'retake.exe')) { throw 'retake.exe is still there after uninstall' }
+          if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Retake -ErrorAction SilentlyContinue) { throw 'autostart value left behind' }
+          Write-Host 'install and uninstall OK'

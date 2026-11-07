@@ -52,6 +52,8 @@ pub enum EncoderSetting {
     Amf,
     Qsv,
     Nvenc,
+    /// CPU H.264, for testing on a PC without a hardware encoder.
+    X264,
 }
 
 /// The hardware encoder family ffmpeg uses.
@@ -63,6 +65,8 @@ pub enum Encoder {
     Qsv,
     /// NVIDIA NVENC.
     Nvenc,
+    /// CPU libx264 `ultrafast` at up to 60 fps: testing only, it costs game performance.
+    X264,
 }
 
 impl fmt::Display for Encoder {
@@ -71,6 +75,7 @@ impl fmt::Display for Encoder {
             Encoder::Amf => "amf",
             Encoder::Qsv => "qsv",
             Encoder::Nvenc => "nvenc",
+            Encoder::X264 => "x264",
         })
     }
 }
@@ -112,13 +117,15 @@ pub fn pick_encoder(setting: EncoderSetting, vendor: Vendor) -> Result<Encoder, 
         (EncoderSetting::Amf, _) => Encoder::Amf,
         (EncoderSetting::Qsv, _) => Encoder::Qsv,
         (EncoderSetting::Nvenc, _) => Encoder::Nvenc,
+        (EncoderSetting::X264, _) => Encoder::X264,
         (EncoderSetting::Auto, Vendor::Amd) => Encoder::Amf,
         (EncoderSetting::Auto, Vendor::Intel) => Encoder::Qsv,
         (EncoderSetting::Auto, Vendor::Nvidia) => Encoder::Nvenc,
         (EncoderSetting::Auto, Vendor::Other(_)) => {
             return Err(format!(
                 "capture.encoder = auto: the GPU ({vendor}) has no supported hardware encoder; \
-                 set capture.encoder to amf, qsv or nvenc"
+                 set capture.encoder to amf, qsv or nvenc, or to x264 to test on the CPU \
+                 (60 fps at most; it costs game performance)"
             ));
         }
     })

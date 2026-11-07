@@ -35,3 +35,15 @@ Newest first.
 
 | Date | Setup | After | Pairs | Median | Worst | Notes |
 |---|---|---|---|---|---|---|
+| 2026-11-07 | 3 h soak, avsync stand-in, 2560×1440 240 fps AMF, process loopback | 1 min | 19 | +45.4 ms | 47.5 ms | |
+| 2026-11-07 | same | 30 min | 20 | +29.2 ms | 35.8 ms | |
+| 2026-11-07 | same | 60 min | 20 | +22.5 ms | 26.2 ms | builds and a montage render ran on the PC around here |
+| 2026-11-07 | same | 120 min | 20 | +32.6 ms | 34.3 ms | |
+| 2026-11-07 | same | 180 min | 18 | +46.9 ms | 48.0 ms | |
+
+### Reading the 3-hour soak
+
+- **No drift.** The offset ends where it started (+45 ms → +47 ms after 3 h). In between it dipped to +22 ms while the PC was busy compiling and rendering, and came back. A clock drift would grow steadily in one direction; this doesn't.
+- **The constant is the stand-in, not Retake.** The avsync window's own audio path (loopback latency, measured at about +46 ms) is in every number, so the ±8 ms target can't be judged with this test game. Measured against a reference without that latency it would show Retake's own error; see #27.
+- **So no drift control is added.** Restarting the pipeline every `max_session_minutes` would only be worth it if drift grew; it doesn't.
+- **Resources stayed flat** (`--diag`, every 5 min): `retake.exe` 17 → 22–25 MB and 291 handles from minute 5 to 180; ffmpeg 67–83 MB and 1169–1172 handles. No leaks.

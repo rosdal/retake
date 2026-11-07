@@ -13,6 +13,7 @@ fn required(enc: Encoder) -> (&'static [&'static str], &'static [&'static str]) 
         Encoder::Amf => (&["hevc_amf", "av1_amf", "h264_amf"], &[]),
         Encoder::Qsv => (&["hevc_qsv", "av1_qsv"], &["hwmap"]),
         Encoder::Nvenc => (&["hevc_nvenc", "av1_nvenc"], &[]),
+        Encoder::X264 => (&["libx264", "libx265"], &["hwdownload"]),
     }
 }
 

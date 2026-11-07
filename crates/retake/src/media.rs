@@ -103,6 +103,16 @@ impl Media {
         self.kick();
     }
 
+    /// Export `clip` with `preset` now (from the window), whatever `export.when` says.
+    pub fn export(self: &Arc<Self>, clip: &Path, preset: &str) {
+        {
+            let mut q = self.lock();
+            q.add_clip(clip, false, &[preset.to_owned()]);
+            self.save(&q);
+        }
+        self.export_now();
+    }
+
     /// "Regrade last clip".
     pub fn regrade(self: &Arc<Self>, clip: &Path) {
         {
@@ -129,11 +139,21 @@ impl Media {
             let q = self.lock();
             q.next(exports).map(|i| (i, q.jobs[i].clone()))
         }) else {
+            let pending = self.lock().pending();
+            crate::status::update(|b| {
+                b.queued = pending;
+                b.exporting = false;
+            });
             if self.when == ExportWhen::Manual {
                 self.exports_allowed.store(false, Ordering::Relaxed);
             }
             return;
         };
+        let pending = self.lock().pending();
+        crate::status::update(|b| {
+            b.queued = pending;
+            b.exporting = true;
+        });
         let started = std::time::Instant::now();
         let result = if !job.clip.is_file() {
             Err(format!("{} no longer exists", job.clip.display()))
@@ -141,10 +161,14 @@ impl Media {
             match &job.task {
                 Task::Grade => self.grader.grade(&job.clip).map(|out| {
                     tracing::info!(clip = %job.clip.display(), graded = %out.display(), secs = started.elapsed().as_secs_f32(), "clip graded");
+                    crate::status::event(format!(
+                        "Graded  {}",
+                        out.file_name().unwrap_or_default().to_string_lossy()
+                    ));
                     self.enforce_raw_limit();
                 }),
-                Task::Export(p) => match Preset::parse(p) {
-                    Some(preset) => self.grader.export(&job.clip, preset).map(|out| {
+                Task::Export(p) => match Preset::parse(p.strip_suffix("+blur").unwrap_or(p)) {
+                    Some(preset) => self.grader.export(&job.clip, preset, p.ends_with("+blur")).map(|out| {
                         tracing::info!(clip = %job.clip.display(), export = %out.display(), secs = started.elapsed().as_secs_f32(), "clip exported");
                     }),
                     None => Err(anyhow::anyhow!("unknown preset {p}")),
