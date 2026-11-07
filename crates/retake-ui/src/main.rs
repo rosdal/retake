@@ -44,6 +44,13 @@ fn main() -> iced::Result {
         .font(include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf").as_slice())
         .default_font(style::INTER)
+        // RETAKE_UI_SCALE=1.5 or 2 shows the window at another display scaling (testing).
+        .scale_factor(|_| {
+            std::env::var("RETAKE_UI_SCALE")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(1.0)
+        })
         .window(iced::window::Settings {
             size: iced::Size::new(1200.0, 780.0),
             min_size: Some(iced::Size::new(900.0, 620.0)),
@@ -1295,7 +1302,7 @@ impl App {
         if let Some((n, _)) = &self.notice {
             main = main.push(
                 container(text(n.clone()).size(14))
-                    .padding([10, 14])
+                    .padding([13, 16])
                     .width(Length::Fill)
                     .style(style::banner(style::ACCENT)),
             );
@@ -1323,7 +1330,7 @@ impl App {
             let active = self.screen == s || (s == Screen::Library && self.screen == Screen::Clip);
             button(text(label).size(15).font(style::INTER_SEMI))
                 .on_press(Message::Nav(s))
-                .padding([12, 16])
+                .padding([13, 16])
                 .width(Length::Fill)
                 .height(style::TARGET)
                 .style(style::nav(active))
@@ -1402,7 +1409,7 @@ impl App {
                             horizontal_space(),
                             button(text("Start Retake").font(style::INTER_SEMI))
                                 .on_press(Message::StartService)
-                                .padding([12, 18])
+                                .padding([13, 18])
                                 .style(style::primary),
                         ]
                         .align_y(Alignment::Center),
@@ -1423,11 +1430,11 @@ impl App {
         };
         let pause = button(text(if s.paused { "Resume" } else { "Pause" }).font(style::INTER_SEMI))
             .on_press(Message::Send(Command::Pause { on: !s.paused }))
-            .padding([12, 18])
+            .padding([13, 18])
             .style(style::secondary);
         let save = button(text("Save last 60 s").font(style::INTER_SEMI))
             .on_press(Message::Send(Command::SaveFull))
-            .padding([12, 18])
+            .padding([13, 18])
             .style(style::primary);
         let state_panel = container(
             column![
@@ -1458,7 +1465,7 @@ impl App {
                     pause,
                     button(text("Open clips folder"))
                         .on_press(Message::OpenFile(self.clips_dir().join("raw")))
-                        .padding([12, 18])
+                        .padding([13, 18])
                         .style(style::secondary),
                 ]
                 .spacing(10),
@@ -1472,7 +1479,7 @@ impl App {
         for w in &s.warnings {
             col = col.push(
                 container(text(w.clone()).size(14))
-                    .padding([10, 14])
+                    .padding([13, 16])
                     .width(Length::Fill)
                     .style(style::banner(style::WARNING)),
             );
@@ -1559,7 +1566,7 @@ impl App {
                 horizontal_space(),
                 button(text("Got it"))
                     .on_press(Message::DismissIntro)
-                    .padding([10, 16])
+                    .padding([13, 16])
                     .style(style::secondary),
             ]
             .align_y(Alignment::Center),
@@ -1673,27 +1680,27 @@ impl App {
     fn library(&self) -> Element<'_, Message> {
         let games = self.games_in_library();
         let filters = row![
-            pick_list(games, Some(self.filter_game.clone()), Message::FilterGame).padding(10),
+            pick_list(games, Some(self.filter_game.clone()), Message::FilterGame).padding(13),
             pick_list(
                 [Since::All, Since::Today, Since::Week, Since::Month],
                 Some(self.filter_since),
                 Message::FilterSince
             )
-            .padding(10),
+            .padding(13),
             checkbox("Starred", self.filter_starred)
                 .on_toggle(Message::FilterStarred)
                 .size(20),
             checkbox("Not used in a montage", self.filter_unused)
                 .on_toggle(Message::FilterUnused)
                 .size(20),
-            horizontal_space(),
             button(text("Rescan"))
                 .on_press(Message::Send(Command::Rescan))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
         ]
         .spacing(14)
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .wrap();
         let clips = self.visible_clips();
         let count = text(format!("{} clips", clips.len())).color(style::MUTED);
         let selected = self.selected;
@@ -1752,14 +1759,14 @@ impl App {
                             text(if p.playing { "Pause" } else { "Play" }).font(style::INTER_SEMI)
                         )
                         .on_press(on_play)
-                        .padding([10, 18])
+                        .padding([13, 18])
                         .style(style::primary),
                         text(format!("{:.1} / {:.1} s", p.position, p.duration))
                             .color(style::MUTED),
                         horizontal_space(),
                         button(text("Open with sound"))
                             .on_press(Message::OpenFile(p.path.clone()))
-                            .padding([10, 14])
+                            .padding([13, 16])
                             .style(style::secondary),
                     ]
                     .spacing(12)
@@ -1783,7 +1790,7 @@ impl App {
         let title = row![
             button(text("Back to library"))
                 .on_press(Message::Back)
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             text(c.name()).size(22).font(style::GROTESK_BOLD),
             horizontal_space(),
@@ -1808,7 +1815,7 @@ impl App {
                     clip: path.clone(),
                     preset: preset.into(),
                 }))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary)
         };
         let options: Vec<Named2> = self
@@ -1827,7 +1834,7 @@ impl App {
                 .align_y(Alignment::Center)
             )
             .on_press(Message::Star)
-            .padding([10, 14])
+            .padding([13, 16])
             .style(if c.lib.starred {
                 style::primary
             } else {
@@ -1838,11 +1845,11 @@ impl App {
             export("Share with blur", "share+blur"),
             button(text("Regrade"))
                 .on_press(Message::Send(Command::Regrade { clip: path.clone() }))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             button(text("Save trim"))
                 .on_press_maybe(trimmed.then_some(Message::Trim))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
         ]
         .spacing(8)
@@ -1850,20 +1857,20 @@ impl App {
         let more = row![
             pick_list(options, v.add_to.clone(), Message::AddTo)
                 .placeholder("Montage…")
-                .padding(10)
+                .padding(13)
                 .width(220),
             button(text("Add to montage"))
                 .on_press_maybe(v.add_to.as_ref().map(|_| Message::AddToMontage))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             horizontal_space(),
             button(text("Show in folder"))
                 .on_press(Message::Reveal(path.clone()))
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             button(text("Delete"))
                 .on_press(Message::Delete)
-                .padding([10, 14])
+                .padding([13, 16])
                 .style(style::danger),
         ]
         .spacing(8)
@@ -1904,11 +1911,11 @@ impl App {
                 row![
                     text_input("Song file (mp3, wav, ogg, flac)…", &self.new_song)
                         .on_input(Message::SongInput)
-                        .padding(10)
+                        .padding(13)
                         .style(style::input),
                     button(text("Browse…"))
                         .on_press(Message::BrowseSong)
-                        .padding([10, 14])
+                        .padding([13, 16])
                         .style(style::secondary),
                 ]
                 .spacing(8),
@@ -1923,11 +1930,11 @@ impl App {
                 .spacing(8),
                 row![
                     pick_list(games, Some(self.new_game.clone()), Message::NewGame)
-                        .padding(10)
+                        .padding(13)
                         .width(Length::Fill),
                     text_input("Length (s)", &self.new_length)
                         .on_input(Message::NewLength)
-                        .padding(10)
+                        .padding(13)
                         .width(110)
                         .style(style::input),
                 ]
@@ -1937,7 +1944,7 @@ impl App {
                     container(text("Make montage").font(style::INTER_SEMI)).center_x(Length::Fill)
                 )
                 .on_press(Message::CreateMontage)
-                .padding([12, 18])
+                .padding([13, 18])
                 .width(Length::Fill)
                 .style(style::primary),
             ]
@@ -2093,22 +2100,22 @@ impl App {
                 .on_toggle(Message::StyleYoutube),
             text_input("Length s", &self.style_length)
                 .on_input(Message::StyleLength)
-                .padding(8)
+                .padding(13)
                 .width(90)
                 .style(style::input),
             text_input("BPM (auto)", &self.style_bpm)
                 .on_input(Message::StyleBpm)
-                .padding(8)
+                .padding(13)
                 .width(100)
                 .style(style::input),
             text_input("Song start s (auto)", &self.style_start)
                 .on_input(Message::StyleStart)
-                .padding(8)
+                .padding(13)
                 .width(150)
                 .style(style::input),
             button(text("Apply"))
                 .on_press(Message::ApplyStyle)
-                .padding([8, 12])
+                .padding([13, 14])
                 .style(style::secondary),
         ]
         .spacing(8)
@@ -2118,11 +2125,11 @@ impl App {
         let actions = row![
             button(text("Preview").font(style::INTER_SEMI))
                 .on_press_maybe((!busy).then_some(Message::RenderMontage(true)))
-                .padding([12, 18])
+                .padding([13, 18])
                 .style(style::secondary),
             button(text("Render").font(style::INTER_SEMI))
                 .on_press_maybe((!busy).then_some(Message::RenderMontage(false)))
-                .padding([12, 18])
+                .padding([13, 18])
                 .style(style::primary),
             button(text("Resolve timeline"))
                 .on_press_maybe(
@@ -2130,15 +2137,15 @@ impl App {
                         .is_file()
                         .then(|| Message::Reveal(timeline_fcpxml.clone()))
                 )
-                .padding([12, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             button(text("Remove clip"))
                 .on_press_maybe(e.selected.map(|_| Message::RemoveFromMontage))
-                .padding([12, 14])
+                .padding([13, 16])
                 .style(style::secondary),
             button(text("Open folder"))
                 .on_press(Message::OpenFile(m.dir.clone()))
-                .padding([12, 14])
+                .padding([13, 16])
                 .style(style::secondary),
         ]
         .spacing(8)
@@ -2193,7 +2200,7 @@ impl App {
                 horizontal_space(),
                 text_input("Search settings", &st.query)
                     .on_input(Message::SettingsQuery)
-                    .padding(10)
+                    .padding(13)
                     .width(260)
                     .style(style::input),
             ]
@@ -2203,7 +2210,7 @@ impl App {
         if let Some((ok, m)) = &st.message {
             col = col.push(
                 container(text(m.clone()).size(14))
-                    .padding([10, 14])
+                    .padding([13, 16])
                     .width(Length::Fill)
                     .style(style::banner(if *ok { style::OK } else { style::WARNING })),
             );
@@ -2239,12 +2246,12 @@ impl App {
                         .map(|v| v.trim_matches('"').to_owned())
                         .collect();
                     pick_list(opts, Some(val), move |v| Message::SettingValue(i, v))
-                        .padding(8)
+                        .padding(13)
                         .into()
                 }
                 settings::Kind::Number | settings::Kind::Text => text_input("", &val)
                     .on_input(move |v| Message::SettingValue(i, v))
-                    .padding(8)
+                    .padding(13)
                     .width(140)
                     .style(style::input)
                     .into(),
@@ -2301,19 +2308,19 @@ impl App {
                     row![
                         button(text("Copy diagnostics"))
                             .on_press(Message::Send(Command::CopyDiagnostics))
-                            .padding([10, 14])
+                            .padding([13, 16])
                             .style(style::secondary),
                         button(text("Open config file"))
                             .on_press(Message::OpenFile(self.args.config.clone()))
-                            .padding([10, 14])
+                            .padding([13, 16])
                             .style(style::secondary),
                         button(text("Open logs"))
                             .on_press(Message::OpenFile(platform::app_data().join("logs")))
-                            .padding([10, 14])
+                            .padding([13, 16])
                             .style(style::secondary),
                         button(text("Lite window"))
                             .on_press(Message::Send(Command::OpenLite))
-                            .padding([10, 14])
+                            .padding([13, 16])
                             .style(style::secondary),
                     ]
                     .spacing(8),
@@ -2327,11 +2334,11 @@ impl App {
         let bar = row![
             button(text("Save").font(style::INTER_SEMI))
                 .on_press_maybe(st.dirty.then_some(Message::SaveSettings))
-                .padding([12, 20])
+                .padding([13, 20])
                 .style(style::primary),
             button(text("Revert"))
                 .on_press_maybe(st.dirty.then_some(Message::RevertSettings))
-                .padding([12, 16])
+                .padding([13, 16])
                 .style(style::secondary),
             text(if st.dirty { "Unsaved changes" } else { "" }).color(style::MUTED),
         ]
@@ -2417,11 +2424,11 @@ impl App {
                 )
                 .on_input(Message::AddExe)
                 .on_submit(Message::AddGame)
-                .padding(10)
+                .padding(13)
                 .style(style::input),
                 button(text("Add game"))
                     .on_press(Message::AddGame)
-                    .padding([10, 14])
+                    .padding([13, 16])
                     .style(style::secondary),
             ]
             .spacing(8),

@@ -12,3 +12,8 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# iced 0.13's CPU renderer misplaces canvases at display scaling above 100%; see
+# crates/vendor/iced_tiny_skia/RETAKE-PATCH.md.
+[patch.crates-io]
+iced_tiny_skia = { path = "crates/vendor/iced_tiny_skia" }
