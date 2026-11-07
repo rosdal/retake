@@ -23,6 +23,7 @@ mod library;
 mod logging;
 mod media;
 mod montage;
+mod net;
 mod notify;
 mod pipe;
 mod procs;
@@ -38,6 +39,7 @@ mod thumbs;
 mod tray;
 mod trim;
 mod ui;
+mod updater;
 mod window;
 
 use std::cell::RefCell;
@@ -418,6 +420,21 @@ fn main() -> ExitCode {
     };
     tracing::info!(path = %config_path.display(), "config loaded");
 
+    // A downloaded update installs now, before anything records (never while a game runs).
+    if config.update.check {
+        let rules = retake_core::games::Rules::from_config(&config);
+        let exes = rules.exes();
+        let game_running = procs::processes().is_ok_and(|p| {
+            p.iter()
+                .any(|(_, n)| exes.iter().any(|e| e.eq_ignore_ascii_case(n)))
+        });
+        if updater::install_pending(game_running) {
+            drop(instance);
+            drop(guard);
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let (vendor, outputs) = match display::adapter() {
         Ok(a) => a,
         Err(e) => return fatal(&format!("Listing monitors: {e:#}")),
@@ -595,6 +612,9 @@ fn main() -> ExitCode {
         tracing::info!(
             "strict safety: device audio loopback, the game's settings file is not read"
         );
+    }
+    if config.update.check {
+        updater::start(quiet.clone(), |m: &str| notify::toast(m));
     }
     let check_gate = quiet.clone();
     if !strict {

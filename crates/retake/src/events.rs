@@ -232,79 +232,23 @@ pub fn start_gsi(root: PathBuf) {
 
 // ---- League of Legends -----------------------------------------------------------------
 
-/// GET `https://127.0.0.1:2999/liveclientdata/allgamedata` through WinHTTP. The game serves
-/// it with Riot's own certificate, which isn't in Windows' store, so certificate errors are
-/// ignored for this one localhost request.
+/// GET `https://127.0.0.1:2999/liveclientdata/allgamedata`. The game serves it with Riot's
+/// own certificate, which isn't in Windows' store, so certificate errors are ignored for this
+/// one localhost request.
 fn get_allgamedata() -> Result<String> {
-    use windows::Win32::Networking::WinHttp::*;
-    use windows::core::{HSTRING, w};
-    // SAFETY: handles are closed below; buffers outlive each call.
-    unsafe {
-        let session = WinHttpOpen(w!("Retake"), WINHTTP_ACCESS_TYPE_NO_PROXY, None, None, 0);
-        if session.is_null() {
-            bail!("WinHttpOpen failed");
-        }
-        let close = |h: *mut core::ffi::c_void| {
-            let _ = WinHttpCloseHandle(h);
-        };
-        let _ = WinHttpSetTimeouts(session, 1000, 1000, 1000, 2000);
-        let conn = WinHttpConnect(
-            session,
-            &HSTRING::from(liveclient::URL_HOST),
-            liveclient::URL_PORT,
-            0,
-        );
-        if conn.is_null() {
-            close(session);
-            bail!("WinHttpConnect failed");
-        }
-        let req = WinHttpOpenRequest(
-            conn,
-            w!("GET"),
-            &HSTRING::from(liveclient::URL_PATH),
-            None,
-            None,
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        );
-        if req.is_null() {
-            close(conn);
-            close(session);
-            bail!("WinHttpOpenRequest failed");
-        }
-        let flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-            | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
-            | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-        let _ = WinHttpSetOption(
-            Some(req),
-            WINHTTP_OPTION_SECURITY_FLAGS,
-            Some(&flags.to_ne_bytes()),
-        );
-        let result = (|| -> Result<String> {
-            WinHttpSendRequest(req, None, None, 0, 0, 0)?;
-            WinHttpReceiveResponse(req, std::ptr::null_mut())?;
-            let mut body = Vec::new();
-            loop {
-                let mut avail = 0u32;
-                WinHttpQueryDataAvailable(req, &mut avail)?;
-                if avail == 0 {
-                    break;
-                }
-                let mut buf = vec![0u8; avail as usize];
-                let mut read = 0u32;
-                WinHttpReadData(req, buf.as_mut_ptr().cast(), avail, &mut read)?;
-                body.extend_from_slice(&buf[..read as usize]);
-                if body.len() > 8 << 20 {
-                    bail!("response too large");
-                }
-            }
-            Ok(String::from_utf8_lossy(&body).into_owned())
-        })();
-        close(req);
-        close(conn);
-        close(session);
-        result
-    }
+    let mut body = Vec::new();
+    crate::net::get(
+        &crate::net::Get {
+            host: liveclient::URL_HOST,
+            port: liveclient::URL_PORT,
+            path: liveclient::URL_PATH,
+            any_certificate: true,
+            max_bytes: 8 << 20,
+            timeout_ms: 2_000,
+        },
+        &mut body,
+    )?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Polls League's Live Client Data API every second while League is the current game.

@@ -29,7 +29,9 @@ pub mod segments;
 pub mod siege_settings;
 pub mod song;
 pub mod sync;
+pub mod update;
 pub mod watcher;
 
 /// Milliseconds since an arbitrary start. Pure code takes time as a value so tests are exact.
 pub type Ms = u64;
+pub use serde;

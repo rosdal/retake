@@ -131,3 +131,8 @@ weighting       = "gaussian_sym" # equal | gaussian_sym | pyramid
 # The strictest anti-cheat footprint: game audio comes from the output device (no
 # game process id is used at all) and the game's settings file is never read.
 strict        = false
+
+[update]
+# Look for a new Retake once a day (only while no game runs); it downloads in the
+# background and installs the next time Retake starts. Never during a match.
+check = true

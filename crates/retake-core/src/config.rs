@@ -28,6 +28,7 @@ pub struct Config {
     pub export: Export,
     pub motion_blur: MotionBlur,
     pub safety: Safety,
+    pub update: Update,
     /// `[games.<id>]`: per-game changes (see `games::Override`).
     #[serde(default)]
     pub games: std::collections::BTreeMap<String, crate::games::Override>,
@@ -39,6 +40,14 @@ pub struct Safety {
     /// The strictest anti-cheat footprint: game audio from the output device (no game process
     /// id used at all) and the game's settings file is never read.
     pub strict: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    /// Look for a new release once a day (only while no game runs) and install it at the
+    /// next start.
+    pub check: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
