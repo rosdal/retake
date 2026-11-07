@@ -20,6 +20,9 @@ pub struct Analysis {
     /// Index into `bars` of the drop.
     pub drop_bar: usize,
     pub duration: f64,
+    /// RMS energy of each bar (for the later drops of a long song).
+    #[serde(default)]
+    pub bar_energy: Vec<f32>,
 }
 
 impl Analysis {
@@ -34,7 +37,36 @@ impl Analysis {
         a.bars = (0..a.beats.len()).step_by(4).collect();
         a.bpm = bpm;
         a.drop_bar = a.drop_bar.min(a.bars.len().saturating_sub(1));
+        // Bar energies belonged to the detected bars.
+        a.bar_energy.clear();
         a
+    }
+
+    /// Every drop (index into `bars`) at least `min_gap` bars apart, in time order: the
+    /// main drop and the other bars with a big energy jump over the four before them. A long
+    /// (YouTube) montage puts a build and a drop on each.
+    pub fn drops(&self, min_gap: usize) -> Vec<usize> {
+        let e = &self.bar_energy;
+        if e.len() < 8 {
+            return vec![self.drop_bar];
+        }
+        let jump = |i: usize| e[i] - e[i - 4..i].iter().copied().fold(0.0, f32::max);
+        let main = jump(self.drop_bar.clamp(4, e.len() - 1));
+        let mut cands: Vec<usize> = (4..e.len()).filter(|&i| jump(i) > main * 0.5).collect();
+        cands.sort_by(|&a, &b| jump(b).total_cmp(&jump(a)));
+        let mut picked = vec![self.drop_bar];
+        for c in cands {
+            if picked.iter().all(|&p| p.abs_diff(c) >= min_gap) {
+                picked.push(c);
+            }
+        }
+        picked.sort_unstable();
+        picked
+    }
+
+    /// The time of bar `i`'s first beat.
+    pub fn bar_time(&self, i: usize) -> Option<f64> {
+        self.bars.get(i).and_then(|&b| self.beats.get(b)).copied()
     }
 
     /// Time of the drop (its bar's first beat).
@@ -288,6 +320,7 @@ pub fn analyse(samples: &[f32]) -> Option<Analysis> {
         bars,
         drop_bar,
         duration: samples.len() as f64 / f64::from(RATE),
+        bar_energy: energy,
     })
 }
 

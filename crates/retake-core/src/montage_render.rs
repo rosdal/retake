@@ -334,7 +334,46 @@ pub fn render_args(
             "50M",
         ],
     };
-    a.extend(enc.map(String::from));
+    // YouTube: HEVC at 1440p60 (what YouTube gives its better encodes for); TikTok: H.264.
+    let hevc: Option<[&str; 10]> =
+        (o.format == Format::Youtube && !o.preview).then(|| match o.encoder {
+            Encoder::Amf => [
+                "-c:v", "hevc_amf", "-quality", "quality", "-rc", "vbr_peak", "-b:v", "40M",
+                "-maxrate", "60M",
+            ],
+            Encoder::Nvenc => [
+                "-c:v",
+                "hevc_nvenc",
+                "-preset",
+                "p5",
+                "-rc",
+                "vbr",
+                "-b:v",
+                "40M",
+                "-maxrate",
+                "60M",
+            ],
+            Encoder::Qsv => [
+                "-c:v",
+                "hevc_qsv",
+                "-preset",
+                "medium",
+                "-b:v",
+                "40M",
+                "-maxrate",
+                "60M",
+                "-look_ahead",
+                "0",
+            ],
+            Encoder::X264 => [
+                "-c:v", "libx265", "-preset", "medium", "-b:v", "40M", "-maxrate", "60M", "-tag:v",
+                "hvc1",
+            ],
+        });
+    a.extend(hevc.unwrap_or(enc).map(String::from));
+    if hevc.is_some() && o.encoder != Encoder::X264 {
+        a.extend(["-tag:v", "hvc1"].map(String::from));
+    }
     a.extend(["-c:a", "aac", "-b:a", "320k", "-r"].map(String::from));
     a.push(FPS.to_string());
     a.extend([

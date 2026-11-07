@@ -56,7 +56,7 @@ impl Format {
     pub fn size(self) -> (u32, u32) {
         match self {
             Format::Tiktok => (1080, 1920),
-            Format::Youtube => (1920, 1080),
+            Format::Youtube => (2560, 1440),
         }
     }
     fn clip_count(self) -> usize {
@@ -530,6 +530,24 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
     let mut placed = Vec::new();
     let mut t = 0.0;
     let drop_lead_room = 2.0; // seconds of output kept free before the drop for its lead-in
+    // YouTube: every drop gets its share of the build clips, which run longer.
+    let youtube = p.format == Format::Youtube;
+    let later_drops: Vec<f64> = if youtube {
+        song.drops(16)
+            .into_iter()
+            .filter_map(|b| song.bar_time(b))
+            .map(|d| d - start)
+            .filter(|&d| d > drop_out + drop_lead_room + 2.0 && d < p.length - 2.0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let quota = if youtube {
+        build.len().div_ceil(later_drops.len() + 1).max(1)
+    } else {
+        usize::MAX
+    };
+    let build_lead = if youtube { 3.0 } else { 1.0 };
     if let Some(h) = &hook
         && let Some(x) = place(
             h,
@@ -545,8 +563,9 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
         t = x.end();
         placed.push(x);
     }
+    let mut built = 0;
     for b in &build {
-        if t >= drop_out - drop_lead_room {
+        if t >= drop_out - drop_lead_room || built >= quota {
             break;
         }
         if let Some(x) = place(
@@ -554,13 +573,14 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
             Role::Build,
             &beats,
             t,
-            1.0,
+            build_lead,
             None,
             drop_out - drop_lead_room,
             slowmo,
         ) {
             t = x.end();
             placed.push(x);
+            built += 1;
         }
     }
     if let Some(d) = &drop {
@@ -573,6 +593,61 @@ pub fn arrange(p: &Project, song: &Analysis) -> Vec<Placed> {
         {
             t = x.end();
             placed.push(x);
+        }
+    }
+    // YouTube: the song's later drops each get a build and the best remaining multi-kill.
+    if youtube {
+        for d in later_drops {
+            if d <= t + drop_lead_room {
+                continue;
+            }
+            let left: Vec<&ProjClip> = build
+                .iter()
+                .filter(|c| !placed.iter().any(|x| x.file == c.file))
+                .collect();
+            // The drop clip: most kills among those left.
+            let best = left
+                .iter()
+                .max_by(|a, b| {
+                    a.kills
+                        .len()
+                        .cmp(&b.kills.len())
+                        .then(a.score.total_cmp(&b.score))
+                })
+                .map(|c| (*c).clone());
+            let mut built = 0;
+            for b in left {
+                if best.as_ref().is_some_and(|x| x.file == b.file) {
+                    continue;
+                }
+                if t >= d - drop_lead_room || built >= quota {
+                    break;
+                }
+                if let Some(x) = place(
+                    b,
+                    Role::Build,
+                    &beats,
+                    t,
+                    build_lead,
+                    None,
+                    d - drop_lead_room,
+                    slowmo,
+                ) {
+                    t = x.end();
+                    placed.push(x);
+                    built += 1;
+                }
+            }
+            let on = beats
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - d).abs().total_cmp(&(b - d).abs()));
+            if let (Some(c), Some(on)) = (&best, on.filter(|&on| on > t))
+                && let Some(x) = place(c, Role::Drop, &beats, t, 1.5, Some(on), p.length, slowmo)
+            {
+                t = x.end();
+                placed.push(x);
+            }
         }
     }
     // Outro: anything left that still fits.
@@ -668,6 +743,7 @@ mod tests {
             drop_bar: 12,
             beats,
             duration: 75.0,
+            bar_energy: Vec::new(),
         }
     }
 
@@ -795,6 +871,70 @@ mod tests {
         let old = p.to_toml().replace("[style]", "[ignored]");
         let back = Project::from_toml(old.split("[ignored]").next().unwrap());
         assert_eq!(back.map(|b| b.style), Ok(Style::default()));
+    }
+
+    #[test]
+    fn youtube_montages_build_to_every_drop() {
+        // A 120 s song with energy jumps at bars 12, 30 and 46 (0.47 s beats, 4/4).
+        let beat = 60.0 / 128.0;
+        let n_beats = 256;
+        let mut energy = vec![0.2f32; n_beats / 4];
+        for (i, e) in energy.iter_mut().enumerate() {
+            if (12..20).contains(&i) || (30..38).contains(&i) || (46..54).contains(&i) {
+                *e = 1.0;
+            }
+        }
+        let a = Analysis {
+            bpm: 128.0,
+            beats: (0..n_beats).map(|i| f64::from(i as u32) * beat).collect(),
+            bars: (0..n_beats / 4).map(|b| b * 4).collect(),
+            drop_bar: 12,
+            duration: 120.0,
+            bar_energy: energy,
+        };
+        assert_eq!(a.drops(16), vec![12, 30, 46]);
+        let lib: Vec<LibClip> = (0..14)
+            .map(|i| {
+                let kills: Vec<f64> = if i % 4 == 0 {
+                    vec![10.0, 11.0, 12.5]
+                } else {
+                    vec![14.0]
+                };
+                LibClip {
+                    path: PathBuf::from(format!(r"C:\c\{i}.mkv")),
+                    saved: 0,
+                    duration: 20.0,
+                    kills,
+                    starred: false,
+                    used: 0,
+                    game: String::new(),
+                }
+            })
+            .collect();
+        let mut p = Project::new(Format::Youtube, Path::new("s.mp3"), &lib);
+        p.length = 115.0;
+        p.song_start = Some(0.0);
+        let placed = arrange(&p, &a);
+        let drops = placed.iter().filter(|x| x.role == Role::Drop).count();
+        assert_eq!(
+            drops,
+            3,
+            "{:?}",
+            placed.iter().map(|x| x.role).collect::<Vec<_>>()
+        );
+        // Each drop's first kill on its bar.
+        for (x, bar) in placed
+            .iter()
+            .filter(|x| x.role == Role::Drop)
+            .zip([12usize, 30, 46])
+        {
+            let want = a.bar_time(bar).unwrap();
+            assert!(
+                (x.kills[0].1 - want).abs() < 1e-6,
+                "{:?} vs {want}",
+                x.kills[0]
+            );
+        }
     }
 
     #[test]
