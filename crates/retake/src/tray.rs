@@ -809,6 +809,12 @@ fn run_loop(hotkeys: &[HotkeySpec], on_ready: impl FnOnce(TrayNotifier)) -> Resu
     // SAFETY: standard message loop on the thread that owns the window.
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // The plain window: Tab moves between controls, Esc closes it.
+            if let Some(w) = crate::ui::window()
+                && windows::Win32::UI::WindowsAndMessaging::IsDialogMessageW(w, &msg).as_bool()
+            {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
