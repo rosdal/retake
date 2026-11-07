@@ -51,6 +51,13 @@ END
 "#
     );
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    // The app icon (Retake's mark), drawn by retake-core.
+    let ico = out.join("retake.ico");
+    std::fs::write(&ico, retake_core::logo::app_ico()).expect("writing retake.ico");
+    let rc = format!(
+        "1 ICON \"{}\"\n{rc}",
+        ico.to_string_lossy().replace('\\', "/")
+    );
     let path = out.join("retake.rc");
     std::fs::write(&path, rc).expect("writing retake.rc");
     embed_resource::compile(&path, embed_resource::NONE)

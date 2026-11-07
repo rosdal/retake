@@ -18,6 +18,7 @@ pub mod grade;
 pub mod gsi;
 pub mod hotkey;
 pub mod liveclient;
+pub mod logo;
 pub mod montage;
 pub mod montage_render;
 pub mod progress;

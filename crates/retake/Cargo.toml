@@ -27,3 +27,4 @@ tempfile = "3.27.0"
 
 [build-dependencies]
 embed-resource = "3"
+retake-core = { path = "../retake-core" }

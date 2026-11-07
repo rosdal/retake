@@ -81,16 +81,16 @@ fn status_from_wparam(w: usize) -> Option<TrayStatus> {
 /// Icon colour and tooltip for a status, plus a hotkey problem if there is one. The problem
 /// is a second tooltip line; it turns an idle icon yellow but never hides red (recording).
 fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
-    const YELLOW: [u8; 3] = [234, 179, 8];
-    const BLUE: [u8; 3] = [37, 99, 235];
+    use retake_core::logo::{ACCENT, ERROR, IDLE, WARNING as YELLOW};
+    const BLUE: [u8; 3] = [0x5B, 0x9B, 0xF5];
     let board = crate::status::get();
     if !board.state.is_empty() && problem.is_none() {
         let rgb = match s {
-            TrayStatus::Recording => [220, 38, 38],
+            TrayStatus::Recording => ACCENT,
             TrayStatus::Warning => YELLOW,
-            TrayStatus::Failed => [185, 28, 28],
+            TrayStatus::Failed => ERROR,
             TrayStatus::Idle if board.exporting => BLUE,
-            TrayStatus::Idle => [140, 140, 140],
+            TrayStatus::Idle => IDLE,
         };
         let mut tip = format!("Retake — {}", crate::status::tooltip_detail(&board));
         if let Some(w) = board.warnings.first() {
@@ -100,8 +100,8 @@ fn look(s: TrayStatus, problem: Option<&str>) -> ([u8; 3], String) {
         return (rgb, tip);
     }
     let (rgb, tip) = match s {
-        TrayStatus::Idle => ([140, 140, 140], "Retake — idle"),
-        TrayStatus::Recording => ([220, 38, 38], "Retake — recording"),
+        TrayStatus::Idle => (IDLE, "Retake — idle"),
+        TrayStatus::Recording => (ACCENT, "Retake — recording"),
         TrayStatus::Warning => (YELLOW, "Retake — warning, see the log"),
         TrayStatus::Failed => (YELLOW, "Retake — recording failed, see the log"),
     };
@@ -638,19 +638,13 @@ fn create_hidden_window() -> Result<HWND> {
 
 const ICON_SIZE: u32 = 32;
 
-/// A filled circle of colour `rgb` with a soft edge, as 32-bit BGRA rows top to bottom.
+/// Retake's mark with the status colour as its dot, as 32-bit BGRA rows top to bottom.
 fn icon_pixels(rgb: [u8; 3]) -> Vec<u8> {
-    let n = ICON_SIZE;
-    let mut bgra = Vec::with_capacity((n * n * 4) as usize);
-    let c = (n as f32 - 1.0) / 2.0;
-    for y in 0..n {
-        for x in 0..n {
-            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-            let alpha = (14.5 - d).clamp(0.0, 1.0);
-            bgra.extend_from_slice(&[rgb[2], rgb[1], rgb[0], (alpha * 255.0) as u8]);
-        }
+    let mut px = retake_core::logo::rgba(ICON_SIZE, rgb, true);
+    for p in px.chunks_exact_mut(4) {
+        p.swap(0, 2);
     }
-    bgra
+    px
 }
 
 /// The icon for colour `rgb`. The caller owns it and frees it with `DestroyIcon`.
@@ -786,11 +780,12 @@ mod tests {
     }
 
     #[test]
-    fn colours_are_grey_red_yellow() {
-        assert_eq!(look(TrayStatus::Idle, None).0, [140, 140, 140]);
-        assert_eq!(look(TrayStatus::Recording, None).0, [220, 38, 38]);
-        assert_eq!(look(TrayStatus::Warning, None).0, [234, 179, 8]);
-        assert_eq!(look(TrayStatus::Failed, None).0, [234, 179, 8]);
+    fn colours_are_the_brand_status_colours() {
+        use retake_core::logo::{ACCENT, IDLE, WARNING};
+        assert_eq!(look(TrayStatus::Idle, None).0, IDLE);
+        assert_eq!(look(TrayStatus::Recording, None).0, ACCENT);
+        assert_eq!(look(TrayStatus::Warning, None).0, WARNING);
+        assert_eq!(look(TrayStatus::Failed, None).0, WARNING);
         assert_eq!(look(TrayStatus::Recording, None).1, "Retake — recording");
     }
 
@@ -799,10 +794,10 @@ mod tests {
         let p = hotkey_problem(&["F9"]).unwrap();
         assert_eq!(p, "Hotkey F9 unavailable — another app may be using it");
         let (rgb, tip) = look(TrayStatus::Recording, Some(&p));
-        assert_eq!(rgb, [220, 38, 38], "recording must stay visible");
+        assert_eq!(rgb, retake_core::logo::ACCENT, "recording must stay visible");
         assert_eq!(tip, format!("Retake — recording\n{p}"));
         let (rgb, tip) = look(TrayStatus::Idle, Some(&p));
-        assert_eq!(rgb, [234, 179, 8], "idle shows the warning");
+        assert_eq!(rgb, retake_core::logo::WARNING, "idle shows the warning");
         assert_eq!(tip, format!("Retake — idle\n{p}"));
         assert_eq!(
             hotkey_problem(&["F9", "Ctrl+F9"]).unwrap(),
@@ -868,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn icon_is_a_soft_circle_in_bgra() {
+    fn icon_is_the_mark_with_a_status_dot_in_bgra() {
         let px = icon_pixels([220, 38, 38]);
         assert_eq!(px.len(), 32 * 32 * 4);
         let centre = ((16 * 32 + 16) * 4) as usize;
