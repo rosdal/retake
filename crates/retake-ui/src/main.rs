@@ -1453,7 +1453,15 @@ impl App {
                     format!("{}   ·   press {} to save a clip", s.capture, s.hotkey)
                 })
                 .color(style::MUTED),
-                row![save, pause].spacing(10),
+                row![
+                    save,
+                    pause,
+                    button(text("Open clips folder"))
+                        .on_press(Message::OpenFile(self.clips_dir().join("raw")))
+                        .padding([12, 18])
+                        .style(style::secondary),
+                ]
+                .spacing(10),
             ]
             .spacing(14),
         )
@@ -2297,6 +2305,10 @@ impl App {
                             .style(style::secondary),
                         button(text("Open config file"))
                             .on_press(Message::OpenFile(self.args.config.clone()))
+                            .padding([10, 14])
+                            .style(style::secondary),
+                        button(text("Open logs"))
+                            .on_press(Message::OpenFile(platform::app_data().join("logs")))
                             .padding([10, 14])
                             .style(style::secondary),
                         button(text("Lite window"))
