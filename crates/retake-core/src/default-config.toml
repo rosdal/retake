@@ -63,6 +63,8 @@ post_roll     = 3
 # Standard clip and full-buffer hotkeys.
 hotkey        = "F9"
 hotkey_full   = "Ctrl+F9"
+# Stars the newest clip for montages ("" = off).
+hotkey_star   = "F10"
 # Play a short sound when a clip is saved.
 sound_cue     = true
 # Once raw clips take more than this many GB, delete the oldest ones that already

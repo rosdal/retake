@@ -469,12 +469,51 @@ fn main() -> ExitCode {
             Err(e) => return fatal(&format!("clips hotkey {label}: {e}")),
         }
     }
+    // The star hotkey (montages): stars the newest clip in the library.
+    let star_index = specs.len();
+    if !config.clips.hotkey_star.is_empty()
+        && let Ok(key) = retake_core::hotkey::parse(&config.clips.hotkey_star)
+    {
+        specs.push(tray::HotkeySpec {
+            label: config.clips.hotkey_star.clone(),
+            key,
+        });
+    }
+    let library = match library::Library::open(&config.clips.out_dir) {
+        Ok(l) => Some(Arc::new(l)),
+        Err(e) => {
+            tracing::warn!("clip library unavailable: {e:#}");
+            None
+        }
+    };
+    let star_library = library.clone();
     let (press_tx, press_rx) = mpsc::channel();
     let ui_press_tx = press_tx.clone();
     let cue = config.clips.sound_cue;
     let hotkey_tx = press_tx.clone();
     let hotkey_session = session.clone();
     let on_hotkey = move |i: usize| {
+        if i == star_index {
+            let starred = star_library.as_ref().map(|l| l.star_last());
+            match starred {
+                Some(Ok(Some(p))) => {
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    tracing::info!(clip = %name, "starred");
+                    status::event(format!("★ starred  {name}"));
+                    if cue {
+                        sound::play_saved();
+                    }
+                }
+                Some(Ok(None)) => tracing::info!("star hotkey: no clip yet"),
+                Some(Err(e)) => tracing::warn!("starring: {e:#}"),
+                None => {}
+            }
+            return;
+        }
         let Some(&kind) = kinds.get(i) else { return };
         let p = Press {
             at: clock::now_ms(),
@@ -534,6 +573,8 @@ fn main() -> ExitCode {
         notify::toast,
     );
     let saved_media = media.clone();
+    let saved_library = library.clone();
+    let saved_ffmpeg = ffmpeg.clone();
 
     // Auto-clipping (Siege): keep the whole session's recording, then after the game closes
     // read its Match Replays and cut the player's kills. Off when not asked for or not Siege:
@@ -554,7 +595,16 @@ fn main() -> ExitCode {
             dissect: autoclipper::find_dissect(&exe_dir),
             raw_dir: config.clips.out_dir.join("raw"),
             min_play: config.autoclip.clip.min_play(),
-            on_clip: Box::new(move |p: &Path| clip_media.clip_saved(p)),
+            on_clip: {
+                let lib = library.clone();
+                let ff = ffmpeg.clone();
+                Box::new(move |p: &Path| {
+                    clip_media.clip_saved(p);
+                    if let Some(l) = &lib {
+                        let _ = l.add(&ff, p);
+                    }
+                })
+            },
             on_notice: Box::new(move |m: &str| {
                 if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     notify::toast(m);
@@ -635,6 +685,9 @@ fn main() -> ExitCode {
                     sound::play_saved();
                 }
                 saved_media.clip_saved(p);
+                if let Some(lib) = &saved_library {
+                    let _ = lib.add(&saved_ffmpeg, p);
+                }
                 let name = p
                     .file_name()
                     .unwrap_or_default()

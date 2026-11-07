@@ -119,6 +119,8 @@ pub struct Clips {
     pub post_roll: u32,
     pub hotkey: String,
     pub hotkey_full: String,
+    /// Stars the newest clip for montages; "" = no star hotkey.
+    pub hotkey_star: String,
     pub sound_cue: bool,
     /// Delete the oldest raw clips that already have a graded version once raw clips take
     /// more than this many GB. 0 = off.
@@ -353,6 +355,16 @@ pub fn validate(c: &Config) -> Vec<String> {
             "clips.hotkey_full = {}: must differ from clips.hotkey",
             clips.hotkey_full
         ));
+    }
+    if !clips.hotkey_star.is_empty() {
+        match crate::hotkey::parse(&clips.hotkey_star) {
+            Ok(k) if parsed.contains(&k) => errs.push(format!(
+                "clips.hotkey_star = {}: must differ from the clip hotkeys",
+                clips.hotkey_star
+            )),
+            Ok(_) => {}
+            Err(e) => errs.push(format!("clips.hotkey_star = {}: {e}", clips.hotkey_star)),
+        }
     }
     if c.audio.game_delay_ms > 500 {
         errs.push(format!(
