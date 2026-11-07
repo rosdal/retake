@@ -70,17 +70,11 @@ sound_cue     = true
 max_raw_gb    = 0
 
 [autoclip]
-# Save a clip automatically on your own kills.
+# Clip your kills automatically after each match. In Siege this reads the game's
+# own Match Replays (turn Match Replay on in Siege's options); nothing to set up.
 enabled       = true
-# x, y, w, h of the kill feed (set by calibration; default assumes 2560x1440).
-region        = [1880, 120, 640, 260]
-# Template image of your name in the kill feed (set by calibration).
-template      = "name.png"
-# Match threshold for normalized cross-correlation, 0–1.
-threshold     = 0.82
-# Kills within this many seconds extend one clip.
-merge_window  = 10
-
+# Which plays: "every" kill, "2k" and up, "3k" and up, "aces", or "off".
+clip          = "every"
 [grade]
 # Grade every saved clip automatically, after the game closes: "on" or "off".
 mode            = "on"

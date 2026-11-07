@@ -129,6 +129,8 @@ struct Loop {
     pump: Option<Pump>,
     /// The game process the game track captures, to notice a restarted game.
     audio_pid: Option<u32>,
+    /// Counts game sessions; a respawn within one keeps the number.
+    game_session: u64,
     /// Free space on the buffer drive; recording stops while it is low.
     disk: DiskGuard,
     /// The PC is going to sleep: recording stops until it resumes.
@@ -157,6 +159,7 @@ impl Loop {
             pump: None,
             audio_pid: None,
             disk: DiskGuard::new(),
+            game_session: 0,
             suspended: false,
             run: 0,
             last_stats: None,
@@ -278,6 +281,7 @@ impl Loop {
             match c {
                 Command::StartSession => {
                     tracing::info!("game running; starting recording");
+                    self.game_session += 1;
                     cmd = self.spawn(now);
                 }
                 Command::Respawn => {
@@ -576,6 +580,7 @@ impl Loop {
                     live: true,
                     torn: false,
                     audio_dir,
+                    game_session: self.game_session,
                 });
                 self.ffmpeg = Some(f);
                 None

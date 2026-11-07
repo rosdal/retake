@@ -119,11 +119,35 @@ pub struct Clips {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Autoclip {
+    /// Clip the player's kills automatically after the match (Siege: from Match Replays).
     pub enabled: bool,
-    pub region: [u32; 4],
-    pub template: PathBuf,
-    pub threshold: f32,
-    pub merge_window: u32,
+    /// Which plays: "every", "2k", "3k", "aces" or "off".
+    pub clip: ClipPlays,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipPlays {
+    Every,
+    #[serde(rename = "2k")]
+    TwoK,
+    #[serde(rename = "3k")]
+    ThreeK,
+    Aces,
+    Off,
+}
+
+impl ClipPlays {
+    pub fn min_play(self) -> crate::autoclip::MinPlay {
+        use crate::autoclip::MinPlay;
+        match self {
+            ClipPlays::Every => MinPlay::Every,
+            ClipPlays::TwoK => MinPlay::TwoK,
+            ClipPlays::ThreeK => MinPlay::ThreeK,
+            ClipPlays::Aces => MinPlay::Aces,
+            ClipPlays::Off => MinPlay::Off,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -410,9 +434,7 @@ pub fn resolve_paths(c: &mut Config, base: &Path) {
             *p = base.join(&*p);
         }
     }
-    if c.autoclip.template.is_relative() {
-        c.autoclip.template = base.join(&c.autoclip.template);
-    }
+
     if c.grade.look.is_relative() && c.grade.look != Path::new(BUILTIN_LOOK) {
         c.grade.look = base.join(&c.grade.look);
     }
@@ -682,7 +704,7 @@ buffer_dir = 'D:/100%/buf'"
         let mut c = load_str("").unwrap();
         resolve_paths(&mut c, Path::new(r"C:\base"));
         assert_eq!(c.grade.look, Path::new("builtin"));
-        assert_eq!(c.autoclip.template, Path::new(r"C:\base\name.png"));
+        assert_eq!(c.autoclip.clip, ClipPlays::Every);
     }
 
     #[test]
