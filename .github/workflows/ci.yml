@@ -44,3 +44,29 @@ jobs:
         with:
           name: retake-exe
           path: target/release/retake.exe
+
+  r6-dissect:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build r6-dissect (pinned, from source)
+        shell: pwsh
+        run: ./scripts/build-r6-dissect.ps1
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $out = & third_party/r6-dissect/r6-dissect.exe --help 2>&1 | Out-String
+          if ($out -notmatch 'info|output') { Write-Host $out; throw 'r6-dissect --help printed nothing useful' }
+
+      - name: Upload r6-dissect.exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: r6-dissect
+          path: third_party/r6-dissect/r6-dissect.exe

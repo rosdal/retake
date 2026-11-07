@@ -11,6 +11,7 @@ mod ffmpeg;
 mod ffmpeg_proc;
 mod grader;
 mod instance;
+mod killfeed;
 mod logging;
 mod media;
 mod pipe;
@@ -223,6 +224,19 @@ fn main() -> ExitCode {
     }
     if words.first().is_some_and(|w| w == "grade") {
         return grade_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "scan-feed") {
+        attach_console();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        let r = ffmpeg::locate(dir).and_then(|f| killfeed::scan_main(&f, &words[1..]));
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("scan-feed: {e:#}");
+                ExitCode::from(1)
+            }
+        };
     }
     let args = parse_args();
     if args.console {

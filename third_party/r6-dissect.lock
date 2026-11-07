@@ -1,0 +1,5 @@
+# r6-dissect (MIT), the Siege Match Replay parser Retake runs as a sidecar after a match.
+# Built from source at this commit by scripts/build-r6-dissect.ps1 (CI does this; the exe is
+# never downloaded prebuilt). The fork supports replays through Y11S2+.
+repo=https://github.com/prestonwillis10/r6-dissect
+commit=98e6a680bd322ba322689dde4b192b6946167705

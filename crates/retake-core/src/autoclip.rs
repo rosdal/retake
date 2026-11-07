@@ -15,71 +15,152 @@ pub struct FeedFrame<'a> {
 /// Tuning for [`new_rows`].
 #[derive(Debug, Clone, Copy)]
 pub struct RowParams {
-    /// Height of one kill-feed row as a fraction of the region height.
-    pub row_frac: f64,
-    /// Mean absolute difference (0–255) above which a band counts as changed.
-    pub changed: f64,
-    /// Mean absolute difference below which a band counts as the same.
+    /// Luma above which a pixel counts as text or icon (kill rows are white text on a box).
+    pub bright: u8,
+    /// Share of a scanline's pixels that must be bright for it to belong to a row.
+    pub min_fill: f64,
+    /// Rows shorter than this share of the region height are noise.
+    pub min_height: f64,
+    /// Rows taller than this share of the region height aren't kill rows.
+    pub max_height: f64,
+    /// Bright/dark transitions a scanline needs per 100 px: text has many, scenery few.
+    pub min_transitions: f64,
+    /// A kill row reaches this close to the region's right edge (share of its width).
+    pub right_margin: f64,
+    /// Mean absolute difference (0–255) under which two rows are the same row.
     pub same: f64,
-    /// Minimum seconds between two detected rows.
+    /// Seconds after a new row during which another new row at the same height is ignored.
     pub min_gap: f64,
 }
 
 impl Default for RowParams {
     fn default() -> Self {
         RowParams {
-            row_frac: 0.2,
-            changed: 18.0,
-            same: 10.0,
-            min_gap: 0.4,
+            bright: 170,
+            min_fill: 0.02,
+            min_height: 0.04,
+            max_height: 0.16,
+            min_transitions: 4.0,
+            right_margin: 0.40,
+            same: 22.0,
+            min_gap: 0.6,
         }
     }
 }
 
-fn band<'a>(f: &'a FeedFrame<'a>, k: usize, rows: usize) -> impl Iterator<Item = u8> + 'a {
-    let h = f.height / rows;
-    f.luma[k * h * f.width..((k + 1) * h * f.width).min(f.luma.len())]
-        .iter()
-        .copied()
+/// Columns in a row's fingerprint.
+const SIG_COLS: usize = 48;
+
+/// A text row found in one frame, by what it looks like.
+#[derive(Debug, Clone)]
+struct Row {
+    sig: Vec<f64>,
 }
 
-fn diff(a: impl Iterator<Item = u8>, b: impl Iterator<Item = u8>) -> f64 {
-    let (mut sum, mut n) = (0u64, 0u64);
-    for (x, y) in a.zip(b) {
-        sum += u64::from(x.abs_diff(y));
-        n += 1;
+/// The rows of text in a kill-feed frame: runs of scanlines with enough bright pixels, each
+/// with a fingerprint (mean luma of `SIG_COLS` column strips over the row's height).
+fn rows_of(f: &FeedFrame<'_>, p: &RowParams) -> Vec<Row> {
+    let (w, h) = (f.width, f.height);
+    if w == 0 || h == 0 || f.luma.len() < w * h {
+        return Vec::new();
     }
-    if n == 0 { 0.0 } else { sum as f64 / n as f64 }
+    let need_edges = p.min_transitions * w as f64 / 100.0;
+    let right_zone = w - ((w as f64 * p.right_margin) as usize).max(1);
+    let filled: Vec<bool> = (0..h)
+        .map(|y| {
+            let line = &f.luma[y * w..(y + 1) * w];
+            let bright = line.iter().filter(|&&v| v >= p.bright).count() as f64 / w as f64;
+            let edges = line
+                .windows(2)
+                .filter(|v| (v[0] >= p.bright) != (v[1] >= p.bright))
+                .count() as f64;
+            let reaches_right = line[right_zone..].iter().any(|&v| v >= p.bright);
+            bright >= p.min_fill && edges >= need_edges && reaches_right
+        })
+        .collect();
+    let min_h = ((h as f64 * p.min_height).round() as usize).max(2);
+    let max_h = (h as f64 * p.max_height).round() as usize;
+    let mut rows = Vec::new();
+    let mut y = 0;
+    while y < h {
+        if !filled[y] {
+            y += 1;
+            continue;
+        }
+        let start = y;
+        while y < h && filled[y] {
+            y += 1;
+        }
+        // Scanlines inside a row may miss the edge test (gaps between letters); a row is the
+        // run of qualifying lines, which must have a kill row's height.
+        if y - start >= min_h && y - start <= max_h {
+            let sig = (0..SIG_COLS)
+                .map(|c| {
+                    let (x0, x1) = (
+                        c * w / SIG_COLS,
+                        ((c + 1) * w / SIG_COLS).max(c * w / SIG_COLS + 1),
+                    );
+                    let mut sum = 0u64;
+                    for yy in start..y {
+                        sum += f.luma[yy * w + x0..yy * w + x1]
+                            .iter()
+                            .map(|&v| u64::from(v))
+                            .sum::<u64>();
+                    }
+                    sum as f64 / ((x1 - x0) * (y - start)) as f64
+                })
+                .collect();
+            rows.push(Row { sig });
+        }
+    }
+    rows
 }
 
-/// Times a new row appeared at the top of the kill feed: the top band changed while the band
-/// below now shows what the top band showed before (the feed shifted down), or the feed was
-/// empty below. Fades of existing rows don't count, because nothing shifts.
+fn sig_diff(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len().max(1) as f64
+}
+
+/// Times a new row appeared in the kill feed. Siege adds rows below the ones already shown and
+/// drops old rows from the top, with system messages mixed in, so a row is new when nothing in
+/// the previous frame looks like it, wherever it sits. Rows that merely move up don't count.
 pub fn new_rows(frames: &[FeedFrame<'_>], p: &RowParams) -> Vec<f64> {
-    let rows = ((1.0 / p.row_frac).round() as usize).max(2);
     let mut out: Vec<f64> = Vec::new();
-    for w in frames.windows(2) {
-        let (a, b) = (&w[0], &w[1]);
-        if a.width != b.width || a.height != b.height || a.height < rows {
-            continue;
+    let mut prev: Vec<Row> = Vec::new();
+    // Rows reported moments ago, by fingerprint: a row fading in changes a little from frame
+    // to frame and must not count twice.
+    let mut recent: Vec<(f64, Vec<f64>)> = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        // The first frame is the baseline: rows already showing aren't new.
+        let first = i == 0;
+        let rows = rows_of(f, p);
+        for r in &rows {
+            let seen = prev.iter().any(|q| sig_diff(&q.sig, &r.sig) < p.same);
+            let near_recent = recent
+                .iter()
+                .any(|(t, s)| f.time - t < p.min_gap && sig_diff(s, &r.sig) < 2.0 * p.same);
+            if !first && !seen && !near_recent {
+                out.push(f.time);
+                recent.push((f.time, r.sig.clone()));
+            }
         }
-        let top_changed = diff(band(a, 0, rows), band(b, 0, rows)) > p.changed;
-        if !top_changed {
-            continue;
-        }
-        // The old top row moved one band down…
-        let shifted = diff(band(a, 0, rows), band(b, 1, rows)) < p.same;
-        // …or the band below was empty (dark) before and still is: the first row of a feed.
-        let band_px = ((a.height / rows) * a.width).max(1) as f64;
-        let mean = |f: &FeedFrame<'_>, k: usize| -> f64 {
-            band(f, k, rows).map(f64::from).sum::<f64>() / band_px
-        };
-        let first = mean(a, 0) < p.same && mean(a, 1) < 24.0 && mean(b, 1) < 24.0;
-        if (shifted || first) && out.last().is_none_or(|&t| b.time - t >= p.min_gap) {
-            out.push(b.time);
-        }
+        recent.retain(|(t, _)| f.time - t < p.min_gap);
+        prev = rows;
     }
+    out.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     out
+}
+/// Siege's kill feed as fractions of the frame *height* (the HUD scales with height and hugs
+/// the right edge, so this fits 16:9, 16:10 and 21:9 alike): `(width, top, height)`; the
+/// region's right edge is the frame's.
+pub const SIEGE_FEED: (f64, f64, f64) = (0.462, 0.22, 0.26);
+
+/// The kill-feed crop `(w, h, x, y)` in pixels for a `width × height` recording.
+pub fn feed_crop(width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let (fw, top, fh) = SIEGE_FEED;
+    let h = f64::from(height);
+    let w = ((fw * h) as u32).min(width) / 2 * 2;
+    let ch = ((fh * h) as u32) / 2 * 2;
+    (w, ch, width - w, (top * h) as u32)
 }
 
 /// A kill from the replay: seconds since the round started, and whether the player made it.
@@ -243,15 +324,22 @@ pub fn clip_stem(stamp: &str, c: &KillClip) -> String {
 mod tests {
     use super::*;
 
-    const W: usize = 40;
-    const H: usize = 50; // 5 bands of 10 px
+    const W: usize = 96;
+    const H: usize = 100; // 10 slots of 10 px
 
-    /// A feed whose rows (top first) have these brightness values; 0 = empty.
+    /// A feed whose slots (top first) hold these row ids; 0 = empty. Each id has its own
+    /// pattern of bright "text" on a dark box.
     fn feed(rows: &[u8]) -> Vec<u8> {
-        let mut v = vec![0u8; W * H];
-        for (k, &val) in rows.iter().enumerate() {
-            for p in &mut v[k * 10 * W..(k + 1) * 10 * W] {
-                *p = val;
+        let mut v = vec![10u8; W * H];
+        for (k, &id) in rows.iter().enumerate() {
+            if id == 0 {
+                continue;
+            }
+            for y in k * 10 + 2..k * 10 + 8 {
+                for x in 0..W {
+                    let bright = (x * (id as usize) + id as usize * 3) % 7 < 3;
+                    v[y * W + x] = if bright { 230 } else { 50 };
+                }
             }
         }
         v
@@ -272,24 +360,30 @@ mod tests {
     }
 
     #[test]
-    fn rows_pushing_down_are_detected_once_each() {
+    fn rows_added_below_are_detected_once_each() {
         let seq = vec![
             feed(&[]),
-            feed(&[200]), // first row on an empty feed
-            feed(&[200]),
-            feed(&[120, 200]), // new row, old one shifted down
-            feed(&[120, 200]),
-            feed(&[90, 120, 200]), // another
+            feed(&[1]), // first row
+            feed(&[1]),
+            feed(&[1, 2]), // a second row below it
+            feed(&[1, 2]),
+            feed(&[2, 3]), // the oldest expired, rows moved up, a third appeared
+            feed(&[2, 3]),
         ];
         assert_eq!(detect(&seq), [0.25, 0.75, 1.25]);
     }
 
     #[test]
-    fn a_row_fading_out_is_not_a_kill() {
-        let seq = vec![feed(&[120, 200]), feed(&[120, 60]), feed(&[120])];
+    fn rows_moving_up_or_fading_are_not_kills() {
+        let seq = vec![feed(&[1, 2, 3]), feed(&[2, 3]), feed(&[3]), feed(&[])];
         assert!(detect(&seq).is_empty());
     }
 
+    #[test]
+    fn rows_already_there_at_the_start_are_not_new() {
+        let seq = vec![feed(&[4, 5]), feed(&[4, 5])];
+        assert!(detect(&seq).is_empty());
+    }
     fn k(at: f64, mine: bool) -> ReplayKill {
         ReplayKill { at, mine }
     }
@@ -316,6 +410,14 @@ mod tests {
     #[test]
     fn align_nothing_matches() {
         assert_eq!(align(&[k(1.0, true)], &[], 0.5), [None]);
+    }
+
+    #[test]
+    fn feed_crop_hugs_the_right_edge() {
+        assert_eq!(feed_crop(1920, 1080), (498, 280, 1422, 237));
+        let (w, _, x, _) = feed_crop(3440, 1440);
+        assert_eq!(x + w, 3440);
+        assert_eq!(w, 664);
     }
 
     #[test]

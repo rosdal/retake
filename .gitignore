@@ -6,3 +6,4 @@ third_party/ffmpeg/
 crates/*/config.toml
 third_party/presentmon/
 /bench/
+third_party/r6-dissect/
