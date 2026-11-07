@@ -239,7 +239,11 @@ fn set_text(h: HWND, s: &str) {
 /// Shows the window (creating it the first time) and brings it to the front.
 /// The plain window, once created (for dialog-style keyboard handling in the tray loop).
 pub fn window() -> Option<HWND> {
-    UI.with(|u| u.try_borrow().ok().and_then(|u| u.as_ref().map(|ui| ui.hwnd)))
+    UI.with(|u| {
+        u.try_borrow()
+            .ok()
+            .and_then(|u| u.as_ref().map(|ui| ui.hwnd))
+    })
 }
 
 pub fn show() {

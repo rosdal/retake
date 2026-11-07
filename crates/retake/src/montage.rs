@@ -552,3 +552,50 @@ pub fn projects(clips: &Path) -> Vec<(PathBuf, Project)> {
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Beat detection on real songs of published tempo: files named `<bpm>_<title>.mp3` in
+    /// `RETAKE_BPM_DIR` (e.g. Kevin MacLeod tracks from incompetech, which lists each BPM).
+    /// `RETAKE_BPM_DIR=... cargo test -p retake --release -- --ignored known_bpm`
+    #[test]
+    #[ignore]
+    fn known_bpm_songs() {
+        let dir = PathBuf::from(std::env::var("RETAKE_BPM_DIR").expect("RETAKE_BPM_DIR"));
+        let ffmpeg =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\third_party\ffmpeg\bin\ffmpeg.exe");
+        let mut results = Vec::new();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "mp3") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let Some(bpm) = name.split('_').next().and_then(|b| b.parse::<f64>().ok()) else {
+                continue;
+            };
+            let samples = decode_song(&ffmpeg, &p).unwrap();
+            let a = song::analyse(&samples).expect("analysis");
+            results.push((name, bpm, a.bpm));
+        }
+        for (n, want, got) in &results {
+            println!("{n}: published {want} BPM, detected {got:.1}");
+        }
+        assert!(results.len() >= 5, "need at least 5 songs");
+        let near = |got: f64, want: f64| (got - want).abs() / want < 0.02;
+        let exact = results.iter().filter(|r| near(r.2, r.1)).count();
+        // MIREX "accuracy 2": half or double tempo counts too.
+        let octave = results
+            .iter()
+            .filter(|r| [1.0, 2.0, 0.5].iter().any(|f| near(r.2, r.1 * f)))
+            .count();
+        println!(
+            "exact {exact}/{n}, octave-tolerant {octave}/{n}",
+            n = results.len()
+        );
+        // Where the tempo is right it is right to within 2%; keep at least today's level.
+        assert!(octave * 3 >= results.len() * 2, "octave-tolerant below 2/3");
+    }
+}

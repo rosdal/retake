@@ -209,6 +209,30 @@ fn tempo(onset: &[f32]) -> f64 {
     best.1
 }
 
+/// The beat period (seconds) fitted through the beats: the slope of time against beat
+/// number, counting skipped beats where a gap is about twice the median.
+fn beat_period(beats: &[f64]) -> Option<f64> {
+    let mut gaps: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_by(f64::total_cmp);
+    let median = *gaps.get(gaps.len() / 2)?;
+    if median <= 0.0 {
+        return None;
+    }
+    let mut idx = 0.0f64;
+    let mut pts = vec![(0.0, beats[0])];
+    for w in beats.windows(2) {
+        idx += ((w[1] - w[0]) / median).round().max(1.0);
+        pts.push((idx, w[1]));
+    }
+    let n = pts.len() as f64;
+    let (sx, sy) = pts.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
+    let (mx, my) = (sx / n, sy / n);
+    let (num, den) = pts.iter().fold((0.0, 0.0), |a, p| {
+        (a.0 + (p.0 - mx) * (p.1 - my), a.1 + (p.0 - mx).powi(2))
+    });
+    (den > 0.0).then(|| num / den).filter(|p| *p > 0.0)
+}
+
 /// Beat frames by dynamic programming (Ellis 2007): each beat rewards onset strength and
 /// penalises gaps that differ from the tempo's period.
 fn track(onset: &[f32], bpm: f64) -> Vec<usize> {
@@ -267,13 +291,10 @@ pub fn analyse(samples: &[f32]) -> Option<Analysis> {
         return None;
     }
     let beats: Vec<f64> = beat_frames.iter().map(|&i| frame_time(i)).collect();
-    // Refine the BPM from the tracked beats' median gap.
-    let mut gaps: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
-    gaps.sort_by(f64::total_cmp);
-    if let Some(g) = gaps.get(gaps.len() / 2)
-        && *g > 0.0
-    {
-        bpm = 60.0 / g;
+    // Refine the BPM: a least-squares line through beat time against beat number. Single
+    // gaps are whole frames (23 ms); the fit over many beats is far finer.
+    if let Some(period) = beat_period(&beats) {
+        bpm = 60.0 / period;
     }
     // Downbeat phase: the beat phase (mod 4) with the most low-band energy.
     let low_at = |i: usize| -> f32 {
