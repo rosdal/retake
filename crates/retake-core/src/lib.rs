@@ -19,6 +19,7 @@ pub mod quiet;
 pub mod replay;
 pub mod segments;
 pub mod siege_settings;
+pub mod song;
 pub mod sync;
 pub mod watcher;
 

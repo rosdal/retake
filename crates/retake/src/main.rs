@@ -243,7 +243,9 @@ fn main() -> ExitCode {
     }
     if words.first().is_some_and(|w| w == "write-look") {
         // The built-in look as a .cube file (for the release zip, or to edit in Resolve).
-        let out = words.get(1).map_or_else(|| PathBuf::from("siege.cube"), PathBuf::from);
+        let out = words
+            .get(1)
+            .map_or_else(|| PathBuf::from("siege.cube"), PathBuf::from);
         let cube = retake_core::grade::builtin_look(33).write("Retake Siege look");
         if let Some(dir) = out.parent() {
             let _ = std::fs::create_dir_all(dir);
