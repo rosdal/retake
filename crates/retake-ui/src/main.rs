@@ -68,6 +68,8 @@ struct Args {
     screen: Option<String>,
     /// Opens this clip in the clip view.
     open: Option<PathBuf>,
+    /// Starts with keyboard focus on the n-th control (screenshots).
+    focus: Option<usize>,
 }
 
 impl Args {
@@ -77,7 +79,7 @@ impl Args {
             .and_then(|e| e.parent().map(|d| d.join("config.toml")))
             .unwrap_or_else(|| PathBuf::from("config.toml"));
         let mut status = platform::app_data().join(retake_core::control::STATUS_FILE);
-        let (mut screen, mut open) = (None, None);
+        let (mut screen, mut open, mut focus) = (None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -85,6 +87,7 @@ impl Args {
                 "--status" => status = it.next().map_or(status, PathBuf::from),
                 "--screen" => screen = it.next(),
                 "--open" => open = it.next().map(PathBuf::from),
+                "--focus" => focus = it.next().and_then(|n| n.parse().ok()),
                 _ => {}
             }
         }
@@ -93,6 +96,7 @@ impl Args {
             status,
             screen,
             open,
+            focus,
         }
     }
 }
@@ -231,6 +235,10 @@ struct SettingsState {
 }
 
 struct App {
+    /// Keyboard focus: an index into the focusable controls of the last drawn frame.
+    focus: Option<usize>,
+    /// The messages of the focusable controls, in the order the last frame drew them.
+    focusables: std::cell::RefCell<Vec<Message>>,
     args: Args,
     ffmpeg: Option<PathBuf>,
     status: Option<Status>,
@@ -263,7 +271,7 @@ struct App {
     was_busy: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Message {
     Tick,
     Wake,
@@ -332,6 +340,8 @@ enum Message {
     DismissIntro,
     StartService,
     Key(Key, Modifiers),
+    /// Give a text field the keyboard focus (Tab reached it, Enter pressed).
+    FocusInput(String),
 }
 
 fn load_doc(path: &Path) -> toml_edit::DocumentMut {
@@ -358,6 +368,8 @@ impl App {
         let status = data::read_status(&args.status);
         let doc = load_doc(&args.config);
         let app = App {
+            focus: args.focus,
+            focusables: std::cell::RefCell::new(Vec::new()),
             ffmpeg: platform::ffmpeg(),
             status,
             screen: Screen::Home,
@@ -629,6 +641,102 @@ impl App {
         self.arrange_editor(None);
     }
 
+    /// Registers a button's message as focusable and returns its style, with an accent
+    /// ring when it has the keyboard focus.
+    fn ring<S>(
+        &self,
+        msg: Message,
+        base: S,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style
+    where
+        S: Fn(&iced::Theme, button::Status) -> button::Style,
+    {
+        let mut f = self.focusables.borrow_mut();
+        let focused = self.focus == Some(f.len());
+        f.push(msg);
+        move |t, s| {
+            let mut st = base(t, s);
+            if focused {
+                st.border = iced::Border {
+                    color: style::ACCENT,
+                    width: 2.0,
+                    radius: st.border.radius,
+                };
+            }
+            st
+        }
+    }
+
+    /// Like [`Self::ring`] for a button that may be disabled (not focusable then).
+    fn ring_maybe<S>(
+        &self,
+        msg: Option<Message>,
+        base: S,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style
+    where
+        S: Fn(&iced::Theme, button::Status) -> button::Style,
+    {
+        let focused = match msg {
+            Some(m) => {
+                let mut f = self.focusables.borrow_mut();
+                let focused = self.focus == Some(f.len());
+                f.push(m);
+                focused
+            }
+            None => false,
+        };
+        move |t, s| {
+            let mut st = base(t, s);
+            if focused {
+                st.border = iced::Border {
+                    color: style::ACCENT,
+                    width: 2.0,
+                    radius: st.border.radius,
+                };
+            }
+            st
+        }
+    }
+
+    /// Wraps a non-button control: focusable (Enter sends `msg`), ringed when focused.
+    fn fbox<'a>(&self, e: impl Into<Element<'a, Message>>, msg: Message) -> Element<'a, Message> {
+        let focused = self.focus_slot(msg);
+        container(e)
+            .padding(2)
+            .style(move |_| container::Style {
+                border: iced::Border {
+                    color: if focused {
+                        style::ACCENT
+                    } else {
+                        iced::Color::TRANSPARENT
+                    },
+                    width: 2.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// A text field that Tab can reach: Enter on it gives it the keyboard focus.
+    fn finput<'a>(
+        &self,
+        id: &str,
+        input: iced::widget::TextInput<'a, Message>,
+    ) -> Element<'a, Message> {
+        let input = input.id(iced::widget::text_input::Id::new(id.to_owned()));
+        self.fbox(input, Message::FocusInput(id.to_owned()))
+    }
+
+    /// Whether the control at the next focusable slot has the focus (for non-button
+    /// controls: toggles, pickers), registering `msg` as what Enter does there.
+    fn focus_slot(&self, msg: Message) -> bool {
+        let mut f = self.focusables.borrow_mut();
+        let focused = self.focus == Some(f.len());
+        f.push(msg);
+        focused
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick | Message::Wake => {
@@ -666,6 +774,7 @@ impl App {
             }
             Message::Nav(s) => {
                 self.screen = s;
+                self.focus = None;
                 self.hover = None;
                 if s == Screen::Settings {
                     self.settings.doc = load_doc(&self.args.config);
@@ -1228,6 +1337,10 @@ impl App {
                 Task::none()
             }
             Message::Key(key, m) => self.on_key(key, m),
+            Message::FocusInput(id) => {
+                self.focus = None;
+                iced::widget::text_input::focus(iced::widget::text_input::Id::new(id))
+            }
         }
     }
 
@@ -1250,6 +1363,31 @@ impl App {
     }
 
     fn on_key(&mut self, key: Key, m: Modifiers) -> Task<Message> {
+        let n = self.focusables.borrow().len();
+        match key.as_ref() {
+            Key::Named(Named::Tab) if n > 0 => {
+                self.focus = Some(match (self.focus, m.shift()) {
+                    (None, false) => 0,
+                    (None, true) => n - 1,
+                    (Some(i), false) => (i + 1) % n,
+                    (Some(i), true) => (i + n - 1) % n,
+                });
+                return Task::none();
+            }
+            Key::Named(Named::Enter | Named::Space) if self.focus.is_some() => {
+                let msg = self
+                    .focus
+                    .and_then(|i| self.focusables.borrow().get(i).cloned());
+                if let Some(msg) = msg {
+                    return self.update(msg);
+                }
+            }
+            Key::Named(Named::Escape) if self.focus.is_some() => {
+                self.focus = None;
+                return Task::none();
+            }
+            _ => {}
+        }
         if m.control() {
             let to = match key.as_ref() {
                 Key::Character("1") => Some(Screen::Home),
@@ -1353,6 +1491,9 @@ impl App {
     // ---- Views -------------------------------------------------------------------------
 
     fn view(&self) -> Element<'_, Message> {
+        self.focusables.borrow_mut().clear();
+        // The sidebar first: Tab order follows the screen, left to right.
+        let sidebar = self.sidebar();
         let content: Element<'_, Message> = match self.screen {
             Screen::Home => self.home(),
             Screen::Library => self.library(),
@@ -1371,7 +1512,7 @@ impl App {
         }
         main = main.push(content);
         let ui = row![
-            self.sidebar(),
+            sidebar,
             container(main)
                 .padding(24)
                 .width(Length::Fill)
@@ -1395,7 +1536,7 @@ impl App {
                 .padding([13, 16])
                 .width(Length::Fill)
                 .height(style::TARGET)
-                .style(style::nav(active))
+                .style(self.ring(Message::Nav(s), style::nav(active)))
         };
         let (dot_colour, state) = match &self.status {
             Some(s) if s.live(data::unix_ms()) => (
@@ -1472,7 +1613,7 @@ impl App {
                             button(text("Start Retake").font(style::INTER_SEMI))
                                 .on_press(Message::StartService)
                                 .padding([13, 18])
-                                .style(style::primary),
+                                .style(self.ring(Message::StartService, style::primary)),
                         ]
                         .align_y(Alignment::Center),
                     )
@@ -1493,11 +1634,14 @@ impl App {
         let pause = button(text(if s.paused { "Resume" } else { "Pause" }).font(style::INTER_SEMI))
             .on_press(Message::Send(Command::Pause { on: !s.paused }))
             .padding([13, 18])
-            .style(style::secondary);
+            .style(self.ring(
+                Message::Send(Command::Pause { on: !s.paused }),
+                style::secondary,
+            ));
         let save = button(text("Save last 60 s").font(style::INTER_SEMI))
             .on_press(Message::Send(Command::SaveFull))
             .padding([13, 18])
-            .style(style::primary);
+            .style(self.ring(Message::Send(Command::SaveFull), style::primary));
         let state_panel = container(
             column![
                 row![
@@ -1528,7 +1672,10 @@ impl App {
                     button(text("Open clips folder"))
                         .on_press(Message::OpenFile(self.clips_dir().join("raw")))
                         .padding([13, 18])
-                        .style(style::secondary),
+                        .style(self.ring(
+                            Message::OpenFile(self.clips_dir().join("raw")),
+                            style::secondary
+                        )),
                 ]
                 .spacing(10),
             ]
@@ -1629,7 +1776,7 @@ impl App {
                 button(text("Got it"))
                     .on_press(Message::DismissIntro)
                     .padding([13, 16])
-                    .style(style::secondary),
+                    .style(self.ring(Message::DismissIntro, style::secondary)),
             ]
             .align_y(Alignment::Center),
             row![
@@ -1732,7 +1879,7 @@ impl App {
             button(card)
                 .on_press(Message::Open(c.lib.path.clone()))
                 .padding(0)
-                .style(style::ghost),
+                .style(self.ring(Message::Open(c.lib.path.clone()), style::ghost)),
         )
         .on_enter(Message::HoverEnter(c.lib.path.clone()))
         .on_exit(Message::HoverExit)
@@ -1741,24 +1888,33 @@ impl App {
 
     fn library(&self) -> Element<'_, Message> {
         let games = self.games_in_library();
+        let next_game = cycle(&games, &self.filter_game);
+        let sinces = [Since::All, Since::Today, Since::Week, Since::Month];
         let filters = row![
-            pick_list(games, Some(self.filter_game.clone()), Message::FilterGame).padding(13),
-            pick_list(
-                [Since::All, Since::Today, Since::Week, Since::Month],
-                Some(self.filter_since),
-                Message::FilterSince
-            )
-            .padding(13),
-            checkbox("Starred", self.filter_starred)
-                .on_toggle(Message::FilterStarred)
-                .size(20),
-            checkbox("Not used in a montage", self.filter_unused)
-                .on_toggle(Message::FilterUnused)
-                .size(20),
+            self.fbox(
+                pick_list(games, Some(self.filter_game.clone()), Message::FilterGame).padding(13),
+                Message::FilterGame(next_game)
+            ),
+            self.fbox(
+                pick_list(sinces, Some(self.filter_since), Message::FilterSince).padding(13),
+                Message::FilterSince(cycle(&sinces, &self.filter_since))
+            ),
+            self.fbox(
+                checkbox("Starred", self.filter_starred)
+                    .on_toggle(Message::FilterStarred)
+                    .size(20),
+                Message::FilterStarred(!self.filter_starred)
+            ),
+            self.fbox(
+                checkbox("Not used in a montage", self.filter_unused)
+                    .on_toggle(Message::FilterUnused)
+                    .size(20),
+                Message::FilterUnused(!self.filter_unused)
+            ),
             button(text("Rescan"))
                 .on_press(Message::Send(Command::Rescan))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring(Message::Send(Command::Rescan), style::secondary)),
         ]
         .spacing(14)
         .align_y(Alignment::Center)
@@ -1820,16 +1976,16 @@ impl App {
                         button(
                             text(if p.playing { "Pause" } else { "Play" }).font(style::INTER_SEMI)
                         )
-                        .on_press(on_play)
+                        .on_press(on_play.clone())
                         .padding([13, 18])
-                        .style(style::primary),
+                        .style(self.ring(on_play, style::primary)),
                         text(format!("{:.1} / {:.1} s", p.position, p.duration))
                             .color(style::MUTED),
                         horizontal_space(),
                         button(text("Open with sound"))
                             .on_press(Message::OpenFile(p.path.clone()))
                             .padding([13, 16])
-                            .style(style::secondary),
+                            .style(self.ring(Message::OpenFile(p.path.clone()), style::secondary)),
                     ]
                     .spacing(12)
                     .align_y(Alignment::Center),
@@ -1853,7 +2009,7 @@ impl App {
             button(text("Back to library"))
                 .on_press(Message::Back)
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring(Message::Back, style::secondary)),
             text(c.name()).size(22).font(style::GROTESK_BOLD),
             horizontal_space(),
             text(data::game_name(&c.lib.game)).color(style::MUTED),
@@ -1878,7 +2034,13 @@ impl App {
                     preset: preset.into(),
                 }))
                 .padding([13, 16])
-                .style(style::secondary)
+                .style(self.ring(
+                    Message::Send(Command::Export {
+                        clip: path.clone(),
+                        preset: preset.into(),
+                    }),
+                    style::secondary,
+                ))
         };
         let options: Vec<Named2> = self
             .montages
@@ -1908,32 +2070,48 @@ impl App {
             button(text("Regrade"))
                 .on_press(Message::Send(Command::Regrade { clip: path.clone() }))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring(
+                    Message::Send(Command::Regrade { clip: path.clone() }),
+                    style::secondary
+                )),
             button(text("Save trim"))
                 .on_press_maybe(trimmed.then_some(Message::Trim))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring_maybe(trimmed.then_some(Message::Trim), style::secondary)),
         ]
         .spacing(8)
         .wrap();
         let more = row![
-            pick_list(options, v.add_to.clone(), Message::AddTo)
-                .placeholder("Montage…")
-                .padding(13)
-                .width(220),
+            {
+                let next = v.add_to.as_ref().map_or_else(
+                    || options.first().cloned(),
+                    |cur| Some(cycle(&options, cur)),
+                );
+                let pick = pick_list(options, v.add_to.clone(), Message::AddTo)
+                    .placeholder("Montage…")
+                    .padding(13)
+                    .width(220);
+                match next {
+                    Some(n) => self.fbox(pick, Message::AddTo(n)),
+                    None => pick.into(),
+                }
+            },
             button(text("Add to montage"))
                 .on_press_maybe(v.add_to.as_ref().map(|_| Message::AddToMontage))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring_maybe(
+                    v.add_to.as_ref().map(|_| Message::AddToMontage),
+                    style::secondary
+                )),
             horizontal_space(),
             button(text("Show in folder"))
                 .on_press(Message::Reveal(path.clone()))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring(Message::Reveal(path.clone()), style::secondary)),
             button(text("Delete"))
                 .on_press(Message::Delete)
                 .padding([13, 16])
-                .style(style::danger),
+                .style(self.ring(Message::Delete, style::danger)),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -1971,34 +2149,49 @@ impl App {
             column![
                 text("New montage").size(18).font(style::GROTESK_BOLD),
                 row![
-                    text_input("Song file (mp3, wav, ogg, flac)…", &self.new_song)
-                        .on_input(Message::SongInput)
-                        .padding(13)
-                        .style(style::input),
+                    self.finput(
+                        "song",
+                        text_input("Song file (mp3, wav, ogg, flac)…", &self.new_song)
+                            .on_input(Message::SongInput)
+                            .padding(13)
+                            .style(style::input)
+                    ),
                     button(text("Browse…"))
                         .on_press(Message::BrowseSong)
                         .padding([13, 16])
-                        .style(style::secondary),
+                        .style(self.ring(Message::BrowseSong, style::secondary)),
                 ]
                 .spacing(8),
                 column![
-                    toggler(self.new_youtube)
-                        .label("YouTube 16:9")
-                        .on_toggle(Message::NewYoutube),
-                    toggler(self.new_starred)
-                        .label("Starred clips only")
-                        .on_toggle(Message::NewStarred),
+                    self.fbox(
+                        toggler(self.new_youtube)
+                            .label("YouTube 16:9")
+                            .on_toggle(Message::NewYoutube),
+                        Message::NewYoutube(!self.new_youtube)
+                    ),
+                    self.fbox(
+                        toggler(self.new_starred)
+                            .label("Starred clips only")
+                            .on_toggle(Message::NewStarred),
+                        Message::NewStarred(!self.new_starred)
+                    ),
                 ]
                 .spacing(8),
                 row![
-                    pick_list(games, Some(self.new_game.clone()), Message::NewGame)
-                        .padding(13)
-                        .width(Length::Fill),
-                    text_input("Length (s)", &self.new_length)
-                        .on_input(Message::NewLength)
-                        .padding(13)
-                        .width(110)
-                        .style(style::input),
+                    self.fbox(
+                        pick_list(games.clone(), Some(self.new_game.clone()), Message::NewGame)
+                            .padding(13)
+                            .width(Length::Fill),
+                        Message::NewGame(cycle(&games, &self.new_game))
+                    ),
+                    self.finput(
+                        "new-length",
+                        text_input("Length (s)", &self.new_length)
+                            .on_input(Message::NewLength)
+                            .padding(13)
+                            .width(110)
+                            .style(style::input)
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -2008,7 +2201,7 @@ impl App {
                 .on_press(Message::CreateMontage)
                 .padding([13, 18])
                 .width(Length::Fill)
-                .style(style::primary),
+                .style(self.ring(Message::CreateMontage, style::primary)),
             ]
             .spacing(10),
         )
@@ -2041,7 +2234,7 @@ impl App {
                 .on_press(Message::SelectMontage(i))
                 .padding([10, 12])
                 .width(Length::Fill)
-                .style(style::nav(sel)),
+                .style(self.ring(Message::SelectMontage(i), style::nav(sel))),
             );
         }
         if self.montages.is_empty() {
@@ -2157,28 +2350,40 @@ impl App {
                 .into()
         };
         let style_panel = row![
-            toggler(m.project.format == retake_core::montage::Format::Youtube)
-                .label("YouTube 16:9")
-                .on_toggle(Message::StyleYoutube),
-            text_input("Length s", &self.style_length)
-                .on_input(Message::StyleLength)
-                .padding(13)
-                .width(90)
-                .style(style::input),
-            text_input("BPM (auto)", &self.style_bpm)
-                .on_input(Message::StyleBpm)
-                .padding(13)
-                .width(100)
-                .style(style::input),
-            text_input("Song start s (auto)", &self.style_start)
-                .on_input(Message::StyleStart)
-                .padding(13)
-                .width(150)
-                .style(style::input),
+            self.fbox(
+                toggler(m.project.format == retake_core::montage::Format::Youtube)
+                    .label("YouTube 16:9")
+                    .on_toggle(Message::StyleYoutube),
+                Message::StyleYoutube(m.project.format != retake_core::montage::Format::Youtube)
+            ),
+            self.finput(
+                "style-length",
+                text_input("Length s", &self.style_length)
+                    .on_input(Message::StyleLength)
+                    .padding(13)
+                    .width(90)
+                    .style(style::input)
+            ),
+            self.finput(
+                "style-bpm",
+                text_input("BPM (auto)", &self.style_bpm)
+                    .on_input(Message::StyleBpm)
+                    .padding(13)
+                    .width(100)
+                    .style(style::input)
+            ),
+            self.finput(
+                "style-start",
+                text_input("Song start s (auto)", &self.style_start)
+                    .on_input(Message::StyleStart)
+                    .padding(13)
+                    .width(150)
+                    .style(style::input)
+            ),
             button(text("Apply"))
                 .on_press(Message::ApplyStyle)
                 .padding([13, 14])
-                .style(style::secondary),
+                .style(self.ring(Message::ApplyStyle, style::secondary)),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -2188,11 +2393,17 @@ impl App {
             button(text("Preview").font(style::INTER_SEMI))
                 .on_press_maybe((!busy).then_some(Message::RenderMontage(true)))
                 .padding([13, 18])
-                .style(style::secondary),
+                .style(self.ring_maybe(
+                    (!busy).then_some(Message::RenderMontage(true)),
+                    style::secondary
+                )),
             button(text("Render").font(style::INTER_SEMI))
                 .on_press_maybe((!busy).then_some(Message::RenderMontage(false)))
                 .padding([13, 18])
-                .style(style::primary),
+                .style(self.ring_maybe(
+                    (!busy).then_some(Message::RenderMontage(false)),
+                    style::primary
+                )),
             button(text("Resolve timeline"))
                 .on_press_maybe(
                     timeline_fcpxml
@@ -2200,11 +2411,21 @@ impl App {
                         .then(|| Message::Reveal(timeline_fcpxml.clone()))
                 )
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(
+                    self.ring_maybe(
+                        timeline_fcpxml
+                            .is_file()
+                            .then(|| Message::Reveal(timeline_fcpxml.clone())),
+                        style::secondary
+                    )
+                ),
             button(text("Remove clip"))
                 .on_press_maybe(e.selected.map(|_| Message::RemoveFromMontage))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring_maybe(
+                    e.selected.map(|_| Message::RemoveFromMontage),
+                    style::secondary
+                )),
             button(text("Play montage"))
                 .on_press_maybe(
                     m.dir
@@ -2213,11 +2434,19 @@ impl App {
                         .then(|| Message::OpenFile(m.dir.join("montage.mp4")))
                 )
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(
+                    self.ring_maybe(
+                        m.dir
+                            .join("montage.mp4")
+                            .is_file()
+                            .then(|| Message::OpenFile(m.dir.join("montage.mp4"))),
+                        style::secondary
+                    )
+                ),
             button(text("Open folder"))
                 .on_press(Message::OpenFile(m.dir.clone()))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring(Message::OpenFile(m.dir.clone()), style::secondary)),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -2241,7 +2470,7 @@ impl App {
                     button(text("Cancel"))
                         .on_press(Message::CancelRender)
                         .padding([13, 16])
-                        .style(style::danger),
+                        .style(self.ring(Message::CancelRender, style::danger)),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center)
@@ -2255,17 +2484,36 @@ impl App {
                           step: f32,
                           shown: String,
                           on: fn(f32) -> Message| {
-            row![
-                text(label).size(13).width(130),
-                iced::widget::slider(range, value, on)
-                    .step(step)
-                    .width(Length::Fill),
-                text(shown).size(13).color(style::MUTED).width(56),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center)
+            // Enter on a focused slider steps it up, wrapping at the end.
+            let next = if value + step > *range.end() + 1e-4 {
+                *range.start()
+            } else {
+                value + step
+            };
+            self.fbox(
+                row![
+                    text(label).size(13).width(130),
+                    iced::widget::slider(range, value, on)
+                        .step(step)
+                        .width(Length::Fill),
+                    text(shown).size(13).color(style::MUTED).width(56),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                on(next),
+            )
         };
         use retake_core::montage::{Interpolation as I, Transitions as T};
+        let transitions = [
+            TransitionChoice(T::Cuts),
+            TransitionChoice(T::MostlyCuts),
+            TransitionChoice(T::Flashy),
+        ];
+        let interps = [
+            InterpChoice(I::Auto),
+            InterpChoice(I::Always),
+            InterpChoice(I::Off),
+        ];
         let effects = container(
             column![
                 text("Style").size(15).font(style::GROTESK_BOLD),
@@ -2302,12 +2550,18 @@ impl App {
                     Message::StylePunch
                 ),
                 row![
-                    toggler(st.music_in_video)
-                        .label("Music in the video")
-                        .on_toggle(Message::StyleMusic),
-                    toggler(st.killfeed)
-                        .label("Kill feed at the top (vertical)")
-                        .on_toggle(Message::StyleKillfeed),
+                    self.fbox(
+                        toggler(st.music_in_video)
+                            .label("Music in the video")
+                            .on_toggle(Message::StyleMusic),
+                        Message::StyleMusic(!st.music_in_video)
+                    ),
+                    self.fbox(
+                        toggler(st.killfeed)
+                            .label("Kill feed at the top (vertical)")
+                            .on_toggle(Message::StyleKillfeed),
+                        Message::StyleKillfeed(!st.killfeed)
+                    ),
                 ]
                 .spacing(20)
                 .wrap(),
@@ -2323,26 +2577,20 @@ impl App {
                 .size(12)
                 .color(style::ACCENT),
                 row![
-                    pick_list(
-                        [
-                            TransitionChoice(T::Cuts),
-                            TransitionChoice(T::MostlyCuts),
-                            TransitionChoice(T::Flashy)
-                        ],
-                        Some(TransitionChoice(st.transitions)),
-                        Message::StyleTransitions
-                    )
-                    .padding(13),
-                    pick_list(
-                        [
-                            InterpChoice(I::Auto),
-                            InterpChoice(I::Always),
-                            InterpChoice(I::Off)
-                        ],
-                        Some(InterpChoice(st.interpolation)),
-                        Message::StyleInterpolation
-                    )
-                    .padding(13),
+                    self.fbox(
+                        pick_list(
+                            transitions,
+                            Some(TransitionChoice(st.transitions)),
+                            Message::StyleTransitions
+                        )
+                        .padding(13),
+                        Message::StyleTransitions(cycle(&transitions, &TransitionChoice(st.transitions)))
+                    ),
+                    self.fbox(
+                        pick_list(interps, Some(InterpChoice(st.interpolation)), Message::StyleInterpolation)
+                            .padding(13),
+                        Message::StyleInterpolation(cycle(&interps, &InterpChoice(st.interpolation)))
+                    ),
                 ]
                 .spacing(10)
                 .wrap(),
@@ -2400,11 +2648,14 @@ impl App {
             row![
                 self.h1("Settings"),
                 horizontal_space(),
-                text_input("Search settings", &st.query)
-                    .on_input(Message::SettingsQuery)
-                    .padding(13)
-                    .width(260)
-                    .style(style::input),
+                self.finput(
+                    "settings-search",
+                    text_input("Search settings", &st.query)
+                        .on_input(Message::SettingsQuery)
+                        .padding(13)
+                        .width(260)
+                        .style(style::input)
+                ),
             ]
             .align_y(Alignment::Center),
         ]
@@ -2439,24 +2690,30 @@ impl App {
             }
             let val = settings::value(&st.doc, &st.defaults, fl);
             let control: Element<'_, Message> = match fl.kind {
-                settings::Kind::Toggle => toggler(val == "true")
-                    .on_toggle(move |b| Message::SettingToggle(i, b))
-                    .into(),
+                settings::Kind::Toggle => self.fbox(
+                    toggler(val == "true").on_toggle(move |b| Message::SettingToggle(i, b)),
+                    Message::SettingToggle(i, val != "true"),
+                ),
                 settings::Kind::Choice(values) => {
                     let opts: Vec<String> = values
                         .iter()
                         .map(|v| v.trim_matches('"').to_owned())
                         .collect();
-                    pick_list(opts, Some(val), move |v| Message::SettingValue(i, v))
-                        .padding(13)
-                        .into()
+                    let next = cycle(&opts, &val);
+                    self.fbox(
+                        pick_list(opts, Some(val), move |v| Message::SettingValue(i, v))
+                            .padding(13),
+                        Message::SettingValue(i, next),
+                    )
                 }
-                settings::Kind::Number | settings::Kind::Text => text_input("", &val)
-                    .on_input(move |v| Message::SettingValue(i, v))
-                    .padding(13)
-                    .width(140)
-                    .style(style::input)
-                    .into(),
+                settings::Kind::Number | settings::Kind::Text => self.finput(
+                    &format!("setting-{i}"),
+                    text_input("", &val)
+                        .on_input(move |v| Message::SettingValue(i, v))
+                        .padding(13)
+                        .width(140)
+                        .style(style::input),
+                ),
             };
             panel = panel.push(
                 row![
@@ -2501,29 +2758,49 @@ impl App {
             container(
                 column![
                     text("Window").size(17).font(style::GROTESK_BOLD),
-                    toggler(self.prefs.reduce_motion)
-                        .label("Reduce motion (no hover previews)")
-                        .on_toggle(Message::ReduceMotion),
-                    toggler(self.status.as_ref().is_some_and(|s| s.autostart))
-                        .label("Start Retake with Windows")
-                        .on_toggle(|on| Message::Send(Command::Autostart { on })),
+                    self.fbox(
+                        toggler(self.prefs.reduce_motion)
+                            .label("Reduce motion (no hover previews)")
+                            .on_toggle(Message::ReduceMotion),
+                        Message::ReduceMotion(!self.prefs.reduce_motion)
+                    ),
+                    {
+                        let on = self.status.as_ref().is_some_and(|s| s.autostart);
+                        self.fbox(
+                            toggler(on)
+                                .label("Start Retake with Windows")
+                                .on_toggle(|on| Message::Send(Command::Autostart { on })),
+                            Message::Send(Command::Autostart { on: !on }),
+                        )
+                    },
                     row![
                         button(text("Copy diagnostics"))
                             .on_press(Message::Send(Command::CopyDiagnostics))
                             .padding([13, 16])
-                            .style(style::secondary),
+                            .style(
+                                self.ring(
+                                    Message::Send(Command::CopyDiagnostics),
+                                    style::secondary
+                                )
+                            ),
                         button(text("Open config file"))
                             .on_press(Message::OpenFile(self.args.config.clone()))
                             .padding([13, 16])
-                            .style(style::secondary),
+                            .style(self.ring(
+                                Message::OpenFile(self.args.config.clone()),
+                                style::secondary
+                            )),
                         button(text("Open logs"))
                             .on_press(Message::OpenFile(platform::app_data().join("logs")))
                             .padding([13, 16])
-                            .style(style::secondary),
+                            .style(self.ring(
+                                Message::OpenFile(platform::app_data().join("logs")),
+                                style::secondary
+                            )),
                         button(text("Lite window"))
                             .on_press(Message::Send(Command::OpenLite))
                             .padding([13, 16])
-                            .style(style::secondary),
+                            .style(self.ring(Message::Send(Command::OpenLite), style::secondary)),
                     ]
                     .spacing(8),
                 ]
@@ -2537,11 +2814,14 @@ impl App {
             button(text("Save").font(style::INTER_SEMI))
                 .on_press_maybe(st.dirty.then_some(Message::SaveSettings))
                 .padding([13, 20])
-                .style(style::primary),
+                .style(self.ring_maybe(st.dirty.then_some(Message::SaveSettings), style::primary)),
             button(text("Revert"))
                 .on_press_maybe(st.dirty.then_some(Message::RevertSettings))
                 .padding([13, 16])
-                .style(style::secondary),
+                .style(self.ring_maybe(
+                    st.dirty.then_some(Message::RevertSettings),
+                    style::secondary
+                )),
             text(if st.dirty { "Unsaved changes" } else { "" }).color(style::MUTED),
         ]
         .spacing(10)
@@ -2605,33 +2885,44 @@ impl App {
             .spacing(16)
             .align_y(Alignment::Center);
             if !manual {
+                let msg = Message::GameSwitch(id.clone(), "autoclip", !g.autoclip);
                 r = r.push(
-                    toggler(g.autoclip)
-                        .label("Auto-clip")
-                        .on_toggle(move |b| Message::GameSwitch(id_a.clone(), "autoclip", b)),
+                    self.fbox(
+                        toggler(g.autoclip)
+                            .label("Auto-clip")
+                            .on_toggle(move |b| Message::GameSwitch(id_a.clone(), "autoclip", b)),
+                        msg,
+                    ),
                 );
             }
+            let msg = Message::GameSwitch(id.clone(), "strict", !g.strict);
             r = r.push(
-                toggler(g.strict)
-                    .label("Strict")
-                    .on_toggle(move |b| Message::GameSwitch(id_b.clone(), "strict", b)),
+                self.fbox(
+                    toggler(g.strict)
+                        .label("Strict")
+                        .on_toggle(move |b| Message::GameSwitch(id_b.clone(), "strict", b)),
+                    msg,
+                ),
             );
             col = col.push(r);
         }
         col = col.push(
             row![
-                text_input(
-                    "Another game's exe, e.g. MyGame.exe",
-                    &self.settings.add_exe
-                )
-                .on_input(Message::AddExe)
-                .on_submit(Message::AddGame)
-                .padding(13)
-                .style(style::input),
+                self.finput(
+                    "add-exe",
+                    text_input(
+                        "Another game's exe, e.g. MyGame.exe",
+                        &self.settings.add_exe
+                    )
+                    .on_input(Message::AddExe)
+                    .on_submit(Message::AddGame)
+                    .padding(13)
+                    .style(style::input)
+                ),
                 button(text("Add game"))
                     .on_press(Message::AddGame)
                     .padding([13, 16])
-                    .style(style::secondary),
+                    .style(self.ring(Message::AddGame, style::secondary)),
             ]
             .spacing(8),
         );
@@ -2711,5 +3002,75 @@ fn on_player(p: &mut Player, e: player::Event) {
             p.playing = false;
             p.position = p.duration;
         }
+    }
+}
+
+/// The option after `cur` in `opts` (wrapping), for Enter on a focused picker.
+fn cycle<T: PartialEq + Clone>(opts: &[T], cur: &T) -> T {
+    let i = opts
+        .iter()
+        .position(|o| o == cur)
+        .map_or(0, |i| (i + 1) % opts.len().max(1));
+    opts.get(i).cloned().unwrap_or_else(|| cur.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(screen: &str) -> App {
+        let d = std::env::temp_dir().join("retake-ui-focus-test");
+        let _ = std::fs::create_dir_all(&d);
+        let (mut a, _) = App::new(Args {
+            config: d.join("config.toml"),
+            status: d.join("status.json"),
+            screen: Some(screen.into()),
+            open: None,
+            focus: None,
+        });
+        a.prefs.intro_seen = true;
+        a
+    }
+
+    fn press(a: &mut App, k: Named, shift: bool) {
+        let _ = a.view();
+        let m = if shift {
+            Modifiers::SHIFT
+        } else {
+            Modifiers::empty()
+        };
+        let _ = a.on_key(Key::Named(k), m);
+    }
+
+    /// Tab walks every control in order (sidebar first), Enter acts on the focused one.
+    #[test]
+    fn tab_and_enter_reach_and_use_every_control() {
+        let mut a = app("settings");
+        // Sidebar (4), the search field, then Strict safety's toggle.
+        for _ in 0..6 {
+            press(&mut a, Named::Tab, false);
+        }
+        assert_eq!(a.focus, Some(5));
+        assert!(!a.settings.dirty);
+        press(&mut a, Named::Enter, false);
+        assert!(a.settings.dirty, "Enter flipped Strict safety");
+        // Shift+Tab goes back to the search field; Enter there focuses the text field.
+        press(&mut a, Named::Tab, true);
+        let _ = a.view();
+        assert_eq!(
+            a.focusables.borrow()[4],
+            Message::FocusInput("settings-search".into())
+        );
+        // From the sidebar, Enter on the second item opens the Library.
+        let mut a = app("home");
+        press(&mut a, Named::Tab, false);
+        press(&mut a, Named::Tab, false);
+        press(&mut a, Named::Enter, false);
+        assert_eq!(a.screen, Screen::Library);
+        assert_eq!(a.focus, None, "a new screen starts unfocused");
+        // Escape drops the focus.
+        press(&mut a, Named::Tab, false);
+        press(&mut a, Named::Escape, false);
+        assert_eq!(a.focus, None);
     }
 }

@@ -126,7 +126,7 @@ pub fn split_strip(path: &Path) -> Option<Vec<iced::widget::image::Handle>> {
 }
 
 /// A montage project in `clips/montages`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Montage {
     pub dir: PathBuf,
     pub project: Project,
