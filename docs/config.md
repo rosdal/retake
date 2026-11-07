@@ -65,7 +65,7 @@ Every key is optional; anything left out takes the default shown. `config.toml` 
 | `vibrance` | number | 0.15 | 0–1 | Boosts muted colours more than saturated ones |
 | `sharpen` | number | 0.35 | 0–1 | CAS strength; 0 = off |
 | `hud_mask` | bool | true | | Ignore HUD areas when measuring |
-| `hud_protect` | bool | true | | Keep HUD colours closer to the original |
+| `hud_protect` | bool | false | | Blend half of the ungraded image back into the HUD areas; keeps UI colours but can leave a visible box over scenery |
 | `bit_depth` | int | 10 | 8 or 10 | HEVC Main10 or Main |
 
 ## [export]

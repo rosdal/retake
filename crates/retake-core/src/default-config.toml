@@ -99,7 +99,8 @@ contrast        = 1.12          # S-curve around mid-grey, 1.0–1.3
 vibrance        = 0.15          # boosts muted colours more than saturated ones
 sharpen         = 0.35          # CAS strength, 0 = off; above 0.4 HUD text looks harsh
 hud_mask        = true          # ignore HUD areas when measuring
-hud_protect     = true          # keep kill feed and UI colours true
+hud_protect     = false         # blend the ungraded image back into the HUD areas
+                                # (keeps UI colours, but can leave a visible box over scenery)
 bit_depth       = 10            # 10 = HEVC Main10, 8 = Main
 
 [export]

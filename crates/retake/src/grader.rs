@@ -16,8 +16,7 @@ use retake_core::grade::{
 };
 use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW};
 
-/// Analysis frames: 2 per second, 640 px wide.
-const ANALYSIS_FPS: u32 = 2;
+/// Analysis frames are keyframes, scaled to 640 px wide.
 const ANALYSIS_WIDTH: u32 = 640;
 /// Grid points of the per-clip LUT.
 const LUT_SIZE: usize = 33;
@@ -142,7 +141,7 @@ impl Grader {
         Cube::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", self.grade.look.display()))
     }
 
-    /// Luma percentiles and midtone cast of `clip`, from frames at 2 fps and 640 px wide.
+    /// Luma percentiles and midtone cast of `clip`, from its keyframes at 640 px wide.
     pub fn analyse(&self, clip: &Path, p: &Probe) -> Result<Stats> {
         let w = ANALYSIS_WIDTH;
         let h = ((u64::from(p.height) * u64::from(w) / u64::from(p.width.max(1))) as u32 / 2 * 2)
@@ -151,14 +150,20 @@ impl Grader {
             "-v".into(),
             "error".into(),
             "-nostdin".into(),
+            "-hwaccel".into(),
+            "d3d11va".into(),
+            // Keyframes only (one per 2 s segment in Retake's clips): enough for one
+            // constant grade per clip, without decoding every frame.
+            "-skip_frame".into(),
+            "nokey".into(),
             "-i".into(),
             clip.to_string_lossy().into_owned(),
             "-map".into(),
             "0:v:0".into(),
+            "-fps_mode".into(),
+            "passthrough".into(),
             "-vf".into(),
-            format!(
-                "fps={ANALYSIS_FPS},scale={w}:{h}:in_color_matrix=bt709:in_range=tv,format=rgb24"
-            ),
+            format!("scale={w}:{h}:in_color_matrix=bt709:in_range=tv,format=rgb24"),
             "-f".into(),
             "rawvideo".into(),
             "-".into(),
@@ -192,7 +197,8 @@ impl Grader {
         fs::create_dir_all(&tmp)?;
         let cube = tmp.join(format!("{stem}.cube"));
         fs::write(&cube, lut.write(&stem)).context("writing the clip LUT")?;
-        let work = tmp.join(format!("{stem}.grading.mkv"));
+        // Next to the clip, so publishing is a rename on the same drive (atomic).
+        let work = clip.with_file_name(format!("{stem}.grading.mkv"));
         let protect: &[_] = if self.grade.hud_protect {
             &SIEGE_HUD
         } else {

@@ -108,15 +108,24 @@ fn ensure_config(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// `retake.exe sync-check …`: a command-line tool, not the recorder. Prints to the console it
-/// was started from.
-fn sync_check_main(words: &[String]) -> ExitCode {
+/// For the command-line tools in this GUI-subsystem exe: print to the console they were
+/// started from, unless output is already redirected (to a file or pipe).
+fn attach_console() {
+    use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
     // SAFETY: plain Win32 calls; failure just means no console output.
     unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+        let redirected =
+            GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
+        if !redirected && AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
             let _ = AllocConsole();
         }
     }
+}
+
+/// `retake.exe sync-check …`: a command-line tool, not the recorder. Prints to the console it
+/// was started from.
+fn sync_check_main(words: &[String]) -> ExitCode {
+    attach_console();
     let run = || -> Result<bool> {
         let args = sync_check::parse(words)?;
         let exe = std::env::current_exe().context("finding Retake's own folder")?;
@@ -137,12 +146,7 @@ fn sync_check_main(words: &[String]) -> ExitCode {
 /// `retake.exe grade <clip>… [--export <preset>]…`: grades clips (and makes exports) right
 /// away with the settings in `config.toml`, without the recorder. Prints to the console.
 fn grade_main(words: &[String]) -> ExitCode {
-    // SAFETY: plain Win32 calls; failure just means no console output.
-    unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-            let _ = AllocConsole();
-        }
-    }
+    attach_console();
     let run = || -> Result<()> {
         let mut clips = Vec::new();
         let mut presets = Vec::new();
@@ -165,6 +169,7 @@ fn grade_main(words: &[String]) -> ExitCode {
         }
         let exe = std::env::current_exe().context("finding Retake''s own folder")?;
         let dir = exe.parent().unwrap_or(Path::new("."));
+        ensure_config(&dir.join("config.toml"))?;
         let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
         let config = config::load_file(&dir.join("config.toml"), &pick_root)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
