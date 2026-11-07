@@ -1,7 +1,8 @@
 //! Applying an edited `config.toml` without a manual restart. The file is checked every
-//! second; a valid change relaunches Retake when nothing is being recorded (during a match it
-//! waits for the match to end and says so), and an invalid one keeps the old settings running
-//! and says what's wrong.
+//! second. Hotkeys, the sound cue, pre/post roll and the auto-clip threshold apply at once;
+//! grading and export settings from the next job; anything else relaunches Retake when
+//! nothing is being recorded (during a match it waits for the match to end and says so). An
+//! invalid file keeps the old settings running and says what's wrong.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -16,7 +17,13 @@ fn modified(p: &Path) -> Option<SystemTime> {
 }
 
 /// Starts the watcher thread. `quit` asks the running Retake to shut down (on the tray thread).
-pub fn start(path: PathBuf, quit: impl Fn() + Send + 'static) {
+/// `apply` applies a live or job-level change in place and returns `false` if it can't (then
+/// Retake restarts after the match instead).
+pub fn start(
+    path: PathBuf,
+    quit: impl Fn() + Send + 'static,
+    apply: impl Fn(&config::Config, config::Reload) -> bool + Send + 'static,
+) {
     let spawn = std::thread::Builder::new()
         .name("config-watch".into())
         .spawn(move || {
@@ -35,10 +42,22 @@ pub fn start(path: PathBuf, quit: impl Fn() + Send + 'static) {
                         continue;
                     }
                     match config::load_str(&new) {
-                        Ok(_) => {
+                        Ok(c) => {
+                            let kind = config::reload_kind(&text, &new);
+                            tracing::info!(?kind, keys = ?config::changed_keys(&text, &new), "config.toml changed");
                             text = new;
-                            pending = true;
-                            tracing::info!("config.toml changed");
+                            match kind {
+                                config::Reload::Nothing => {}
+                                config::Reload::Live | config::Reload::Jobs if !pending => {
+                                    if apply(&c, kind) {
+                                        crate::status::event("Settings applied");
+                                        crate::notify::toast("Settings applied.");
+                                    } else {
+                                        pending = true;
+                                    }
+                                }
+                                _ => pending = true,
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
