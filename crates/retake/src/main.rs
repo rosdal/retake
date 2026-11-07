@@ -34,7 +34,7 @@ mod ui;
 mod window;
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
@@ -240,6 +240,18 @@ fn main() -> ExitCode {
     }
     if words.first().is_some_and(|w| w == "grade") {
         return grade_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "write-look") {
+        // The built-in look as a .cube file (for the release zip, or to edit in Resolve).
+        let out = words.get(1).map_or_else(|| PathBuf::from("siege.cube"), PathBuf::from);
+        let cube = retake_core::grade::builtin_look(33).write("Retake Siege look");
+        if let Some(dir) = out.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        return match std::fs::write(&out, cube) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
     }
     if words.first().is_some_and(|w| w == "scan-feed") {
         attach_console();

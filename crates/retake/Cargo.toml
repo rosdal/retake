@@ -23,3 +23,6 @@ workspace = true
 [dev-dependencies]
 object = { version = "0.40", default-features = false, features = ["read_core", "pe", "std"] }
 tempfile = "3.27.0"
+
+[build-dependencies]
+embed-resource = "3"
