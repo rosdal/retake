@@ -45,6 +45,15 @@ jobs:
           name: retake-exe
           path: target/release/retake.exe
 
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   r6-dissect:
     runs-on: windows-latest
     timeout-minutes: 15
