@@ -34,6 +34,9 @@ fn xml_escape(s: &str) -> String {
 
 /// The FCPXML document. `durations[i]` is the length in seconds of `placed`'s i-th distinct
 /// file (first-use order); the song starts at `song_start` and runs `length` seconds.
+/// `song_marks` are markers on the song (bars, the drop) at montage times; every kill gets a
+/// marker on its clip.
+#[allow(clippy::too_many_arguments)]
 pub fn timeline(
     name: &str,
     format: Format,
@@ -42,6 +45,7 @@ pub fn timeline(
     song: &Path,
     song_start: f64,
     length: f64,
+    song_marks: &[(f64, String)],
 ) -> String {
     let (w, h) = format.size();
     let mut x = String::new();
@@ -113,17 +117,38 @@ pub fn timeline(
                     t(frames(s.src1))
                 );
             }
-            if p.segs.first().is_some_and(|f| f == s) {
-                // The song rides on the first piece as a connected clip, on lane −1.
-                if o0 == 0 {
+            if p.segs.first().is_some_and(|f| f == s) && o0 == 0 {
+                // The song rides on the first piece as a connected clip, on lane −1, with
+                // its bar and drop markers (in the song's own time).
+                let _ = writeln!(
+                    x,
+                    r#"          <asset-clip ref="a{song_id}" lane="-1" offset="{}" start="{}" duration="{}" name="Song">"#,
+                    t(src0),
+                    t(frames(song_start)),
+                    t(frames(length))
+                );
+                for (at, label) in song_marks.iter().filter(|(a, _)| *a >= 0.0 && *a <= length) {
                     let _ = writeln!(
                         x,
-                        r#"          <asset-clip ref="a{song_id}" lane="-1" offset="{}" start="{}" duration="{}" name="Song"/>"#,
-                        t(src0),
-                        t(frames(song_start)),
-                        t(frames(length))
+                        r#"            <marker start="{}" duration="1/{FPS}s" value="{}"/>"#,
+                        t(frames(song_start + at)),
+                        xml_escape(label)
                     );
                 }
+                let _ = writeln!(x, "          </asset-clip>");
+            }
+            // Kills in this piece, at their source time (a kill on a cut belongs to the piece
+            // it starts).
+            let last = p.segs.last().is_some_and(|l| l == s);
+            for &(src, out) in p.kills.iter().filter(|(_, out)| {
+                *out >= s.out0 - 1e-9 && (*out < s.out1 - 1e-9 || last && *out <= s.out1 + 1e-9)
+            }) {
+                let _ = writeln!(
+                    x,
+                    r#"          <marker start="{}" duration="1/{FPS}s" value="Kill at {:.2} s"/>"#,
+                    t(frames(src)),
+                    out
+                );
             }
             let _ = writeln!(x, "        </asset-clip>");
         }
@@ -170,6 +195,11 @@ mod tests {
             Path::new(r"D:\s\song.mp3"),
             30.0,
             2.0,
+            &[
+                (0.0, "Bar 1".into()),
+                (1.0, "Drop".into()),
+                (9.0, "outside".into()),
+            ],
         );
         assert!(x.contains(r#"<fcpxml version="1.9">"#));
         assert!(x.contains(r#"width="1080" height="1920""#));
@@ -180,5 +210,15 @@ mod tests {
         assert_eq!(x.matches("<timeMap>").count(), 1);
         assert!(x.contains(r#"value="681/60s""#));
         assert!(x.contains(r#"name="Song""#) && x.contains(r#"start="1800/60s""#));
+        // Markers: the song's bar and drop (not one outside the montage), and the kill.
+        assert!(x.contains(r#"<marker start="1860/60s" duration="1/60s" value="Drop"/>"#));
+        assert!(!x.contains("outside"));
+        assert_eq!(x.matches("value=\"Kill at").count(), 1, "{x}");
+        assert!(x.contains(r#"<marker start="660/60s""#));
+        // Well-formed enough: every opened asset-clip closes.
+        assert_eq!(
+            x.matches("<asset-clip").count(),
+            x.matches("</asset-clip>").count()
+        );
     }
 }

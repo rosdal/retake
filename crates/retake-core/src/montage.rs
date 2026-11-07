@@ -186,6 +186,11 @@ pub struct Style {
     pub punch: f64,
     pub transitions: Transitions,
     pub interpolation: Interpolation,
+    /// Mix the song into the video. Off: cut to the song but export game audio only, to add
+    /// the same sound inside TikTok.
+    pub music_in_video: bool,
+    /// Vertical montages show the kill feed near the top ("Centre + kill feed").
+    pub killfeed: bool,
 }
 
 impl Default for Style {
@@ -197,6 +202,8 @@ impl Default for Style {
             punch: 0.07,
             transitions: Transitions::MostlyCuts,
             interpolation: Interpolation::Auto,
+            music_in_video: true,
+            killfeed: true,
         }
     }
 }

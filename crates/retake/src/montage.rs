@@ -297,8 +297,16 @@ pub fn render(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    // Bars and the drop as markers on the song.
+    let mut marks: Vec<(f64, String)> = a
+        .bars
+        .iter()
+        .enumerate()
+        .filter_map(|(n, &b)| Some((a.beats.get(b)? - start, format!("Bar {}", n + 1))))
+        .collect();
+    marks.push((a.drop_time() - start, "Drop".into()));
     let xml = retake_core::fcpxml::timeline(
-        &name, p.format, &placed, &durations, &p.song, start, p.length,
+        &name, p.format, &placed, &durations, &p.song, start, p.length, &marks,
     );
     std::fs::write(dir.join("timeline.fcpxml"), xml)?;
     if !preview && let Some(lib) = lib {

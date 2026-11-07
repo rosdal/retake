@@ -42,6 +42,8 @@ const WHIP: f64 = 0.12;
 const WHIP_ZOOM: f64 = 0.35;
 /// How long a flash cut lasts.
 const FLASH: f64 = 0.07;
+/// Fade at both ends of every game-audio piece, so cuts don't click.
+const XFADE: f64 = 0.008;
 
 /// Facts about a source clip.
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +124,11 @@ pub fn render_args(
                 .filter(|(a, b)| *b > 0.0 && *a < dur)
                 .map(|(a, b)| format!("between(t,{a:.3},{b:.3})"))
                 .collect();
-            let feed = o.killfeed && o.format == Format::Tiktok && !o.preview && !shows.is_empty();
+            let feed = o.killfeed
+                && style.killfeed
+                && o.format == Format::Tiktok
+                && !o.preview
+                && !shows.is_empty();
             let mut chain = format!(
                 "[{i}:v:0]trim=start={:.4}:end={:.4},setpts=(PTS-STARTPTS)/{v:.5}",
                 s.src0, s.src1
@@ -241,8 +247,10 @@ pub fn render_args(
                 };
                 let _ = write!(
                     g,
-                    "[{i}:a:0]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS,atempo={v:.5}{lift},apad,atrim=duration={dur:.4}[a{n}];",
-                    s.src0, s.src1
+                    "[{i}:a:0]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS,atempo={v:.5}{lift},apad,atrim=duration={dur:.4},afade=t=in:d={XFADE},afade=t=out:st={:.4}:d={XFADE}[a{n}];",
+                    s.src0,
+                    s.src1,
+                    (dur - XFADE).max(0.0)
                 );
             } else {
                 let _ = write!(g, "aevalsrc=0:d={dur:.4}:s=48000:c=stereo[a{n}];");
@@ -262,17 +270,28 @@ pub fn render_args(
         vout = "[vlook]".into();
     }
     let _ = write!(g, "{vout}format=yuv420p[vout];");
+    // Under the song the game sits at `game_db`; without the song it is the soundtrack.
+    let game_db = if style.music_in_video { o.game_db } else { 0.0 };
     let _ = write!(
         g,
-        "{}concat=n={n}:v=0:a=1,volume={:.1}dB[game];",
-        alabels.join(""),
-        o.game_db
+        "{}concat=n={n}:v=0:a=1,volume={game_db:.1}dB[game];",
+        alabels.join("")
     );
-    let _ = write!(
-        g,
-        "[{song_idx}:a:0]aresample=48000,afade=t=in:d=0.3,afade=t=out:st={:.3}:d=0.8[song];[song][game]amix=inputs=2:normalize=0:duration=first[aout]",
-        (length - 0.8).max(0.0)
-    );
+    // Loudness to about -14 LUFS (what TikTok and YouTube play at), back at 48 kHz.
+    let finish = if o.preview {
+        String::new()
+    } else {
+        ",loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000".to_owned()
+    };
+    if style.music_in_video {
+        let _ = write!(
+            g,
+            "[{song_idx}:a:0]aresample=48000,afade=t=in:d=0.3,afade=t=out:st={:.3}:d=0.8[song];[song][game]amix=inputs=2:normalize=0:duration=first{finish}[aout]",
+            (length - 0.8).max(0.0)
+        );
+    } else {
+        let _ = write!(g, "[game]anull{finish}[aout]");
+    }
     a.extend([
         "-filter_complex".into(),
         g,
@@ -283,8 +302,8 @@ pub fn render_args(
     ]);
     let enc = match o.encoder {
         Encoder::Amf => [
-            "-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_peak", "-b:v", "16M",
-            "-maxrate", "24M",
+            "-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_peak", "-b:v", "25M",
+            "-maxrate", "35M",
         ],
         Encoder::Nvenc => [
             "-c:v",
@@ -294,9 +313,9 @@ pub fn render_args(
             "-rc",
             "vbr",
             "-b:v",
-            "16M",
+            "25M",
             "-maxrate",
-            "24M",
+            "35M",
         ],
         Encoder::Qsv => [
             "-c:v",
@@ -304,19 +323,19 @@ pub fn render_args(
             "-preset",
             "medium",
             "-b:v",
-            "16M",
+            "25M",
             "-maxrate",
-            "24M",
+            "35M",
             "-look_ahead",
             "0",
         ],
         Encoder::X264 => [
-            "-c:v", "libx264", "-preset", "medium", "-b:v", "16M", "-maxrate", "24M", "-bufsize",
-            "32M",
+            "-c:v", "libx264", "-preset", "medium", "-b:v", "25M", "-maxrate", "35M", "-bufsize",
+            "50M",
         ],
     };
     a.extend(enc.map(String::from));
-    a.extend(["-c:a", "aac", "-b:a", "256k", "-r"].map(String::from));
+    a.extend(["-c:a", "aac", "-b:a", "320k", "-r"].map(String::from));
     a.push(FPS.to_string());
     a.extend([
         "-t".into(),
@@ -474,6 +493,53 @@ mod tests {
             def.contains("minterpolate"),
             "60 fps sources slowed down are interpolated"
         );
+    }
+
+    #[test]
+    fn audio_has_no_clicks_hits_minus_14_lufs_and_can_leave_the_song_out() {
+        let mut o = opts(false);
+        let g = graph(&render_args(
+            &placed(),
+            &sources(240.0),
+            Path::new("s.mp3"),
+            0.0,
+            25.0,
+            &o,
+            Path::new("o.mp4"),
+        ))
+        .to_owned();
+        assert!(g.contains("afade=t=in:d=0.008"), "{g}");
+        assert!(g.contains("loudnorm=I=-14") && g.contains("amix=inputs=2"));
+        assert!(g.contains("volume=-10.0dB[game]"));
+        o.style.music_in_video = false;
+        let a = render_args(
+            &placed(),
+            &sources(240.0),
+            Path::new("s.mp3"),
+            0.0,
+            25.0,
+            &o,
+            Path::new("o.mp4"),
+        );
+        let g = graph(&a);
+        assert!(!g.contains("amix") && g.contains("[game]anull,loudnorm"));
+        assert!(
+            g.contains("volume=0.0dB[game]"),
+            "the game is the soundtrack"
+        );
+        assert!(a.windows(2).any(|w| w == ["-b:a", "320k"]));
+        o.style.killfeed = false;
+        let g = graph(&render_args(
+            &placed(),
+            &sources(240.0),
+            Path::new("s.mp3"),
+            0.0,
+            25.0,
+            &o,
+            Path::new("o.mp4"),
+        ))
+        .to_owned();
+        assert!(!g.contains("overlay="), "Centre layout: no kill feed");
     }
 
     #[test]

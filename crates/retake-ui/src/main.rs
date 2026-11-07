@@ -209,6 +209,8 @@ struct ClipView {
 }
 
 struct Editor {
+    /// Where in the song the montage starts, seconds.
+    song_start: f64,
     /// The whole song's peaks (the montage's part is cut from these for drawing).
     song_peaks: Vec<f32>,
     peaks: Vec<f32>,
@@ -314,6 +316,8 @@ enum Message {
     StylePunch(f32),
     StyleTransitions(TransitionChoice),
     StyleInterpolation(InterpChoice),
+    StyleMusic(bool),
+    StyleKillfeed(bool),
     CancelRender,
     RemoveFromMontage,
     SettingsQuery(String),
@@ -523,6 +527,7 @@ impl App {
         let selected = self.editor.as_ref().and_then(|e| e.selected);
         let Some(mut a) = m.analysis() else {
             self.editor = Some(Editor {
+                song_start: m.project.song_start.unwrap_or(0.0),
                 song_peaks: peaks_all.unwrap_or_default(),
                 peaks: Vec::new(),
                 beats: Vec::new(),
@@ -582,6 +587,7 @@ impl App {
             })
             .unwrap_or_default();
         self.editor = Some(Editor {
+            song_start: start,
             song_peaks,
             peaks,
             beats,
@@ -1119,6 +1125,8 @@ impl App {
             Message::StylePunch(v) => self.style_edit(|s| s.punch = f64::from(v)),
             Message::StyleTransitions(c) => self.style_edit(|s| s.transitions = c.0),
             Message::StyleInterpolation(c) => self.style_edit(|s| s.interpolation = c.0),
+            Message::StyleMusic(b) => self.style_edit(|s| s.music_in_video = b),
+            Message::StyleKillfeed(b) => self.style_edit(|s| s.killfeed = b),
             Message::CancelRender => {
                 self.send(Command::MontageCancel);
                 Task::none()
@@ -2197,6 +2205,15 @@ impl App {
                 .on_press_maybe(e.selected.map(|_| Message::RemoveFromMontage))
                 .padding([13, 16])
                 .style(style::secondary),
+            button(text("Play montage"))
+                .on_press_maybe(
+                    m.dir
+                        .join("montage.mp4")
+                        .is_file()
+                        .then(|| Message::OpenFile(m.dir.join("montage.mp4")))
+                )
+                .padding([13, 16])
+                .style(style::secondary),
             button(text("Open folder"))
                 .on_press(Message::OpenFile(m.dir.clone()))
                 .padding([13, 16])
@@ -2284,6 +2301,27 @@ impl App {
                     format!("{:.0} %", st.punch * 100.0),
                     Message::StylePunch
                 ),
+                row![
+                    toggler(st.music_in_video)
+                        .label("Music in the video")
+                        .on_toggle(Message::StyleMusic),
+                    toggler(st.killfeed)
+                        .label("Kill feed at the top (vertical)")
+                        .on_toggle(Message::StyleKillfeed),
+                ]
+                .spacing(20)
+                .wrap(),
+                text(if st.music_in_video {
+                    String::new()
+                } else {
+                    format!(
+                        "Exported with game audio only. In TikTok, add the same sound starting at {}:{:02}.",
+                        (e.song_start / 60.0) as u32,
+                        (e.song_start % 60.0).round() as u32
+                    )
+                })
+                .size(12)
+                .color(style::ACCENT),
                 row![
                     pick_list(
                         [
