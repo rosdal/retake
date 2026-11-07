@@ -19,12 +19,17 @@ use windows::Win32::System::Threading::{
 
 use crate::pipe::OutPipe;
 
-/// Packets may arrive this late after their capture time and still land in place (100 ms).
-const HOLD_FRAMES: u64 = 4_800;
+/// Packets may arrive this late after their capture time and still land in place (60 ms).
+/// Audio has its own ffmpeg, so this delay never holds the video back.
+const HOLD_FRAMES: u64 = 2_880;
 /// A write ffmpeg doesn't take within this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long ffmpeg gets to open a pipe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The AAC encoder's delay (one 1024-sample frame of priming): audio is placed this much
+/// earlier, so after encoding each sound sits at its capture time. Measured with the avsync
+/// stand-in: without it clips showed sound ~21 ms later than the raw capture times.
+const AAC_DELAY_FRAMES: i64 = 1_024;
 /// Ticks (10 ms) between checks that the capture still runs on the right device (2 s).
 const RECHECK_TICKS: u32 = 200;
 
@@ -99,7 +104,7 @@ impl SourceWatch {
         let on_data = move |at: i64, frames: &[i16]| {
             tl.lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(frames_at(at - origin), frames);
+                .push(frames_at(at - origin) - AAC_DELAY_FRAMES, frames);
         };
         match Capture::start(source.clone(), on_data) {
             Ok(c) => {
@@ -134,6 +139,8 @@ pub struct Track {
     pub source: Option<Source>,
     /// Mic noise gate threshold in dBFS; 0 = off.
     pub gate_db: f32,
+    /// Moves this track's audio earlier by this many ms (the game's own audio latency).
+    pub delay_ms: u32,
 }
 
 /// The running track threads. Dropping it stops them and closes the pipes.
@@ -218,7 +225,9 @@ fn run(t: Track, origin_us: i64, stop: &AtomicBool, warning: &AtomicBool) {
         return;
     }
     let timeline = Arc::new(Mutex::new(Timeline::new(HOLD_FRAMES)));
-    let mut source = SourceWatch::new(t.name, t.source.clone(), timeline.clone(), origin_us);
+    // Earlier placement = a later origin for this track.
+    let track_origin = origin_us + i64::from(t.delay_ms) * 1_000;
+    let mut source = SourceWatch::new(t.name, t.source.clone(), timeline.clone(), track_origin);
     source.check(warning);
     let timer = match tick_timer() {
         Ok(timer) => timer,

@@ -40,6 +40,10 @@ game          = true
 # "process": only the game's own sound (Windows 10 2004 or later; older Windows
 # falls back to "device"). "device": everything your speakers play.
 game_source   = "process"
+# The game's own audio latency in ms (0–500), removed from the game and comms
+# tracks so sounds line up with the picture. 0 keeps each sound where Windows
+# mixed it; `retake.exe sync-check <clip>` suggests a value.
+game_delay_ms = 0
 # Microphone (track 2).
 mic           = true
 mic_device    = "default"

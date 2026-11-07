@@ -134,10 +134,90 @@ fn sync_check_main(words: &[String]) -> ExitCode {
     }
 }
 
+/// `retake.exe grade <clip>… [--export <preset>]…`: grades clips (and makes exports) right
+/// away with the settings in `config.toml`, without the recorder. Prints to the console.
+fn grade_main(words: &[String]) -> ExitCode {
+    // SAFETY: plain Win32 calls; failure just means no console output.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            let _ = AllocConsole();
+        }
+    }
+    let run = || -> Result<()> {
+        let mut clips = Vec::new();
+        let mut presets = Vec::new();
+        let mut it = words.iter();
+        while let Some(w) = it.next() {
+            if w == "--export" {
+                let p = it.next().context("--export needs a preset")?;
+                presets.push(
+                    retake_core::export::Preset::parse(p)
+                        .with_context(|| format!("unknown preset {p}"))?,
+                );
+            } else {
+                clips.push(std::path::PathBuf::from(w));
+            }
+        }
+        if clips.is_empty() {
+            anyhow::bail!(
+                "usage: retake grade <clip>... [--export edit|edit-smooth|share|vertical]..."
+            );
+        }
+        let exe = std::env::current_exe().context("finding Retake''s own folder")?;
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+        let config = config::load_file(&dir.join("config.toml"), &pick_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (vendor, _) = display::adapter()?;
+        let encoder =
+            pick_encoder(config.capture.encoder, vendor).map_err(|e| anyhow::anyhow!(e))?;
+        let g = grader::Grader {
+            ffmpeg: ffmpeg::locate(dir)?,
+            encoder,
+            grade: config.grade.clone(),
+            blur: config.motion_blur.clone(),
+            out_dir: config.clips.out_dir.clone(),
+        };
+        for clip in &clips {
+            let t = std::time::Instant::now();
+            if config.grade.mode == retake_core::config::GradeMode::On {
+                let out = g.grade(clip)?;
+                println!(
+                    "graded {} -> {} in {:.1} s",
+                    clip.display(),
+                    out.display(),
+                    t.elapsed().as_secs_f32()
+                );
+            }
+            for &p in &presets {
+                let t = std::time::Instant::now();
+                let out = g.export(clip, p)?;
+                println!(
+                    "exported {} -> {} in {:.1} s",
+                    p.name(),
+                    out.display(),
+                    t.elapsed().as_secs_f32()
+                );
+            }
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("grade: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let words: Vec<String> = std::env::args().skip(1).collect();
     if words.first().is_some_and(|w| w == "sync-check") {
         return sync_check_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "grade") {
+        return grade_main(&words[1..]);
     }
     let args = parse_args();
     if args.console {

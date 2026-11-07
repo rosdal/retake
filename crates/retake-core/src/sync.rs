@@ -19,23 +19,20 @@ pub fn rising_edges(samples: &[(f64, f64)], high: f64, low: f64) -> Vec<f64> {
 }
 
 /// Times (from `start`, in seconds) of the first sample louder than `loud` after at least
-/// `quiet_secs` of samples no louder than `loud / 3`.
+/// `quiet_secs` of samples that are not. (A sound's own rising edge stays below `loud` for a
+/// few samples; that must not count against the quiet before it.)
 pub fn onsets(samples: &[i16], rate: u32, start: f64, loud: i16, quiet_secs: f64) -> Vec<f64> {
     let need = (quiet_secs * f64::from(rate)) as usize;
-    let soft = loud.unsigned_abs() / 3;
     let mut out = Vec::new();
     let mut quiet = need; // the very start counts as quiet
     for (i, &s) in samples.iter().enumerate() {
-        let a = s.unsigned_abs();
-        if a > loud.unsigned_abs() {
+        if s.unsigned_abs() > loud.unsigned_abs() {
             if quiet >= need {
                 out.push(start + i as f64 / f64::from(rate));
             }
             quiet = 0;
-        } else if a <= soft {
-            quiet += 1;
         } else {
-            quiet = 0;
+            quiet += 1;
         }
     }
     out
@@ -118,6 +115,18 @@ mod tests {
         assert_eq!(o.len(), 2, "{o:?}");
         assert!((o[0] - 1.1).abs() < 1e-9);
         assert!((o[1] - (1.0 + 30_000.0 / 48_000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rising_edge_does_not_hide_the_onset() {
+        let mut s = vec![0i16; 48_000];
+        // A 1 kHz burst: its first samples are quiet-ish, then loud.
+        for (i, v) in s[24_000..24_480].iter_mut().enumerate() {
+            *v = (12_000.0 * (i as f32 * 2.0 * std::f32::consts::PI / 48.0).sin()) as i16;
+        }
+        let o = onsets(&s, 48_000, 0.0, 3_000, 0.3);
+        assert_eq!(o.len(), 1);
+        assert!((o[0] - 0.5).abs() < 0.001, "{o:?}");
     }
 
     #[test]

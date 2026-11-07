@@ -93,6 +93,9 @@ pub struct Audio {
     pub game: bool,
     /// Where the game track comes from.
     pub game_source: GameSource,
+    /// The game's own audio latency in ms, removed from the game and comms tracks (0–500).
+    /// `retake sync-check` suggests a value.
+    pub game_delay_ms: u32,
     pub mic: bool,
     pub mic_device: String,
     pub mic_gate_db: f32,
@@ -316,6 +319,12 @@ pub fn validate(c: &Config) -> Vec<String> {
         errs.push(format!(
             "clips.hotkey_full = {}: must differ from clips.hotkey",
             clips.hotkey_full
+        ));
+    }
+    if c.audio.game_delay_ms > 500 {
+        errs.push(format!(
+            "audio.game_delay_ms = {}: must be 0–500",
+            c.audio.game_delay_ms
         ));
     }
     if clips.max_raw_gb.is_nan() || clips.max_raw_gb < 0.0 {

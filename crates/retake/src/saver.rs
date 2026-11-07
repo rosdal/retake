@@ -13,7 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use retake_core::Ms;
 use retake_core::clip::{
-    ClipJob, Kind, Press, Scheduler, clip_name, concat_args, concat_list, numbered,
+    ClipJob, Kind, Press, Scheduler, clip_name, concat_list, numbered, parse_concat_list,
+    ts_join_args, ts_mux_args,
 };
 use retake_core::ffmpeg_args::INDEX_FILE;
 use retake_core::segments::{SEGMENT_MS, Segment, parse_index, select, still_intact, writing_file};
@@ -38,6 +39,9 @@ pub struct Session {
     /// slot it was writing may hold part of a newer segment while `index.csv` still lists the
     /// older one. Only meaningful once `live` is false.
     pub torn: bool,
+    /// The audio ring (`buffer_dir/audio`) when this run records audio. Its index counts from
+    /// the same `start`.
+    pub audio_dir: Option<PathBuf>,
 }
 
 /// Written by the recorder, read by the saver. `None` while no run's segments are usable.
@@ -150,6 +154,7 @@ pub fn save(
     slot: &SessionSlot,
     dirs: &ClipDirs,
     concat: &dyn Fn(&Path, &Path) -> Result<()>,
+    mux: &dyn Fn(&Path, &Path, &Path) -> Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf> {
     let s = current(slot).context("not recording; no clip saved")?;
@@ -226,7 +231,18 @@ pub fn save(
         "{}.part",
         out.file_name().expect("has a name").to_string_lossy()
     ));
-    if let Err(e) = concat(&list, &part) {
+    let joined = match &s.audio_dir {
+        None => concat(&list, &part),
+        Some(adir) => match audio_for(&s, adir, &keep, &work.0) {
+            Ok(Some(alist)) => mux(&list, &alist, &part),
+            Ok(None) => {
+                tracing::warn!("no audio covers this clip; saved without sound");
+                concat(&list, &part)
+            }
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(e) = joined {
         let _ = fs::remove_file(&part);
         return Err(e);
     }
@@ -241,9 +257,73 @@ pub fn save(
     Ok(out)
 }
 
+/// Copies the audio segments overlapping the clip's video segments `keep` and lists them.
+/// Returns the list, or `None` if no intact audio covers the clip.
+fn audio_for(s: &Session, adir: &Path, keep: &[Segment], work: &Path) -> Result<Option<PathBuf>> {
+    let (Some(first), Some(last)) = (keep.first(), keep.last()) else {
+        return Ok(None);
+    };
+    let listed = read_index(adir, s.start);
+    let writing = if s.live || s.torn {
+        writing_file(&listed, s.wrap)
+    } else {
+        None
+    };
+    let picked: Vec<Segment> = listed
+        .iter()
+        .filter(|a| a.end > first.start && a.start < last.end)
+        .filter(|a| writing.as_deref() != Some(a.file.as_str()))
+        .cloned()
+        .collect();
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    for (i, seg) in picked.iter().enumerate() {
+        let name = format!("a{i:03}.ts");
+        copy_shared(&adir.join(&seg.file), &work.join(&name))
+            .with_context(|| format!("copying audio {}", seg.file))?;
+        names.push(name);
+    }
+    if s.live && still_intact(&picked, &read_index(adir, s.start), s.wrap).contains(&false) {
+        tracing::warn!("audio segments were overwritten while copying");
+        return Ok(None);
+    }
+    let list = work.join("audio.txt");
+    fs::write(&list, concat_list(&names)).context("writing audio concat list")?;
+    Ok(Some(list))
+}
+
+/// The files a list from [`concat_list`] names, resolved against the list's folder.
+fn listed_files(list: &Path) -> Result<Vec<PathBuf>> {
+    let dir = list.parent().unwrap_or(Path::new("."));
+    let text = fs::read_to_string(list).with_context(|| format!("reading {}", list.display()))?;
+    Ok(parse_concat_list(&text)
+        .into_iter()
+        .map(|f| dir.join(f))
+        .collect())
+}
+
+/// Runs the mux ffmpeg (video + audio lists, stream copy) at below-normal priority and waits.
+pub fn run_mux(
+    ffmpeg: &Path,
+    job: &ChildJob,
+    video: &Path,
+    audio: &Path,
+    out: &Path,
+) -> Result<()> {
+    let args = ts_mux_args(&listed_files(video)?, &listed_files(audio)?, out);
+    let mut child = job.spawn_logged_low(ffmpeg, &args)?;
+    let status = child.wait().context("waiting for mux ffmpeg")?;
+    if !status.success() {
+        bail!("mux ffmpeg exited with {status}");
+    }
+    Ok(())
+}
+
 /// Runs the concat ffmpeg at below-normal priority and waits for it.
 pub fn run_concat(ffmpeg: &Path, job: &ChildJob, list: &Path, out: &Path) -> Result<()> {
-    let mut child = job.spawn_logged_low(ffmpeg, &concat_args(list, out))?;
+    let mut child = job.spawn_logged_low(ffmpeg, &ts_join_args(&listed_files(list)?, out))?;
     let status = child.wait().context("waiting for concat ffmpeg")?;
     if !status.success() {
         bail!("concat ffmpeg exited with {status}");
@@ -332,6 +412,7 @@ fn take_messages(rx: &Receiver<SaverMsg>, timeout: Duration) -> (Vec<Press>, boo
 fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
     let mut sched = Scheduler::new(s.pre_roll, s.post_roll, s.buffer_secs);
     let concat = |list: &Path, out: &Path| run_concat(&s.ffmpeg, &s.job, list, out);
+    let mux = |v: &Path, a: &Path, out: &Path| run_mux(&s.ffmpeg, &s.job, v, a, out);
     loop {
         let (presses, shutdown) = take_messages(&rx, Duration::from_millis(100));
         if shutdown || stop.load(Ordering::Relaxed) {
@@ -348,7 +429,7 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
             }
             wait_for_segments(&s.session, job.to, stop);
             let cancelled = || stop.load(Ordering::Relaxed);
-            match save(&job, &s.session, &s.dirs, &concat, &cancelled) {
+            match save(&job, &s.session, &s.dirs, &concat, &mux, &cancelled) {
                 Ok(path) => (s.on_saved)(&path),
                 Err(e) => {
                     tracing::warn!(id = job.id, "clip not saved: {e:#}");
@@ -370,8 +451,9 @@ fn wait_for_segments(slot: &SessionSlot, to: Ms, stop: &AtomicBool) {
         if stop.load(Ordering::Relaxed) || !s.live {
             return;
         }
-        let segs = read_index(&s.buffer_dir, s.start);
-        if segs.last().is_some_and(|x| x.end >= to) || now_ms() >= give_up {
+        let covered = |dir: &Path| read_index(dir, s.start).last().is_some_and(|x| x.end >= to);
+        let audio_ok = s.audio_dir.as_deref().is_none_or(covered);
+        if (covered(&s.buffer_dir) && audio_ok) || now_ms() >= give_up {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -418,6 +500,7 @@ mod tests {
             wrap: 30,
             live: true,
             torn: false,
+            audio_dir: None,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -452,11 +535,24 @@ mod tests {
         false
     }
 
+    /// Mux stand-in for runs without audio; never called there.
+    fn no_mux(_: &Path, _: &Path, _: &Path) -> Result<()> {
+        panic!("mux called without audio")
+    }
+
     #[test]
     fn stopped_run_keeps_its_oldest_segment() {
         let (_t, slot, dirs) = setup();
         slot.lock().unwrap().as_mut().unwrap().live = false;
-        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
+        let out = save(
+            &job_at(Kind::Full, 59, 0, 62),
+            &slot,
+            &dirs,
+            &cat,
+            &no_mux,
+            &never,
+        )
+        .unwrap();
         let text = fs::read_to_string(&out).unwrap();
         assert!(
             text.starts_with("[0][2]") && text.ends_with("[58]"),
@@ -473,7 +569,15 @@ mod tests {
             s.live = false;
             s.torn = true;
         }
-        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
+        let out = save(
+            &job_at(Kind::Full, 59, 0, 62),
+            &slot,
+            &dirs,
+            &cat,
+            &no_mux,
+            &never,
+        )
+        .unwrap();
         let text = fs::read_to_string(&out).unwrap();
         assert!(
             text.starts_with("[2][4]") && text.ends_with("[58]"),
@@ -489,6 +593,7 @@ mod tests {
             &slot,
             &dirs,
             &cat,
+            &no_mux,
             &|| true,
         )
         .unwrap_err()
@@ -506,6 +611,7 @@ mod tests {
             &slot,
             &dirs,
             &cat,
+            &no_mux,
             &never,
         )
         .unwrap();
@@ -521,7 +627,15 @@ mod tests {
     #[test]
     fn full_save_skips_the_segment_being_written() {
         let (_t, slot, dirs) = setup();
-        let out = save(&job_at(Kind::Full, 59, 0, 62), &slot, &dirs, &cat, &never).unwrap();
+        let out = save(
+            &job_at(Kind::Full, 59, 0, 62),
+            &slot,
+            &dirs,
+            &cat,
+            &no_mux,
+            &never,
+        )
+        .unwrap();
         assert!(out.ends_with("2026-11-06_201533_full.mkv"));
         let text = fs::read_to_string(&out).unwrap();
         assert!(
@@ -539,6 +653,7 @@ mod tests {
             &slot,
             &dirs,
             &cat,
+            &no_mux,
             &never,
         )
         .unwrap();
@@ -557,6 +672,7 @@ mod tests {
             &slot,
             &dirs,
             &fail,
+            &no_mux,
             &never,
         )
         .unwrap_err();
@@ -569,7 +685,7 @@ mod tests {
     fn no_session_or_no_video_is_an_error() {
         let (_t, slot, dirs) = setup();
         let late = job_at(Kind::Normal, 500, 485, 503);
-        let e = save(&late, &slot, &dirs, &cat, &never)
+        let e = save(&late, &slot, &dirs, &cat, &no_mux, &never)
             .unwrap_err()
             .to_string();
         assert!(e.contains("no buffered video"), "{e}");
@@ -579,6 +695,7 @@ mod tests {
             &slot,
             &dirs,
             &cat,
+            &no_mux,
             &never,
         )
         .unwrap_err()
@@ -688,6 +805,7 @@ mod tests {
             wrap: 30,
             live: true,
             torn: false,
+            audio_dir: None,
         })));
         let dirs = ClipDirs::new(&t.path().join("clips"));
         dirs.prepare().unwrap();
@@ -718,6 +836,7 @@ mod tests {
             &slot,
             &dirs,
             &concat,
+            &no_mux,
             &never,
         )
         .unwrap();
@@ -729,6 +848,7 @@ mod tests {
             &slot,
             &dirs,
             &concat,
+            &no_mux,
             &never,
         )
         .unwrap();

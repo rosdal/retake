@@ -146,5 +146,12 @@ pub fn run(ffmpeg: &Path, args: &Args) -> Result<SyncReport> {
         r.worst_ms,
         if passes(&r) { "PASS" } else { "FAIL" }
     );
+    if r.median_ms > 8.0 && args.track == 0 {
+        println!(
+            "Sound comes {:.0} ms after the picture. If this clip was made with audio.game_delay_ms = 0, \
+             that is the game's own audio latency: add {:.0} to audio.game_delay_ms to remove it.",
+            r.median_ms, r.median_ms
+        );
+    }
     Ok(r)
 }

@@ -1,7 +1,7 @@
 //! Hotkey presses turned into clip jobs: the window each clip covers, merging presses that land
 //! in a pending clip's post-roll, and the file name and ffmpeg command for writing one. Pure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Ms;
 
@@ -143,6 +143,79 @@ pub fn concat_list(files: &[String]) -> String {
 
 /// Joins the listed segments without re-encoding into Matroska at `out`. The format is given
 /// explicitly because `out` ends in `.part`.
+/// The file names in a list written by [`concat_list`], in order.
+pub fn parse_concat_list(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("file '")?.strip_suffix('\''))
+        .map(|f| f.replace("'\\''", "'"))
+        .collect()
+}
+
+fn concat_url(files: &[PathBuf]) -> String {
+    let parts: Vec<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    format!("concat:{}", parts.join("|"))
+}
+
+/// Joins MPEG-TS segments byte for byte (the `concat:` protocol, which suits TS) into
+/// Matroska, stream copy, timestamps starting at 0.
+pub fn ts_join_args(files: &[PathBuf], out: &Path) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-y",
+        "-i",
+    ]
+    .map(String::from)
+    .to_vec();
+    a.push(concat_url(files));
+    a.extend(["-map", "0", "-c", "copy", "-f", "matroska"].map(String::from));
+    a.push(out.to_string_lossy().into_owned());
+    a
+}
+
+/// Joins video segments with audio segments from the separate audio ring. Both rings keep
+/// timestamps counted from the same origin, so `-copyts` lines them up exactly; one common
+/// shift then moves the earliest packet to 0.
+pub fn ts_mux_args(video: &[PathBuf], audio: &[PathBuf], out: &Path) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-y",
+        "-copyts",
+        "-i",
+    ]
+    .map(String::from)
+    .to_vec();
+    a.push(concat_url(video));
+    a.push("-i".into());
+    a.push(concat_url(audio));
+    a.extend(
+        [
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            "-output_ts_offset",
+            "-100000",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-f",
+            "matroska",
+        ]
+        .map(String::from),
+    );
+    a.push(out.to_string_lossy().into_owned());
+    a
+}
 pub fn concat_args(list: &Path, out: &Path) -> Vec<String> {
     let mut a: Vec<String> = [
         "-hide_banner",
@@ -306,5 +379,36 @@ mod tests {
                 r"C:\c\a.mkv.part",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod mux_tests {
+    use super::*;
+
+    #[test]
+    fn list_round_trips_and_join_uses_the_concat_protocol() {
+        let names = vec!["000.ts".to_string(), "it's.ts".to_string()];
+        assert_eq!(parse_concat_list(&concat_list(&names)), names);
+        let a = ts_join_args(
+            &[PathBuf::from(r"D:\w\000.ts"), PathBuf::from(r"D:\w\001.ts")],
+            Path::new("o.mkv"),
+        );
+        assert!(a.contains(&r"concat:D:\w\000.ts|D:\w\001.ts".to_string()));
+    }
+
+    #[test]
+    fn mux_keeps_both_timelines() {
+        let a = ts_mux_args(
+            &[PathBuf::from("v.ts")],
+            &[PathBuf::from("a.ts")],
+            Path::new("o.mkv"),
+        );
+        assert!(a.contains(&"-copyts".to_string()));
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["-avoid_negative_ts", "make_zero"])
+        );
+        assert!(a.windows(4).any(|w| w == ["-map", "0:v", "-map", "1:a"]));
     }
 }

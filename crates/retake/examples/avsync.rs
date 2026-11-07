@@ -35,6 +35,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+fn unix_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
+}
+
 static WHITE: AtomicBool = AtomicBool::new(false);
 static mut WINDOW: HWND = HWND(std::ptr::null_mut());
 
@@ -127,6 +133,15 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
         let ev = CreateEventW(None, false, false, None)?;
         client.SetEventHandle(ev)?;
         let render: IAudioRenderClient = client.GetService()?;
+        let (mut def, mut min) = (0i64, 0i64);
+        let _ = client.GetDevicePeriod(Some(&mut def), Some(&mut min));
+        eprintln!(
+            "render: stream latency {:.1} ms, device period {:.1} ms (min {:.1}), buffer {} frames",
+            client.GetStreamLatency().unwrap_or(0) as f64 / 10_000.0,
+            def as f64 / 10_000.0,
+            min as f64 / 10_000.0,
+            client.GetBufferSize().unwrap_or(0)
+        );
         let size = client.GetBufferSize()?;
         client.Start()?;
         let start = Instant::now();
@@ -150,7 +165,9 @@ fn audio(stop: Arc<AtomicBool>, quiet: (u64, u64)) -> windows::core::Result<()> 
                 click_left = 480; // 10 ms
                 phase = 0.0;
                 WHITE.store(true, Ordering::Relaxed);
+                let before = unix_us();
                 repaint();
+                eprintln!("click {before} painted {} padding {pad}", unix_us());
                 white_until = Some(Instant::now() + Duration::from_millis(100));
             }
             if white_until.is_some_and(|t| Instant::now() >= t) {

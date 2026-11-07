@@ -14,7 +14,9 @@ use retake_core::buffer::clear_dir;
 use retake_core::config::{Audio, Capture, GameSource};
 use retake_core::disk::{DiskEvent, DiskGuard};
 use retake_core::display::OutputInfo;
-use retake_core::ffmpeg_args::{AudioInput, CaptureSetup, capture_args, segment_count};
+use retake_core::ffmpeg_args::{
+    AUDIO_DIR, AudioInput, CaptureSetup, audio_capture_args, capture_args, segment_count,
+};
 use retake_core::progress::{SpeedEvent, SpeedMonitor, Stats};
 use retake_core::watcher::{Command, Phase, TrayStatus, Watcher, game_running, tray_status};
 
@@ -122,7 +124,8 @@ struct Loop {
     watcher: Watcher,
     speed: SpeedMonitor,
     ffmpeg: Option<Ffmpeg>,
-    /// Feeds the running ffmpeg's audio inputs.
+    /// The audio recorder (its own ffmpeg, see `audio_capture_args`) and the pump feeding it.
+    audio_ffmpeg: Option<Ffmpeg>,
     pump: Option<Pump>,
     /// The game process the game track captures, to notice a restarted game.
     audio_pid: Option<u32>,
@@ -150,6 +153,7 @@ impl Loop {
             watcher: Watcher::new(),
             speed: SpeedMonitor::new(),
             ffmpeg: None,
+            audio_ffmpeg: None,
             pump: None,
             audio_pid: None,
             disk: DiskGuard::new(),
@@ -224,7 +228,16 @@ impl Loop {
             if let Some(status) = self.ffmpeg.as_mut().and_then(Ffmpeg::exited) {
                 tracing::warn!(%status, "ffmpeg exited unexpectedly");
                 self.ffmpeg = None;
-                self.pump = None;
+                self.stop_ffmpeg();
+                self.speed.reset();
+                let cmd = self.watcher.on_ffmpeg_exit(now);
+                self.apply(cmd, now);
+            }
+            if let Some(status) = self.audio_ffmpeg.as_mut().and_then(Ffmpeg::exited) {
+                // The run restarts as a whole, so video and audio keep one origin.
+                tracing::warn!(%status, "audio ffmpeg exited unexpectedly; restarting the recording");
+                self.audio_ffmpeg = None;
+                self.stop_ffmpeg();
                 self.speed.reset();
                 let cmd = self.watcher.on_ffmpeg_exit(now);
                 self.apply(cmd, now);
@@ -366,6 +379,9 @@ impl Loop {
     /// stopped cleanly.
     fn stop_ffmpeg(&mut self) -> bool {
         let clean = self.ffmpeg.take().is_some_and(|f| f.stop(GRACE));
+        if let Some(a) = self.audio_ffmpeg.take() {
+            a.stop(GRACE);
+        }
         self.pump = None;
         clean
     }
@@ -392,7 +408,7 @@ impl Loop {
     /// recording stopped.
     fn audio_tracks(&mut self, run: u64) -> Vec<Track> {
         let a = &self.s.audio;
-        let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32)> = Vec::new();
+        let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32, u32)> = Vec::new();
         self.audio_pid = None;
         if a.game {
             let source = match (a.game_source, self.game_pids.first()) {
@@ -408,7 +424,7 @@ impl Loop {
                 }
                 _ => retake_audio::Source::DeviceLoopback,
             };
-            want.push(("game", Some(source), 0.0));
+            want.push(("game", Some(source), 0.0, a.game_delay_ms));
         }
         if a.mic {
             want.push((
@@ -417,6 +433,7 @@ impl Loop {
                     name: a.mic_device.clone(),
                 }),
                 a.mic_gate_db,
+                0,
             ));
         }
         if a.comms {
@@ -430,6 +447,7 @@ impl Loop {
                     "comms",
                     Some(retake_audio::Source::ProcessLoopback { pid }),
                     0.0,
+                    a.game_delay_ms,
                 )),
                 None => tracing::info!(
                     "audio.comms is on but Discord isn't running; no comms track this run"
@@ -437,13 +455,14 @@ impl Loop {
             }
         }
         let mut tracks = Vec::new();
-        for (name, source, gate_db) in want {
+        for (name, source, gate_db, delay_ms) in want {
             match OutPipe::create(&pipe_name(name, run)) {
                 Ok(pipe) => tracks.push(Track {
                     name,
                     pipe,
                     source,
                     gate_db,
+                    delay_ms,
                 }),
                 Err(e) => tracing::error!("{e:#}; recording without the {name} track"),
             }
@@ -546,12 +565,9 @@ impl Loop {
         match Ffmpeg::spawn(&self.s.job, &self.s.ffmpeg, &args, priority, on_stats) {
             Ok(f) => {
                 tracing::info!(pid = f.pid(), ?priority, "ffmpeg recording");
-                if !tracks.is_empty() {
-                    match Pump::start(tracks, origin_us) {
-                        Ok(p) => self.pump = Some(p),
-                        Err(e) => tracing::error!("starting the audio pump: {e:#}"),
-                    }
-                }
+                let audio_dir = (!tracks.is_empty())
+                    .then(|| self.start_audio(tracks, origin_us))
+                    .flatten();
                 *self.s.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
                     run: self.run,
                     start,
@@ -559,6 +575,7 @@ impl Loop {
                     wrap: segment_count(self.s.capture.buffer_secs),
                     live: true,
                     torn: false,
+                    audio_dir,
                 });
                 self.ffmpeg = Some(f);
                 None
@@ -568,6 +585,40 @@ impl Loop {
                 self.watcher.on_ffmpeg_exit(now)
             }
         }
+    }
+
+    /// Starts the audio recorder and its pump for this run. Returns the audio ring folder, or
+    /// `None` (recording goes on without sound) if it couldn't start.
+    fn start_audio(&mut self, tracks: Vec<Track>, origin_us: i64) -> Option<std::path::PathBuf> {
+        let setup = self.current.clone()?;
+        let dir = setup.buffer_dir.join(AUDIO_DIR);
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| clear_dir(&dir).map(|_| ())) {
+            tracing::error!("preparing {}: {e}; recording without sound", dir.display());
+            return None;
+        }
+        let args = audio_capture_args(&setup);
+        tracing::info!(args = %args.join(" "), "audio ffmpeg command");
+        match Ffmpeg::spawn(
+            &self.s.job,
+            &self.s.ffmpeg,
+            &args,
+            self.s.capture.priority,
+            |_| {},
+        ) {
+            Ok(a) => {
+                tracing::info!(pid = a.pid(), "audio ffmpeg recording");
+                self.audio_ffmpeg = Some(a);
+            }
+            Err(e) => {
+                tracing::error!("starting the audio ffmpeg: {e:#}; recording without sound");
+                return None;
+            }
+        }
+        match Pump::start(tracks, origin_us) {
+            Ok(p) => self.pump = Some(p),
+            Err(e) => tracing::error!("starting the audio pump: {e:#}"),
+        }
+        Some(dir)
     }
 
     fn log_summary(&self) {

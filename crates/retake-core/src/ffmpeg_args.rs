@@ -178,13 +178,9 @@ pub fn segment_args(c: &CaptureSetup) -> Vec<String> {
         "-segment_list_size".into(),
         n,
     ]);
-    a.extend(strs(&[
-        "-segment_format",
-        "mpegts",
-        "-reset_timestamps",
-        "1",
-        "-segment_list",
-    ]));
+    // Timestamps stay continuous across segments (no -reset_timestamps): the video and audio
+    // rings count from the same origin, and the saver lines them up by timestamp.
+    a.extend(strs(&["-segment_format", "mpegts", "-segment_list"]));
     a.extend([index, "-segment_list_type".into(), "csv".into(), pattern]);
     a
 }
@@ -209,25 +205,39 @@ pub fn audio_input_args(c: &CaptureSetup) -> Vec<String> {
     a
 }
 
-/// Maps the video and each audio track, encodes audio as AAC and titles the tracks. Empty
-/// without audio: ffmpeg then maps the filter graph's only output by itself.
-///
-/// With audio the video keeps its wall-clock timestamps (`passthrough`): re-gridding them to
-/// a constant frame rate drifted the picture by about 100 ms over 20 s against the audio.
+/// Maps the video with its wall-clock timestamps kept (`passthrough`) when there is audio to
+/// line up with: re-gridding to a constant frame rate drifted the picture by about 100 ms over
+/// 20 s. Empty without audio: ffmpeg then maps the filter graph's only output by itself.
 pub fn map_args(c: &CaptureSetup) -> Vec<String> {
     if c.audio.is_empty() {
         return Vec::new();
     }
     // A 90 kHz encoder time base (the MPEG-TS clock): with the default 1/fps, two frames
     // stamped within one frame period would collide.
-    let mut a = strs(&[
+    strs(&[
         "-map",
         "[v]",
         "-fps_mode:v",
         "passthrough",
         "-enc_time_base:v",
         "1/90000",
-    ]);
+    ])
+}
+
+/// The audio ring buffer folder inside `buffer_dir`.
+pub const AUDIO_DIR: &str = "audio";
+
+/// The audio recorder's command line: every pipe encoded as an AAC track (titled Game, Mic,
+/// Comms) into its own ring of 2 s segments in `buffer_dir/audio`, with timestamps counted
+/// from the run's origin like the video's.
+///
+/// Audio runs in its own ffmpeg because one ffmpeg keeps all its outputs within 100 ms of each
+/// other: audio, which arrives a few tens of ms late by nature, made it pause the video, and
+/// ddagrab then captured 70–140 fps instead of 240. The saver joins the two by timestamp.
+pub fn audio_capture_args(c: &CaptureSetup) -> Vec<String> {
+    // "error": the segment muxer warns "frame size not set" for AAC on every segment.
+    let mut a = strs(&["-hide_banner", "-loglevel", "error", "-nostats"]);
+    a.extend(audio_input_args(c));
     for k in 0..c.audio.len() {
         a.extend(["-map".into(), format!("{k}:a")]);
     }
@@ -235,6 +245,11 @@ pub fn map_args(c: &CaptureSetup) -> Vec<String> {
     for (k, t) in c.audio.iter().enumerate() {
         a.extend([format!("-metadata:s:a:{k}"), format!("title={}", t.title)]);
     }
+    let in_audio = CaptureSetup {
+        buffer_dir: c.buffer_dir.join(AUDIO_DIR),
+        ..c.clone()
+    };
+    a.extend(segment_args(&in_audio));
     a
 }
 
@@ -249,7 +264,6 @@ pub fn capture_args(c: &CaptureSetup) -> Vec<String> {
         "1",
     ]);
     a.extend(input_args(c));
-    a.extend(audio_input_args(c));
     a.extend(map_args(c));
     a.extend(encoder_args(c));
     a.extend(segment_args(c));
@@ -292,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn game_and_mic_tracks() {
+    fn video_with_audio_keeps_wall_clock_timestamps() {
         let a = capture_args(&with_audio(2));
         let v = a.iter().position(|s| s == "-c:v").unwrap();
         assert_eq!(
@@ -303,6 +317,32 @@ mod tests {
                 "-filter_complex",
                 "ddagrab=output_idx=0:framerate=120:draw_mouse=0,\
                  setpts=(RTCTIME-1700000000000000)/(TB*1000000)[v]",
+                "-map",
+                "[v]",
+                "-fps_mode:v",
+                "passthrough",
+                "-enc_time_base:v",
+                "1/90000",
+            ]
+        );
+        // No audio in the video recorder; everything from the encoder on is unchanged.
+        assert!(!a.iter().any(|s| s.contains("pipe")));
+        let plain = capture_args(&amf());
+        let pv = plain.iter().position(|s| s == "-c:v").unwrap();
+        assert_eq!(a[v..], plain[pv..]);
+    }
+
+    #[test]
+    fn audio_recorder_writes_its_own_ring() {
+        let a = audio_capture_args(&with_audio(2));
+        let seg = a.iter().position(|s| s == "-f").unwrap();
+        assert_eq!(
+            a[..seg + 16],
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostats",
                 "-f",
                 "s16le",
                 "-ar",
@@ -319,39 +359,18 @@ mod tests {
                 "48000",
                 "-ch_layout",
                 "stereo",
-                "-thread_queue_size",
-                "1024",
-                "-i",
-                r"\\.\pipe\retake_1",
-                "-map",
-                "[v]",
-                "-fps_mode:v",
-                "passthrough",
-                "-enc_time_base:v",
-                "1/90000",
-                "-map",
-                "0:a",
-                "-map",
-                "1:a",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "256k",
-                "-metadata:s:a:0",
-                "title=Game",
-                "-metadata:s:a:1",
-                "title=Mic",
             ]
         );
-        // Everything from the video encoder on is the same as without audio.
-        let plain = capture_args(&amf());
-        let pv = plain.iter().position(|s| s == "-c:v").unwrap();
-        assert_eq!(a[v..], plain[pv..]);
+        assert!(a.windows(2).any(|w| w == ["-map", "1:a"]));
+        assert!(a.windows(2).any(|w| w == ["-metadata:s:a:1", "title=Mic"]));
+        assert!(a.windows(2).any(|w| w == ["-b:a", "256k"]));
+        assert!(a.contains(&r"C:\buf\audio\index.csv".to_string()));
+        assert_eq!(a.last().unwrap(), r"C:\buf\audio\seg_%02d.ts");
     }
 
     #[test]
     fn comms_is_a_third_track() {
-        let a = capture_args(&with_audio(3));
+        let a = audio_capture_args(&with_audio(3));
         assert!(a.windows(2).any(|w| w == ["-map", "2:a"]));
         assert!(
             a.windows(2)
@@ -359,7 +378,6 @@ mod tests {
         );
         assert_eq!(a.iter().filter(|s| *s == "-i").count(), 3);
     }
-
     #[test]
     fn qsv_with_audio_labels_after_hwmap() {
         let c = CaptureSetup {
@@ -414,8 +432,6 @@ mod tests {
                 "30",
                 "-segment_format",
                 "mpegts",
-                "-reset_timestamps",
-                "1",
                 "-segment_list",
                 r"C:\buf\index.csv",
                 "-segment_list_type",

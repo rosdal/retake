@@ -189,6 +189,7 @@ struct Stream {
     capture: IAudioCaptureClient,
     event: EventHandle,
     description: String,
+    loopback: bool,
 }
 
 fn open(source: &Source) -> Result<Stream> {
@@ -238,6 +239,7 @@ fn open(source: &Source) -> Result<Stream> {
         capture,
         event,
         description: format!("{name}, 48 kHz 16-bit stereo"),
+        loopback,
     })
 }
 
@@ -281,8 +283,12 @@ fn pump(s: &Stream, mut on_data: OnData, stop: &AtomicBool) -> Result<()> {
             }
             // SAFETY: releasing exactly what GetBuffer gave us.
             unsafe { s.capture.ReleaseBuffer(frames) }.context("ReleaseBuffer")?;
-            // Process loopback may not stamp packets; then the packet ends about now.
-            let at = if qpc == 0 {
+            // Loopback packets are stamped with when they will be played (after the output
+            // device's latency), but the picture is captured when it is composed, before it is
+            // shown. Placing loopback audio at its mix time, when the packet arrives here,
+            // lines it up with the picture the way the game made them. A microphone's stamp
+            // is its real capture time, so it is used as is.
+            let at = if s.loopback || qpc == 0 {
                 qpc_to_unix_us(qpc_100ns()) - i64::from(frames) * 1_000_000 / i64::from(RATE)
             } else {
                 qpc_to_unix_us(qpc)
