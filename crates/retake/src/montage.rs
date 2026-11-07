@@ -151,9 +151,11 @@ pub fn render(
     }
     save(dir, &p)?;
     let mut sources: Vec<(PathBuf, Source)> = Vec::new();
+    let mut durations: Vec<(PathBuf, f64)> = Vec::new();
     for x in &placed {
         if !sources.iter().any(|(f, _)| *f == x.file) {
             let pr = probe(ffmpeg, &x.file)?;
+            durations.push((x.file.clone(), pr.duration));
             sources.push((
                 x.file.clone(),
                 Source {
@@ -179,7 +181,7 @@ pub fn render(
         encoder,
         look: Some(look),
         game_db: -10.0,
-        killfeed: None,
+        killfeed: true,
     };
     let args = render_args(&placed, &sources, &p.song, start, p.length, &opts, &out);
     let o = job().run_output(ffmpeg, &args)?;
@@ -195,6 +197,16 @@ pub fn render(
                 .join(" / ")
         );
     }
+    // A Resolve timeline of the same arrangement, for polishing by hand.
+    let name = dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let xml = retake_core::fcpxml::timeline(
+        &name, p.format, &placed, &durations, &p.song, start, p.length,
+    );
+    std::fs::write(dir.join("timeline.fcpxml"), xml)?;
     if !preview && let Some(lib) = lib {
         let used: Vec<PathBuf> = placed.iter().map(|x| x.file.clone()).collect();
         let _ = lib.mark_used(&used);

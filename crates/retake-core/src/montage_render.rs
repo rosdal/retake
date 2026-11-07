@@ -4,6 +4,9 @@
 //! shake and a screen pump, the frame is cropped for the format, the punchy look applied, and
 //! the song mixed with the game audio. Pure: the arguments are pinned by tests.
 
+/// Seconds the kill-feed overlay stays up after a kill.
+const FEED_HOLD: f64 = 2.5;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -23,8 +26,9 @@ pub struct RenderOpts {
     pub look: Option<PathBuf>,
     /// Game audio level under the song, dB (e.g. −10).
     pub game_db: f64,
-    /// Kill-feed overlay for vertical montages (v1.4): crop `(w, h, x, y)` of the source.
-    pub killfeed: Option<(u32, u32, u32, u32)>,
+    /// Vertical montages: show the source's kill feed (which the 9:16 crop cuts off) near
+    /// the top of the frame.
+    pub killfeed: bool,
 }
 
 /// Facts about a source clip.
@@ -90,10 +94,30 @@ pub fn render_args(
         for s in &x.segs {
             let v = s.speed();
             let dur = s.out1 - s.out0;
+            // The feed region is see-through when empty, so it shows only while a kill's row
+            // is up: from just before each kill to 2.5 s after (piece-local times).
+            let shows: Vec<String> = x
+                .kills
+                .iter()
+                .map(|(_, at)| (at - s.out0 - 0.15, at - s.out0 + FEED_HOLD))
+                .filter(|(a, b)| *b > 0.0 && *a < dur)
+                .map(|(a, b)| format!("between(t,{a:.3},{b:.3})"))
+                .collect();
+            let feed = o.killfeed && o.format == Format::Tiktok && !o.preview && !shows.is_empty();
             let mut chain = format!(
                 "[{i}:v:0]trim=start={:.4}:end={:.4},setpts=(PTS-STARTPTS)/{v:.5}",
                 s.src0, s.src1
             );
+            if feed {
+                // Keep a copy of the full frame for the kill-feed overlay.
+                let (fw, fh, fx, fy) = crate::autoclip::feed_crop(src.width, src.height);
+                let ow = (w as f64 * 0.8) as u32 / 2 * 2;
+                let _ = write!(
+                    g,
+                    "[{i}:v:0]trim=start={:.4}:end={:.4},setpts=(PTS-STARTPTS)/{v:.5},fps={FPS},crop={fw}:{fh}:{fx}:{fy},scale={ow}:-2,format=rgba,colorchannelmixer=aa=0.92[kf{n}];",
+                    s.src0, s.src1
+                );
+            }
             // Crop to the format's aspect first: everything after works on fewer pixels.
             if o.format == Format::Tiktok {
                 chain.push_str(",crop=ih*9/16:ih");
@@ -127,6 +151,13 @@ pub fn render_args(
                     );
                 }
             }
+            if feed {
+                let _ = write!(
+                    chain,
+                    ",setsar=1[base{n}];[base{n}][kf{n}]overlay=x=(W-w)/2:y=H*0.10:shortest=1:enable='{}'",
+                    shows.join("+")
+                );
+            }
             // The pump's rescale can leave a non-square pixel aspect; concat needs them equal.
             let _ = write!(
                 chain,
@@ -136,9 +167,24 @@ pub fn render_args(
             vlabels.push(format!("[v{n}]"));
             // Game audio: retimed where the speed is listenable (0.5–2×), silent otherwise.
             if src.has_audio && (0.5..=MAX_SPEED).contains(&v) {
+                // The shot itself comes up through the song: +8 dB around each kill.
+                let lifts: Vec<String> = x
+                    .kills
+                    .iter()
+                    .filter(|(_, at)| *at >= s.out0 - 1e-9 && *at <= s.out1 + 1e-9)
+                    .map(|(_, at)| {
+                        let t = at - s.out0;
+                        format!("between(t,{:.3},{:.3})", t - 0.12, t + 0.5)
+                    })
+                    .collect();
+                let lift = if lifts.is_empty() || o.preview {
+                    String::new()
+                } else {
+                    format!(",volume='if({},2.5,1)':eval=frame", lifts.join("+"))
+                };
                 let _ = write!(
                     g,
-                    "[{i}:a:0]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS,atempo={v:.5},apad,atrim=duration={dur:.4}[a{n}];",
+                    "[{i}:a:0]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS,atempo={v:.5}{lift},apad,atrim=duration={dur:.4}[a{n}];",
                     s.src0, s.src1
                 );
             } else {
@@ -284,7 +330,7 @@ mod tests {
             encoder: Encoder::Amf,
             look: Some(PathBuf::from(r"D:\c\look.cube")),
             game_db: -10.0,
-            killfeed: None,
+            killfeed: true,
         }
     }
 
@@ -320,6 +366,23 @@ mod tests {
         assert!(g.contains("aevalsrc=0:d=0.4688"));
         assert!(g.contains("atempo=0.64000"));
         assert!(a.windows(2).any(|w| w == ["-ss", "30.000"]));
+    }
+
+    #[test]
+    fn vertical_montages_overlay_the_kill_feed_and_lift_kills() {
+        let a = render_args(
+            &placed(),
+            &sources(240.0),
+            Path::new("s.mp3"),
+            0.0,
+            25.0,
+            &opts(false),
+            Path::new("o.mp4"),
+        );
+        let g = graph(&a);
+        assert!(g.contains("crop=664:374:1896:316"), "{g}");
+        assert!(g.contains("overlay=x=(W-w)/2:y=H*0.10:shortest=1:enable='between(t,"));
+        assert!(g.contains(",volume='if(between(t,"));
     }
 
     #[test]

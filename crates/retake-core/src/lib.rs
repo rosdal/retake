@@ -9,6 +9,7 @@ pub mod cue;
 pub mod disk;
 pub mod display;
 pub mod export;
+pub mod fcpxml;
 pub mod ffmpeg_args;
 pub mod ffmpeg_caps;
 pub mod grade;
