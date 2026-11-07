@@ -261,6 +261,7 @@ fn main() -> ExitCode {
                 &ffmpeg::locate(dir)?,
                 encoder,
                 &config.clips.out_dir,
+                &montage::looks_of(&config),
                 &words[1..],
             )
         })();
@@ -730,10 +731,11 @@ fn main() -> ExitCode {
             Err(e) => tracing::error!("{e:#}"),
         }
         let action_recorder = slot.clone();
-        let (montage_ffmpeg, montage_library, montage_clips) = (
+        let (montage_ffmpeg, montage_library, montage_clips, montage_looks) = (
             ffmpeg.clone(),
             library.clone(),
             config.clips.out_dir.clone(),
+            montage::looks_of(&config),
         );
         tray::set_media_handler(move |a| match a {
             tray::MediaAction::ExportNow => media.export_now(),
@@ -767,6 +769,7 @@ fn main() -> ExitCode {
                 encoder,
                 montage_library.clone(),
                 montage_clips.clone(),
+                montage_looks.clone(),
                 job,
             ),
             tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {

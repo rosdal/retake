@@ -21,6 +21,8 @@ pub struct LibClip {
     pub starred: bool,
     /// Montages it was used in.
     pub used: u32,
+    /// The game's profile id, or empty if unknown.
+    pub game: String,
 }
 
 /// How good a clip is for a montage: kills (multi-kills extra), a star, kill density, minus
@@ -122,6 +124,9 @@ pub struct ProjClip {
     /// Changed by hand: re-arranging keeps its role, in/out and position.
     #[serde(default)]
     pub manual: bool,
+    /// The clip's game (its look is applied before the montage's own).
+    #[serde(default)]
+    pub game: String,
 }
 
 /// A montage project (`montages/<date>_<name>/montage.toml`).
@@ -211,6 +216,7 @@ fn proj_clip(c: &LibClip) -> ProjClip {
         r#in: None,
         out: None,
         manual: false,
+        game: c.game.clone(),
     }
 }
 
@@ -506,6 +512,7 @@ mod tests {
             kills: kills.to_vec(),
             starred,
             used,
+            game: String::new(),
         }
     }
 

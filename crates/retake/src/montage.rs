@@ -75,7 +75,21 @@ pub fn save(dir: &Path, p: &Project) -> Result<()> {
     std::fs::write(dir.join("montage.toml"), p.to_toml()).context("writing montage.toml")
 }
 
-/// Creates a project for `song` from the library and returns its folder.
+/// Game looks for montages: profile id → `.cube`, from `[games.<id>] look`.
+pub type Looks = std::collections::BTreeMap<String, PathBuf>;
+
+/// The looks set in the config (only files that exist).
+pub fn looks_of(config: &retake_core::config::Config) -> Looks {
+    config
+        .games
+        .iter()
+        .filter_map(|(id, o)| Some((id.clone(), PathBuf::from(o.look.as_ref()?))))
+        .filter(|(_, p)| p.is_file())
+        .collect()
+}
+
+/// Creates a project for `song` from the library (only `game`'s clips if given; mixed
+/// otherwise) and returns its folder.
 pub fn create(
     lib: &Library,
     montages: &Path,
@@ -83,8 +97,14 @@ pub fn create(
     format: Format,
     pick: &Pick,
     name: &str,
+    game: Option<&str>,
 ) -> Result<PathBuf> {
-    let clips = candidates(&lib.list(), pick, format);
+    let all: Vec<_> = lib
+        .list()
+        .into_iter()
+        .filter(|c| game.is_none_or(|g| c.game == g))
+        .collect();
+    let clips = candidates(&all, pick, format);
     if clips.is_empty() {
         bail!("no clips with kills to pick from ({pick:?})");
     }
@@ -123,6 +143,7 @@ pub fn render(
     ffmpeg: &Path,
     encoder: Encoder,
     lib: Option<&Library>,
+    looks: &Looks,
     dir: &Path,
     preview: bool,
 ) -> Result<(PathBuf, Vec<Placed>)> {
@@ -180,6 +201,12 @@ pub fn render(
         preview,
         encoder,
         look: Some(look),
+        // Each clip in its own game's look first (mixed montages).
+        clip_looks: p
+            .clips
+            .iter()
+            .filter_map(|c| Some((c.file.clone(), looks.get(&c.game)?.clone())))
+            .collect(),
         game_db: -10.0,
         killfeed: true,
     };
@@ -215,14 +242,21 @@ pub fn render(
 }
 
 /// `retake.exe montage new <song> [--format tiktok|youtube] [--pick starred|auto|<folder>]
-/// [--name n]` and `retake.exe montage render <dir> [--preview]`.
-pub fn cli(ffmpeg: &Path, encoder: Encoder, clips: &Path, words: &[String]) -> Result<()> {
+/// [--game <id>] [--name n]` and `retake.exe montage render <dir> [--preview]`.
+pub fn cli(
+    ffmpeg: &Path,
+    encoder: Encoder,
+    clips: &Path,
+    looks: &Looks,
+    words: &[String],
+) -> Result<()> {
     let lib = Library::open(clips)?;
     match words.first().map(String::as_str) {
         Some("new") => {
             let song_path = PathBuf::from(words.get(1).context("montage new <song>")?);
             let mut format = Format::Tiktok;
             let mut pick = Pick::Auto;
+            let mut game: Option<String> = None;
             let mut name = song_path
                 .file_stem()
                 .unwrap_or_default()
@@ -246,6 +280,7 @@ pub fn cli(ffmpeg: &Path, encoder: Encoder, clips: &Path, words: &[String]) -> R
                         }
                     }
                     "--name" => name = it.next().cloned().unwrap_or(name),
+                    "--game" => game = it.next().cloned(),
                     other => bail!("unknown option {other}"),
                 }
             }
@@ -260,6 +295,7 @@ pub fn cli(ffmpeg: &Path, encoder: Encoder, clips: &Path, words: &[String]) -> R
                 format,
                 &pick,
                 &name,
+                game.as_deref(),
             )?;
             println!("{}", dir.display());
         }
@@ -267,7 +303,7 @@ pub fn cli(ffmpeg: &Path, encoder: Encoder, clips: &Path, words: &[String]) -> R
             let dir = PathBuf::from(words.get(1).context("montage render <dir>")?);
             let preview = words.iter().any(|w| w == "--preview");
             let t = std::time::Instant::now();
-            let (out, placed) = render(ffmpeg, encoder, Some(&lib), &dir, preview)?;
+            let (out, placed) = render(ffmpeg, encoder, Some(&lib), looks, &dir, preview)?;
             for x in &placed {
                 for s in &x.segs {
                     println!(
@@ -306,6 +342,8 @@ pub enum Job {
         format: Format,
         starred: bool,
         length: Option<f64>,
+        /// Only this game's clips; `None` = mixed.
+        game: Option<String>,
     },
     /// Render a project: a preview, or the full montage.
     Render { dir: PathBuf, preview: bool },
@@ -326,6 +364,7 @@ pub fn run_in_background(
     encoder: Encoder,
     lib: Option<std::sync::Arc<Library>>,
     clips: PathBuf,
+    looks: Looks,
     job: Job,
 ) {
     use std::sync::atomic::Ordering;
@@ -336,7 +375,7 @@ pub fn run_in_background(
     let spawned = std::thread::Builder::new()
         .name("montage".into())
         .spawn(move || {
-            let r = run_job(&ffmpeg, encoder, lib.as_deref(), &clips, &job);
+            let r = run_job(&ffmpeg, encoder, lib.as_deref(), &clips, &looks, &job);
             BUSY.store(false, Ordering::Release);
             match r {
                 Ok(msg) => {
@@ -362,6 +401,7 @@ fn run_job(
     encoder: Encoder,
     lib: Option<&Library>,
     clips: &Path,
+    looks: &Looks,
     job: &Job,
 ) -> Result<String> {
     let lib = lib.context("the clip library is unavailable")?;
@@ -371,6 +411,7 @@ fn run_job(
             format,
             starred,
             length,
+            game,
         } => {
             if lib.list().is_empty() {
                 lib.rescan(ffmpeg)?;
@@ -382,13 +423,21 @@ fn run_job(
                 .to_string_lossy()
                 .into_owned();
             crate::status::event(format!("Montage: analysing {name}"));
-            let dir = create(lib, &clips.join("montages"), song, *format, &pick, &name)?;
+            let dir = create(
+                lib,
+                &clips.join("montages"),
+                song,
+                *format,
+                &pick,
+                &name,
+                game.as_deref(),
+            )?;
             if let Some(l) = length {
                 let mut p = load(&dir)?;
                 p.length = l.clamp(5.0, 600.0);
                 save(&dir, &p)?;
             }
-            let (out, _) = render(ffmpeg, encoder, Some(lib), &dir, true)?;
+            let (out, _) = render(ffmpeg, encoder, Some(lib), looks, &dir, true)?;
             Ok(format!("Montage preview ready: {}", out.display()))
         }
         Job::Render { dir, preview } => {
@@ -398,7 +447,7 @@ fn run_job(
                 if *preview { " (preview)" } else { "" }
             ));
             let t = std::time::Instant::now();
-            let (out, _) = render(ffmpeg, encoder, Some(lib), dir, *preview)?;
+            let (out, _) = render(ffmpeg, encoder, Some(lib), looks, dir, *preview)?;
             Ok(format!(
                 "Montage ready in {:.0} s: {}",
                 t.elapsed().as_secs_f32(),

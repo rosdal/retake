@@ -24,6 +24,9 @@ pub struct RenderOpts {
     pub encoder: Encoder,
     /// A look LUT for the whole montage.
     pub look: Option<PathBuf>,
+    /// Per-clip looks (a mixed montage: each clip's game look), applied to the clip before
+    /// the montage's look.
+    pub clip_looks: Vec<(PathBuf, PathBuf)>,
     /// Game audio level under the song, dB (e.g. −10).
     pub game_db: f64,
     /// Vertical montages: show the source's kill feed (which the 9:16 crop cuts off) near
@@ -121,6 +124,11 @@ pub fn render_args(
             // Crop to the format's aspect first: everything after works on fewer pixels.
             if o.format == Format::Tiktok {
                 chain.push_str(",crop=ih*9/16:ih");
+            }
+            if !o.preview
+                && let Some((_, lut)) = o.clip_looks.iter().find(|(f, _)| *f == x.file)
+            {
+                let _ = write!(chain, ",lut3d=file='{}':interp=tetrahedral", esc(lut));
             }
             // Frames the source has per output second at this speed.
             let have = src.fps * v;
@@ -329,6 +337,7 @@ mod tests {
             preview,
             encoder: Encoder::Amf,
             look: Some(PathBuf::from(r"D:\c\look.cube")),
+            clip_looks: Vec::new(),
             game_db: -10.0,
             killfeed: true,
         }
@@ -366,6 +375,29 @@ mod tests {
         assert!(g.contains("aevalsrc=0:d=0.4688"));
         assert!(g.contains("atempo=0.64000"));
         assert!(a.windows(2).any(|w| w == ["-ss", "30.000"]));
+    }
+
+    #[test]
+    fn each_clip_gets_its_games_look_before_the_montage_look() {
+        let mut o = opts(false);
+        o.clip_looks = vec![(
+            PathBuf::from(r"D:\c\a.mkv"),
+            PathBuf::from(r"D:\l\cs2.cube"),
+        )];
+        let a = render_args(
+            &placed(),
+            &sources(240.0),
+            Path::new("s.mp3"),
+            0.0,
+            25.0,
+            &o,
+            Path::new("o.mp4"),
+        );
+        let g = graph(&a);
+        assert_eq!(g.matches(r"lut3d=file='D\:/l/cs2.cube'").count(), 1, "{g}");
+        let clip = g.find("cs2.cube").unwrap();
+        let montage = g.find("look.cube").unwrap();
+        assert!(clip < montage);
     }
 
     #[test]

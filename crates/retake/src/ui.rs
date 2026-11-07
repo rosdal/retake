@@ -79,6 +79,8 @@ const ID_RENDER: i32 = 172;
 const ID_MONTAGE_FOLDER: i32 = 173;
 const ID_MONTAGE_REFRESH: i32 = 174;
 const ID_MONTAGE_MSG: i32 = 175;
+const ID_MONTAGE_GAME: i32 = 176;
+const ID_CLIPS_GAME: i32 = 177;
 const ID_SAVE: i32 = 140;
 const ID_REVERT: i32 = 141;
 const ID_OPEN_CONFIG: i32 = 142;
@@ -187,6 +189,8 @@ struct Ui {
     projects: HWND,
     pclips: HWND,
     montage_msg: HWND,
+    montage_game: HWND,
+    clips_game: HWND,
     fields: Vec<HWND>,
     settings_msg: HWND,
 }
@@ -392,9 +396,9 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
             WS_TABSTOP | WS_BORDER | WINDOW_STYLE(LVS_REPORT | LVS_SHOWSELALWAYS),
             WS_EX_CLIENTEDGE,
             x0,
-            y0,
+            y0 + 34,
             cw,
-            H - 160,
+            H - 160 - 34,
             ID_LIST,
         );
         send(
@@ -406,7 +410,8 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
         add_columns(
             list,
             &[
-                ("Clip", 300),
+                ("Clip", 270),
+                ("Game", 110),
                 ("★", 30),
                 ("Play", 70),
                 ("Graded", 60),
@@ -489,10 +494,15 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
                 id,
             )
         };
+        let clips_label = label("Game", x0, y0, 45);
+        let clips_game = combo(x0 + 50, y0, 220, ID_CLIPS_GAME, &["All games"]);
         let mut montage = Vec::new();
         montage.push(label("Song", x0, y0, 60));
-        let song = edit("", x0 + 65, y0, 560, ID_SONG);
+        let song = edit("", x0 + 65, y0, 330, ID_SONG);
         montage.push(song);
+        montage.push(label("Game", x0 + 410, y0, 45));
+        let montage_game = combo(x0 + 455, y0, 170, ID_MONTAGE_GAME, &["All games (mixed)"]);
+        montage.push(montage_game);
         montage.push(btn("Browse…", x0 + 640, y0 - 2, ID_BROWSE));
         let y1 = y0 + 34;
         montage.push(label("Format", x0, y1, 60));
@@ -694,7 +704,10 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
 
         let pages = [
             vec![status_text, pause, save60, open_clips],
-            std::iter::once(list).chain(clip_btns).collect(),
+            [list, clips_label, clips_game]
+                .into_iter()
+                .chain(clip_btns)
+                .collect(),
             montage,
             settings,
             std::iter::once(about).chain(about_btns).collect(),
@@ -719,6 +732,8 @@ fn create(setup: UiSetup) -> anyhow::Result<Ui> {
             projects,
             pclips,
             montage_msg,
+            montage_game,
+            clips_game,
             fields,
             settings_msg,
         };
@@ -888,9 +903,68 @@ fn select_row(list: HWND, i: usize) {
     send(list, LVM_ENSUREVISIBLE, i, 0);
 }
 
+/// A game's display name from its profile id.
+fn game_name(id: &str) -> String {
+    if id.is_empty() {
+        return "Unknown".into();
+    }
+    retake_core::games::BUILTIN
+        .iter()
+        .find(|p| p.id == id)
+        .map_or_else(|| id.to_owned(), |p| p.name.to_owned())
+}
+
+thread_local! {
+    /// The game ids behind each game combo's items (after the first, "all").
+    static CLIPS_GAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static MONTAGE_GAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Refills a game combo with "all" and the games in the library, keeping the selection.
+fn fill_game_combo(
+    combo: HWND,
+    all: &str,
+    games: &'static std::thread::LocalKey<RefCell<Vec<String>>>,
+    lib: &[retake_core::montage::LibClip],
+) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_RESETCONTENT;
+    let keep = selected_game(combo, games);
+    let mut ids: Vec<String> = lib.iter().map(|c| c.game.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    send(combo, CB_RESETCONTENT, 0, 0);
+    for name in std::iter::once(all.to_owned()).chain(ids.iter().map(|i| game_name(i))) {
+        let s: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        send(combo, CB_ADDSTRING, 0, s.as_ptr() as isize);
+    }
+    let sel = keep
+        .and_then(|k| ids.iter().position(|i| *i == k))
+        .map_or(0, |i| i + 1);
+    send(combo, CB_SETCURSEL, sel, 0);
+    games.with(|g| *g.borrow_mut() = ids);
+}
+
+/// The game picked in a combo; `None` = all.
+fn selected_game(
+    combo: HWND,
+    games: &'static std::thread::LocalKey<RefCell<Vec<String>>>,
+) -> Option<String> {
+    let i = send(combo, CB_GETCURSEL, 0, 0);
+    let i = usize::try_from(i).ok()?.checked_sub(1)?;
+    games.with(|g| g.borrow().get(i).cloned())
+}
+
 fn fill_clips_of(ui: &Ui) {
-    let clips = list_clips(&ui.setup.clips);
     let lib = ui.library.as_ref().map(Library::list).unwrap_or_default();
+    fill_game_combo(ui.clips_game, "All games", &CLIPS_GAMES, &lib);
+    let game = selected_game(ui.clips_game, &CLIPS_GAMES);
+    let clips: Vec<_> = list_clips(&ui.setup.clips)
+        .into_iter()
+        .filter(|c| {
+            game.as_ref()
+                .is_none_or(|g| lib.iter().any(|l| l.path == c.0 && l.game == *g))
+        })
+        .collect();
     let rows: Vec<Vec<String>> = clips
         .iter()
         .map(|(p, play, graded, len, when)| {
@@ -900,6 +974,7 @@ fn fill_clips_of(ui: &Ui) {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+                game_name(l.map_or("", |c| c.game.as_str())),
                 if l.is_some_and(|c| c.starred) {
                     "★".into()
                 } else {
@@ -972,6 +1047,8 @@ fn rendered_of(dir: &Path) -> String {
 }
 
 fn fill_projects(ui: &Ui) {
+    let lib = ui.library.as_ref().map(Library::list).unwrap_or_default();
+    fill_game_combo(ui.montage_game, "All games (mixed)", &MONTAGE_GAMES, &lib);
     let keep = selected_project(ui);
     let list = crate::montage::projects(&ui.setup.clips);
     let rows: Vec<Vec<String>> = list
@@ -1106,6 +1183,7 @@ fn new_montage(ui: &Ui) -> Option<MediaAction> {
         format,
         starred: send(ui.pick, CB_GETCURSEL, 0, 0) == 1,
         length,
+        game: selected_game(ui.montage_game, &MONTAGE_GAMES),
     }))
 }
 
@@ -1386,9 +1464,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_COMMAND => {
-            // Notifications from combo boxes and edits (high word ≠ 0) aren't commands.
-            if (wparam.0 >> 16) & 0xFFFF == 0 {
-                on_command((wparam.0 & 0xFFFF) as i32);
+            // Notifications from combo boxes and edits (high word ≠ 0) aren't commands, except
+            // a new pick in the Clips tab's game filter.
+            let (code, id) = ((wparam.0 >> 16) & 0xFFFF, (wparam.0 & 0xFFFF) as i32);
+            if code == 0 {
+                on_command(id);
+            } else if code == 1 && id == ID_CLIPS_GAME {
+                UI.with(|u| {
+                    if let Some(ui) = u.borrow().as_ref() {
+                        fill_clips_of(ui);
+                    }
+                });
             }
             LRESULT(0)
         }
