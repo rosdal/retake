@@ -57,6 +57,8 @@ pub struct SessionInfo {
     pub unix_offset_ms: i64,
     pub start_ms: Ms,
     pub end_ms: Ms,
+    /// The game's profile id (sessions from before v1.5 were Siege).
+    pub game: String,
 }
 
 pub struct Keeper {
@@ -102,6 +104,8 @@ struct Open {
     last_end: [Ms; 2],
     seq: u64,
     warned_space: bool,
+    /// The game's profile id.
+    game: String,
 }
 
 fn unix_ms() -> i64 {
@@ -112,6 +116,8 @@ fn unix_ms() -> i64 {
 
 fn run(slot: &SessionSlot, root: &Path, on_done: &dyn Fn(SessionInfo), stop: &AtomicBool) {
     let mut open: Option<Open> = None;
+    // A game session whose game has no automatic clips: nothing is kept for it.
+    let mut skipped: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
         let s = current(slot);
@@ -125,10 +131,20 @@ fn run(slot: &SessionSlot, root: &Path, on_done: &dyn Fn(SessionInfo), stop: &At
         }
         let Some(s) = s else { continue };
         if open.is_none() {
-            if !s.live {
+            if !s.live || skipped == Some(s.game_session) {
                 continue;
             }
-            match start_session(root, s.game_session) {
+            let game = crate::current_game::get();
+            if !game.as_ref().is_some_and(|g| g.autoclip) {
+                tracing::info!(
+                    game = game.as_ref().map_or("none", |g| g.name.as_str()),
+                    "no automatic clips for this game; the session isn't kept"
+                );
+                skipped = Some(s.game_session);
+                continue;
+            }
+            let game = game.map(|g| g.id).unwrap_or_default();
+            match start_session(root, s.game_session, game) {
                 Ok(o) => open = Some(o),
                 Err(e) => {
                     tracing::warn!("session recording off for this session: {e:#}");
@@ -178,7 +194,7 @@ fn run(slot: &SessionSlot, root: &Path, on_done: &dyn Fn(SessionInfo), stop: &At
     }
 }
 
-fn start_session(root: &Path, game_session: u64) -> Result<Open> {
+fn start_session(root: &Path, game_session: u64, game: String) -> Result<Open> {
     let id = format!("{}-{game_session}", unix_ms());
     let dir = root.join(id);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -195,6 +211,7 @@ fn start_session(root: &Path, game_session: u64) -> Result<Open> {
         last_end: [0, 0],
         seq: 0,
         warned_space: false,
+        game,
     })
 }
 
@@ -220,11 +237,13 @@ fn finish(o: Open, on_done: &dyn Fn(SessionInfo)) {
         unix_offset_ms: unix_ms() - now_ms() as i64,
         start_ms: o.start_ms,
         end_ms: now_ms(),
+        game: o.game.clone(),
     };
     let json = serde_json::json!({
         "unix_offset_ms": info.unix_offset_ms,
         "start_ms": info.start_ms,
         "end_ms": info.end_ms,
+        "game": info.game,
     });
     let _ = fs::write(o.dir.join("session.json"), json.to_string());
     tracing::info!(dir = %o.dir.display(), "session recording finished");
@@ -240,6 +259,11 @@ pub fn read_info(dir: &Path) -> Option<SessionInfo> {
         unix_offset_ms: v.get("unix_offset_ms")?.as_i64()?,
         start_ms: v.get("start_ms")?.as_u64()?,
         end_ms: v.get("end_ms")?.as_u64()?,
+        game: v
+            .get("game")
+            .and_then(|g| g.as_str())
+            .unwrap_or("siege")
+            .to_owned(),
     })
 }
 

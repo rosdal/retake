@@ -7,10 +7,12 @@ mod background;
 mod child;
 mod clock;
 mod config_watch;
+mod current_game;
 mod diag;
 mod diagnostics;
 mod display;
 mod drive;
+mod events;
 mod ffmpeg;
 mod ffmpeg_proc;
 mod grader;
@@ -542,7 +544,10 @@ fn main() -> ExitCode {
         Err(e) => return fatal(&format!("{e:#}")),
     };
     let jobs = background.submitter();
-    let strict = config.safety.strict;
+    // The setup check reads Siege's settings file: only when Siege isn't under strict safety.
+    let strict = retake_core::games::Rules::from_config(&config)
+        .builtin_game("siege")
+        .is_none_or(|g| g.strict);
     if strict {
         tracing::info!(
             "strict safety: device audio loopback, the game's settings file is not read"
@@ -576,17 +581,31 @@ fn main() -> ExitCode {
     let saved_library = library.clone();
     let saved_ffmpeg = ffmpeg.clone();
 
-    // Auto-clipping (Siege): keep the whole session's recording, then after the game closes
-    // read its Match Replays and cut the player's kills. Off when not asked for or not Siege:
+    // Auto-clipping: while a game with automatic clips runs, keep the whole session's
+    // recording; after it closes, find the player's kills (Siege's replays, CS2's and League's
+    // events, or the kill feed) and cut them. Games without automatic clips keep nothing:
     // keeping the session doubles the disk writes while recording.
-    let is_siege = config
-        .game
-        .processes
-        .iter()
-        .any(|p| p.to_ascii_lowercase().starts_with("rainbowsix"));
-    let auto_on =
-        config.autoclip.enabled && config.autoclip.clip != config::ClipPlays::Off && is_siege;
+    let auto_on = config.autoclip.enabled && config.autoclip.clip != config::ClipPlays::Off;
     let session_root = config.clips.out_dir.join("session");
+    if auto_on {
+        let rules = retake_core::games::Rules::from_config(&config);
+        if rules.builtin_game("cs2").is_some_and(|g| g.autoclip) {
+            let cs2_running = procs::processes()
+                .map(|p| p.iter().any(|(_, n)| n.eq_ignore_ascii_case("cs2.exe")))
+                .unwrap_or(true);
+            if !events::install_cs2_cfg(&session_root, cs2_running).is_empty() {
+                notify::toast(
+                    "Retake added its Game State Integration file to CS2, for automatic kill clips. Restart CS2 if it's open.",
+                );
+            }
+            events::start_gsi(session_root.clone());
+        }
+        if rules.builtin_game("lol").is_some_and(|g| g.autoclip) {
+            events::start_league(session_root.clone());
+        }
+        // Events older than a day belong to no session any more.
+        events::trim(&session_root, events::unix_now() - 24 * 3_600_000);
+    }
     let _keeper = if auto_on {
         let told = std::sync::atomic::AtomicBool::new(false);
         let clip_media = media.clone();
@@ -595,6 +614,8 @@ fn main() -> ExitCode {
             dissect: autoclipper::find_dissect(&exe_dir),
             raw_dir: config.clips.out_dir.join("raw"),
             min_play: config.autoclip.clip.min_play(),
+            rules: retake_core::games::Rules::from_config(&config),
+            session_root: session_root.clone(),
             on_clip: {
                 let lib = library.clone();
                 let ff = ffmpeg.clone();
@@ -667,7 +688,7 @@ fn main() -> ExitCode {
         audio.game_source = config::GameSource::Device;
     }
     let diag = args.diag;
-    let processes = config.game.processes.clone();
+    let rules = retake_core::games::Rules::from_config(&config);
     let (pre_roll, post_roll) = (config.clips.pre_roll, config.clips.post_roll);
     let warning = !warnings.is_empty();
     let on_ready = move |notifier: tray::TrayNotifier| {
@@ -759,7 +780,7 @@ fn main() -> ExitCode {
             capture,
             audio,
             diag,
-            processes,
+            rules,
             warning,
             job: setup_job,
             notify: Box::new(move |s| notifier.set(s)),

@@ -28,6 +28,9 @@ pub struct Config {
     pub export: Export,
     pub motion_blur: MotionBlur,
     pub safety: Safety,
+    /// `[games.<id>]`: per-game changes (see `games::Override`).
+    #[serde(default)]
+    pub games: std::collections::BTreeMap<String, crate::games::Override>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +44,12 @@ pub struct Safety {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Game {
+    /// More exe names to record (the default profile), on top of the built-in games.
     pub processes: Vec<String>,
+    /// Record the games in Retake's built-in game list without setup.
+    pub builtin: bool,
+    /// Treat any fullscreen app (not Explorer or a browser) as a game.
+    pub any_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

@@ -45,7 +45,8 @@ pub struct Setup {
     /// `--diag`: log memory and handle counts every 5 minutes.
     pub diag: bool,
     pub encoder: Encoder,
-    pub processes: Vec<String>,
+    /// Which processes are games, and their profiles.
+    pub rules: retake_core::games::Rules,
     /// A startup warning (monitor refresh, HDR) keeps the icon yellow.
     pub warning: bool,
     pub job: Arc<ChildJob>,
@@ -127,6 +128,8 @@ struct Loop {
     outputs: Vec<OutputInfo>,
     /// Siege's process ids at the last poll.
     game_pids: Vec<u32>,
+    /// Exe names that are games (built-in list, user games, `[game] processes`).
+    exes: Vec<String>,
     /// The current session's monitor has a warning (refresh, HDR).
     session_warning: bool,
     /// The monitor Siege's window has moved to, and on how many polls in a row.
@@ -159,7 +162,9 @@ struct Loop {
 
 impl Loop {
     fn new(s: Setup, stats_tx: Sender<Event>) -> Loop {
+        let exes = s.rules.exes();
         Loop {
+            exes,
             s,
             stats_tx,
             epoch: Instant::now(),
@@ -235,11 +240,16 @@ impl Loop {
                 next_poll = now + POLL;
                 match processes() {
                     Ok(procs) => {
-                        self.game_pids = procs
-                            .iter()
-                            .filter(|(_, n)| game_running([n.as_str()], &self.s.processes))
-                            .map(|(p, _)| *p)
-                            .collect();
+                        let (pids, game) = self.detect(&procs);
+                        self.game_pids = pids;
+                        if crate::current_game::get().map(|g| g.id)
+                            != game.as_ref().map(|g| g.id.clone())
+                        {
+                            if let Some(g) = &game {
+                                tracing::info!(game = %g.name, anticheat = g.anticheat.name(), strict = g.strict, method = ?g.method, "game detected");
+                            }
+                            crate::current_game::set(game);
+                        }
                         let running = !self.game_pids.is_empty();
                         crate::notify::game_running(running);
                         // A pause lasts until the game is launched again.
@@ -441,6 +451,33 @@ impl Loop {
         clean
     }
 
+    /// The running game's process ids and profile: known exe names first, then (if turned on)
+    /// a fullscreen foreground app. Only the process list and window list are read.
+    fn detect(&self, procs: &[(u32, String)]) -> (Vec<u32>, Option<retake_core::games::Game>) {
+        let exes = &self.exes;
+        let pids: Vec<u32> = procs
+            .iter()
+            .filter(|(_, n)| game_running([n.as_str()], exes))
+            .map(|(p, _)| *p)
+            .collect();
+        let game = procs
+            .iter()
+            .filter(|(p, _)| pids.contains(p))
+            .find_map(|(_, n)| self.s.rules.identify(n));
+        if game.is_some() || !self.s.rules.any_fullscreen {
+            return (pids, game);
+        }
+        let Some(pid) = crate::window::fullscreen_pid() else {
+            return (Vec::new(), None);
+        };
+        match procs.iter().find(|(p, _)| *p == pid) {
+            Some((_, n)) if retake_core::games::fullscreen_counts(n) => {
+                (vec![pid], Some(self.s.rules.fullscreen_game(n)))
+            }
+            _ => (Vec::new(), None),
+        }
+    }
+
     /// A game restarted mid-session has a new process id; process loopback on the old one
     /// would record silence, so the run restarts on the new one.
     fn follow_game_pid(&mut self, now: Ms) {
@@ -466,7 +503,14 @@ impl Loop {
         let mut want: Vec<(&'static str, Option<retake_audio::Source>, f32, u32)> = Vec::new();
         self.audio_pid = None;
         if a.game {
-            let source = match (a.game_source, self.game_pids.first()) {
+            // Strict safety for this game (Vanguard games by default): device audio only.
+            let strict = crate::current_game::get().is_some_and(|g| g.strict);
+            let game_source = if strict {
+                GameSource::Device
+            } else {
+                a.game_source
+            };
+            let source = match (game_source, self.game_pids.first()) {
                 (GameSource::Process, Some(&pid)) if process_loopback_supported() => {
                     self.audio_pid = Some(pid);
                     retake_audio::Source::ProcessLoopback { pid }
@@ -710,7 +754,7 @@ impl Loop {
         let game = self
             .game_pids
             .first()
-            .and_then(|_| self.s.processes.first().cloned());
+            .and_then(|_| crate::current_game::get().map(|g| g.name));
         let capture = self
             .current
             .as_ref()

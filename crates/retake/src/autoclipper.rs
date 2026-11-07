@@ -1,10 +1,15 @@
-//! Automatic kill clips for Siege, after the game has closed: find the Match Replays written
-//! during the session, read them with the r6-dissect sidecar, find new kill-feed rows in the
-//! session recording, line the two up per round and cut the player's kills (kill, 2K, 3K, 4K,
-//! ACE) as clips, which then go through grading and exports like any other clip.
+//! Automatic kill clips after the game has closed. Per game, the safest source of kill times:
+//! - Siege: find the Match Replays written
+//!   during the session, read them with the r6-dissect sidecar, find new kill-feed rows in the
+//!   session recording, line the two up per round and cut the player's kills (kill, 2K, 3K, 4K,
+//!   ACE) as clips, which then go through grading and exports like any other clip.
 //!
-//! Only files on disk are read, and only after the game has closed: the replay files and
-//! Retake's own recording. Nothing touches the game while it runs.
+//! - CS2 and League: the kill times their official event interfaces sent while the game ran
+//!   (`events.rs`), grouped by round or multi-kill.
+//! - Other kill-feed games: new rows in the game's kill-feed region of the recording.
+//!
+//! Only files on disk are read, and only after the game has closed: the replay files, the
+//! event log and Retake's own recording. Nothing touches the game while it runs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +54,7 @@ fn reg_string(root: HKEY, key: &str, value: &str) -> Option<String> {
 }
 
 /// Paths of Steam library folders from `libraryfolders.vdf`.
-fn steam_libraries() -> Vec<PathBuf> {
+pub fn steam_libraries() -> Vec<PathBuf> {
     let Some(steam) = reg_string(HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath") else {
         return Vec::new();
     };
@@ -146,6 +151,10 @@ pub struct Setup {
     pub dissect: Option<PathBuf>,
     pub raw_dir: PathBuf,
     pub min_play: MinPlay,
+    /// Game profiles, to look up a session's game.
+    pub rules: retake_core::games::Rules,
+    /// `clips/session`, where the event log is.
+    pub session_root: PathBuf,
     /// Called with each new clip (queues grading and exports).
     pub on_clip: Box<dyn Fn(&Path) + Send + Sync>,
     /// Called once with a message for the user (replays off, sidecar missing).
@@ -173,9 +182,156 @@ pub fn run(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
 }
 
 fn analyse(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
+    use retake_core::games::Method;
     if s.min_play == MinPlay::Off {
         return Ok(Vec::new());
     }
+    let Some(game) = s.rules.game_by_id(&info.game) else {
+        bail!("unknown game {:?} in the session", info.game);
+    };
+    match game.method {
+        Method::SiegeReplay => analyse_siege(s, info),
+        Method::Gsi | Method::LiveClient => analyse_events(s, info, &game),
+        Method::KillFeed => analyse_feed(s, info, &game),
+        Method::Manual => Ok(Vec::new()),
+    }
+}
+
+/// The session's kept video and audio segments.
+fn kept_of(info: &SessionInfo) -> Result<(Vec<Kept>, Vec<Kept>)> {
+    let kept = read_kept(&info.dir);
+    let (video, audio): (Vec<Kept>, Vec<Kept>) = kept.into_iter().partition(|k| k.kind == "v");
+    if video.is_empty() {
+        bail!("the session recording is empty");
+    }
+    Ok((video, audio))
+}
+
+/// Cuts `clips` and reports each; returns the files made.
+fn cut_all(
+    s: &Setup,
+    job: &ChildJob,
+    rec: &Recording<'_>,
+    clips: Vec<KillClip>,
+    extra: &serde_json::Value,
+) -> Vec<PathBuf> {
+    let mut made = Vec::new();
+    for clip in clips {
+        match cut(s, job, rec, &clip, extra, &|_| serde_json::json!({})) {
+            Ok(p) => {
+                (s.on_clip)(&p);
+                made.push(p);
+            }
+            Err(e) => tracing::warn!("cutting a kill clip: {e:#}"),
+        }
+    }
+    made
+}
+
+/// CS2 and League: kill times from the event log.
+fn analyse_events(
+    s: &Setup,
+    info: &SessionInfo,
+    game: &retake_core::games::Game,
+) -> Result<Vec<PathBuf>> {
+    let off = info.unix_offset_ms;
+    let events = crate::events::read(
+        &s.session_root,
+        &game.id,
+        info.start_ms as i64 + off,
+        info.end_ms as i64 + off,
+    );
+    if events.is_empty() {
+        tracing::info!(game = %game.name, "no kill events in this session");
+        return Ok(Vec::new());
+    }
+    let (video, audio) = kept_of(info)?;
+    let (vref, aref): (Vec<&Kept>, Vec<&Kept>) = (video.iter().collect(), audio.iter().collect());
+    let rec = Recording {
+        info,
+        video: &vref,
+        audio: &aref,
+    };
+    let job = ChildJob::new()?;
+    // A round (CS2) or a multi-kill chain (League) is one play; five enemies make an ace.
+    let mut groups: Vec<(u32, Vec<f64>)> = Vec::new();
+    if game.method == retake_core::games::Method::Gsi {
+        for e in &events {
+            let t = (e.ms - off) as f64 / 1000.0;
+            match groups.last_mut() {
+                Some((r, g)) if *r == e.round => g.push(t),
+                _ => groups.push((e.round, vec![t])),
+            }
+        }
+    } else {
+        let times: Vec<f64> = events
+            .iter()
+            .map(|e| (e.ms - off) as f64 / 1000.0)
+            .collect();
+        groups = retake_core::liveclient::plays(&times)
+            .into_iter()
+            .map(|g| (0, g))
+            .collect();
+    }
+    let mut made = Vec::new();
+    for (round, kills) in groups {
+        let extra = serde_json::json!({ "game": game.id, "round": round, "source": "events" });
+        made.extend(cut_all(
+            s,
+            &job,
+            &rec,
+            round_clips(&kills, 5, s.min_play),
+            &extra,
+        ));
+    }
+    Ok(made)
+}
+
+/// Other kill-feed games: every burst of new kill-feed rows is a candidate play. Without a
+/// checked layout this stays off unless the user turned it on for the game.
+fn analyse_feed(
+    s: &Setup,
+    info: &SessionInfo,
+    game: &retake_core::games::Game,
+) -> Result<Vec<PathBuf>> {
+    let Some(region) = game.feed else {
+        bail!("{} has no kill-feed region", game.name);
+    };
+    let (video, audio) = kept_of(info)?;
+    let job = ChildJob::new()?;
+    let list = info.dir.join("video.txt");
+    fs::write(
+        &list,
+        concat_list(&video.iter().map(|k| k.file.clone()).collect::<Vec<_>>()),
+    )?;
+    let first = video[0].start as f64 / 1000.0;
+    let rows: Vec<f64> = killfeed::scan_list(&s.ffmpeg, &job, &list, Some(region))?
+        .into_iter()
+        .map(|t| first + t)
+        .collect();
+    tracing::info!(game = %game.name, rows = rows.len(), "kill feed scanned");
+    let (vref, aref): (Vec<&Kept>, Vec<&Kept>) = (video.iter().collect(), audio.iter().collect());
+    let rec = Recording {
+        info,
+        video: &vref,
+        audio: &aref,
+    };
+    let mut made = Vec::new();
+    for g in retake_core::liveclient::plays(&rows) {
+        let extra = serde_json::json!({ "game": game.id, "source": "killfeed" });
+        made.extend(cut_all(
+            s,
+            &job,
+            &rec,
+            round_clips(&g, 5, s.min_play),
+            &extra,
+        ));
+    }
+    Ok(made)
+}
+
+/// Siege: Match Replays lined up with the kill feed.
+fn analyse_siege(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
     let minutes = (info.end_ms.saturating_sub(info.start_ms)) / 60_000;
     let Some(dissect) = &s.dissect else {
         bail!("r6-dissect isn't next to retake.exe; auto-clipping is off");
@@ -212,7 +368,7 @@ fn analyse(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
         &list,
         concat_list(&video.iter().map(|k| k.file.clone()).collect::<Vec<_>>()),
     )?;
-    let rows: Vec<f64> = killfeed::scan_list(&s.ffmpeg, &job, &list)?
+    let rows: Vec<f64> = killfeed::scan_list(&s.ffmpeg, &job, &list, None)?
         .into_iter()
         .map(|t| first.start as f64 / 1000.0 + t)
         .collect();
@@ -275,7 +431,18 @@ fn analyse(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
                     video: &video,
                     audio: &audio,
                 };
-                match cut(s, &job, &rec, &clip, round, &details) {
+                let extra = serde_json::json!({
+                    "game": "siege",
+                    "round": round.number,
+                    "map": round.map,
+                });
+                let kill = |t: f64| {
+                    details.iter().find(|d| d.0 == t).map_or(
+                        serde_json::json!({}),
+                        |(_, k)| serde_json::json!({ "victim": k.victim, "headshot": k.headshot }),
+                    )
+                };
+                match cut(s, &job, &rec, &clip, &extra, &kill) {
                     Ok(p) => {
                         (s.on_clip)(&p);
                         made.push(p);
@@ -322,8 +489,8 @@ fn cut(
     job: &ChildJob,
     rec: &Recording<'_>,
     c: &KillClip,
-    round: &Round,
-    details: &[(f64, &replay::Kill)],
+    extra: &serde_json::Value,
+    kill: &dyn Fn(f64) -> serde_json::Value,
 ) -> Result<PathBuf> {
     let (info, video, audio) = (rec.info, rec.video, rec.audio);
     let (from, to): (Ms, Ms) = ((c.start * 1000.0) as Ms, (c.end * 1000.0) as Ms);
@@ -359,27 +526,35 @@ fn cut(
         .find(|k| k.end > from)
         .map_or(from, |k| k.start) as f64
         / 1000.0;
-    let side = serde_json::json!({
-        "autoclip": {
-            "play": c.play.tag(),
-            "part": [c.part.0, c.part.1],
-            "round": round.number,
-            "map": round.map,
-            "kills": details
-                .iter()
-                .filter(|(t, _)| c.kills.contains(t))
-                .map(|(t, k)| serde_json::json!({
-                    "at": t - base,
-                    "victim": k.victim,
-                    "headshot": k.headshot,
-                }))
-                .collect::<Vec<_>>(),
-        }
+    let mut auto = serde_json::json!({
+        "play": c.play.tag(),
+        "part": [c.part.0, c.part.1],
+        "kills": c
+            .kills
+            .iter()
+            .map(|&t| {
+                let mut k = kill(t);
+                if let Some(o) = k.as_object_mut() {
+                    o.insert("at".into(), serde_json::json!(t - base));
+                }
+                k
+            })
+            .collect::<Vec<_>>(),
     });
+    if let (Some(a), Some(e)) = (auto.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            a.insert(k.clone(), v.clone());
+        }
+    }
+    let game = extra
+        .get("game")
+        .cloned()
+        .unwrap_or(serde_json::json!("siege"));
+    let side = serde_json::json!({ "game": game, "autoclip": auto });
     fs::write(
         out.with_extension("json"),
         serde_json::to_string_pretty(&side)?,
     )?;
-    tracing::info!(clip = %out.display(), play = %c.play.tag(), round = round.number, "kill clip saved");
+    tracing::info!(clip = %out.display(), play = %c.play.tag(), "kill clip saved");
     Ok(out)
 }
