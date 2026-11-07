@@ -16,8 +16,10 @@ mod ffmpeg_proc;
 mod grader;
 mod instance;
 mod killfeed;
+mod library;
 mod logging;
 mod media;
+mod montage;
 mod notify;
 mod pipe;
 mod procs;
@@ -240,6 +242,33 @@ fn main() -> ExitCode {
     }
     if words.first().is_some_and(|w| w == "grade") {
         return grade_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "montage") {
+        attach_console();
+        let r = (|| -> Result<()> {
+            let exe = std::env::current_exe()?;
+            let dir = exe.parent().unwrap_or(Path::new("."));
+            ensure_config(&dir.join("config.toml"))?;
+            let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+            let config = config::load_file(&dir.join("config.toml"), &pick_root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (vendor, _) = display::adapter()?;
+            let encoder =
+                pick_encoder(config.capture.encoder, vendor).map_err(|e| anyhow::anyhow!(e))?;
+            montage::cli(
+                &ffmpeg::locate(dir)?,
+                encoder,
+                &config.clips.out_dir,
+                &words[1..],
+            )
+        })();
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("montage: {e:#}");
+                ExitCode::from(1)
+            }
+        };
     }
     if words.first().is_some_and(|w| w == "write-look") {
         // The built-in look as a .cube file (for the release zip, or to edit in Resolve).

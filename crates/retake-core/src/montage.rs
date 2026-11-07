@@ -268,8 +268,23 @@ fn place(
         .filter(|&k| k < c.duration)
         .collect();
     kills.sort_by(f64::total_cmp);
+    // A hook is one quick kill; build clips stay short (at most two kills, close together);
+    // the drop and outro keep them all.
+    match role {
+        Role::Hook => kills.truncate(1),
+        Role::Build => {
+            if let Some(&k0) = kills.first() {
+                kills.retain(|&k| k - k0 <= 2.5);
+                kills.truncate(2);
+            }
+        }
+        Role::Drop | Role::Outro => {}
+    }
     let first = *kills.first()?;
-    let mut src = c.r#in.unwrap_or((first - lead).max(0.0));
+    // In/out points count only when set by hand; otherwise they are the last arrangement's.
+    let manual_in = c.r#in.filter(|_| c.manual);
+    let manual_out = c.out.filter(|_| c.manual);
+    let mut src = manual_in.unwrap_or((first - lead).max(0.0));
     let mut out = t0;
     let mut segs = Vec::new();
     let mut kept = Vec::new();
@@ -319,7 +334,7 @@ fn place(
         return None;
     }
     // Tail: about half a second of source, ending on the next beat that allows it.
-    let tail_end = c.out.unwrap_or((src + 0.6).min(c.duration));
+    let tail_end = manual_out.unwrap_or((src + 0.6).min(c.duration));
     if tail_end > src
         && let Some(b) = beat_for(beats, out, src, tail_end, out).filter(|&b| b <= limit)
     {
@@ -595,6 +610,21 @@ mod tests {
         files.dedup();
         assert_eq!(files.len(), placed.len());
         assert_eq!(placed[0].role, Role::Hook);
+    }
+
+    #[test]
+    fn hooks_and_builds_stay_short() {
+        let a = analysis();
+        let mut p = project();
+        // A hook candidate with kills far apart: only its first kill is used.
+        p.clips[0].kills = vec![2.0, 4.0];
+        let placed = arrange(&p, &a);
+        assert_eq!(placed[0].role, Role::Hook);
+        assert_eq!(placed[0].kills.len(), 1);
+        assert!(placed.iter().filter(|x| x.role == Role::Build).count() >= 1);
+        for x in placed.iter().filter(|x| x.role == Role::Build) {
+            assert!(x.kills.len() <= 2);
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ publish = false
 anyhow = "1.0.104"
 retake-audio = { path = "../retake-audio" }
 retake-core = { path = "../retake-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1.0.145"
 toml_edit = "0.23"
 tauri-winrt-notification = "0.8.1"
