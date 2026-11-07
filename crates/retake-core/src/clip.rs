@@ -71,6 +71,12 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// New pre/post roll (seconds) for presses from now on.
+    pub fn set_rolls(&mut self, pre_roll: u32, post_roll: u32) {
+        self.pre = Ms::from(pre_roll) * 1000;
+        self.post = Ms::from(post_roll) * 1000;
+    }
+
     /// `pre_roll` and `post_roll` from `[clips]` and `buffer_secs` from `[capture]`, in seconds.
     pub fn new(pre_roll: u32, post_roll: u32, buffer_secs: u32) -> Scheduler {
         let ms = |s: u32| Ms::from(s) * 1000;

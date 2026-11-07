@@ -20,6 +20,7 @@ mod grader;
 mod instance;
 mod killfeed;
 mod library;
+mod live;
 mod logging;
 mod media;
 mod montage;
@@ -515,6 +516,7 @@ fn main() -> ExitCode {
         ));
     }
     let session: SessionSlot = Arc::default();
+    let hotkey_count = hotkey_specs(&config).map_or(0, |s| s.len());
 
     // Both strings were validated with the config, so a failure here is a bug.
     let mut specs = Vec::new();
@@ -554,7 +556,7 @@ fn main() -> ExitCode {
     let star_library = library.clone();
     let (press_tx, press_rx) = mpsc::channel();
     let ui_press_tx = press_tx.clone();
-    let cue = config.clips.sound_cue;
+    live::set_from(&config);
     let hotkey_tx = press_tx.clone();
     let hotkey_session = session.clone();
     let on_hotkey = move |i: usize| {
@@ -569,7 +571,7 @@ fn main() -> ExitCode {
                         .into_owned();
                     tracing::info!(clip = %name, "starred");
                     status::event(format!("★ starred  {name}"));
-                    if cue {
+                    if live::sound_cue() {
                         sound::play_saved();
                     }
                 }
@@ -594,7 +596,7 @@ fn main() -> ExitCode {
         let live = saver::current(&hotkey_session).is_some_and(|s| s.live);
         if !live {
             tracing::info!("clip hotkey while not recording");
-        } else if cue {
+        } else if live::sound_cue() {
             sound::play_press();
         }
     };
@@ -645,6 +647,7 @@ fn main() -> ExitCode {
         notify::toast,
     );
     let saved_media = media.clone();
+    let watch_media = media.clone();
     let saved_library = library.clone();
     let saved_ffmpeg = ffmpeg.clone();
     let saved_jobs = jobs.clone();
@@ -781,7 +784,7 @@ fn main() -> ExitCode {
             buffer_secs: capture.buffer_secs,
             on_saved: Box::new(move |p: &Path| {
                 notifier.clip_saved(p.to_path_buf());
-                if cue {
+                if live::sound_cue() {
                     sound::play_saved();
                 }
                 // Manual clips record their game too (grading after the match needs it).
@@ -873,7 +876,7 @@ fn main() -> ExitCode {
                 }
             }
             tray::MediaAction::OpenLite => ui::show(),
-            tray::MediaAction::OpenWindow => {}
+            tray::MediaAction::OpenWindow | tray::MediaAction::Hotkeys(_) => {}
             tray::MediaAction::MontageCancel => montage::cancel(),
             tray::MediaAction::Trim(clip, from, to) => {
                 let (ff, lib, jobs, clips) = (
@@ -927,7 +930,27 @@ fn main() -> ExitCode {
         };
         let watch_notifier = notifier;
         control::start_pipe(control_clips.clone(), notifier);
-        config_watch::start(watch_config.clone(), move || watch_notifier.quit());
+        let (live_media, live_hotkeys) = (watch_media.clone(), hotkey_count);
+        config_watch::start(
+            watch_config.clone(),
+            move || watch_notifier.quit(),
+            move |c, kind| {
+                // Hotkeys keep their order (clip, full, star); adding or removing the star
+                // hotkey changes it, so that needs a restart.
+                let Some(specs) = hotkey_specs(c) else {
+                    return false;
+                };
+                if specs.len() != live_hotkeys {
+                    return false;
+                }
+                live::set_from(c);
+                tray::post(tray::MediaAction::Hotkeys(specs));
+                if kind == config::Reload::Jobs {
+                    live_media.reconfigure(c);
+                }
+                true
+            },
+        );
         match Recorder::start(setup) {
             Ok(r) => {
                 *slot.borrow_mut() = Some(r);
@@ -979,4 +1002,23 @@ fn main() -> ExitCode {
         // Already logged by tray::run, whose exit hook has closed the log.
         Err(e) => error_box(&format!("{e:#}")),
     }
+}
+
+/// The hotkeys to register, in order: clip, whole buffer, star (if set). `None` if one doesn't
+/// parse.
+fn hotkey_specs(c: &Config) -> Option<Vec<tray::HotkeySpec>> {
+    let mut v = Vec::new();
+    for label in [&c.clips.hotkey, &c.clips.hotkey_full] {
+        v.push(tray::HotkeySpec {
+            label: label.clone(),
+            key: retake_core::hotkey::parse(label).ok()?,
+        });
+    }
+    if !c.clips.hotkey_star.is_empty() {
+        v.push(tray::HotkeySpec {
+            label: c.clips.hotkey_star.clone(),
+            key: retake_core::hotkey::parse(&c.clips.hotkey_star).ok()?,
+        });
+    }
+    Some(v)
 }

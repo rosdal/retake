@@ -301,6 +301,93 @@ pub fn load_str(user: &str) -> Result<Config, ConfigError> {
     }
 }
 
+/// How an edited config can be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reload {
+    /// Nothing that matters changed.
+    Nothing,
+    /// Hotkeys, the sound cue, pre/post roll and the auto-clip threshold: at once.
+    Live,
+    /// Also grading, export and motion-blur settings: from the next job.
+    Jobs,
+    /// Anything else (capture, audio, games, folders…): restart after the match.
+    Restart,
+}
+
+/// Settings applied the moment the file is saved.
+const LIVE_KEYS: &[&str] = &[
+    "clips.hotkey",
+    "clips.hotkey_full",
+    "clips.hotkey_star",
+    "clips.sound_cue",
+    "clips.pre_roll",
+    "clips.post_roll",
+    "autoclip.clip",
+];
+/// Sections whose settings apply from the next grading or export job.
+const JOB_SECTIONS: &[&str] = &["grade", "export", "motion_blur"];
+
+fn merged_table(text: &str) -> Option<Table> {
+    let mut merged: Table = DEFAULT_CONFIG_TOML.parse().ok()?;
+    merge(&mut merged, text.parse().ok()?);
+    Some(merged)
+}
+
+fn flatten(prefix: &str, t: &Table, out: &mut Vec<(String, Value)>) {
+    for (k, v) in t {
+        let key = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            Value::Table(sub) => flatten(&key, sub, out),
+            other => out.push((key, other.clone())),
+        }
+    }
+}
+
+/// The dotted keys whose effective value differs between two config files (defaults
+/// filled in), sorted.
+pub fn changed_keys(old: &str, new: &str) -> Vec<String> {
+    let (Some(a), Some(b)) = (merged_table(old), merged_table(new)) else {
+        return vec!["*".into()];
+    };
+    let (mut fa, mut fb) = (Vec::new(), Vec::new());
+    flatten("", &a, &mut fa);
+    flatten("", &b, &mut fb);
+    let mut keys: Vec<String> = fa
+        .iter()
+        .filter(|(k, v)| fb.iter().find(|(k2, _)| k2 == k).map(|(_, v2)| v2) != Some(v))
+        .map(|(k, _)| k.clone())
+        .chain(
+            fb.iter()
+                .filter(|(k, _)| !fa.iter().any(|(k2, _)| k2 == k))
+                .map(|(k, _)| k.clone()),
+        )
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// How the change from `old` to `new` can be applied.
+pub fn reload_kind(old: &str, new: &str) -> Reload {
+    changed_keys(old, new)
+        .iter()
+        .map(|k| {
+            if LIVE_KEYS.contains(&k.as_str()) {
+                Reload::Live
+            } else if JOB_SECTIONS.iter().any(|s| k.starts_with(&format!("{s}."))) {
+                Reload::Jobs
+            } else {
+                Reload::Restart
+            }
+        })
+        .max()
+        .unwrap_or(Reload::Nothing)
+}
+
 /// Allowed capture frame rates.
 pub const ALLOWED_FPS: [u32; 5] = [60, 120, 144, 165, 240];
 
@@ -790,6 +877,89 @@ hotkey = \"Alt+Shift+K\""
         assert_eq!(
             load_str("[capture]\noutput = 2").unwrap().capture.output,
             Auto::Value(2)
+        );
+    }
+
+    #[test]
+    fn changes_are_applied_as_soon_as_they_safely_can() {
+        let base = "[clips]
+pre_roll = 15
+";
+        assert_eq!(reload_kind(base, base), Reload::Nothing);
+        // Writing out a default changes nothing.
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 15
+post_roll = 3
+"
+            ),
+            Reload::Nothing
+        );
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 20
+"
+            ),
+            Reload::Live
+        );
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 15
+hotkey = \"F8\"
+"
+            ),
+            Reload::Live
+        );
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 20
+[grade]
+sharpen = 0.2
+"
+            ),
+            Reload::Jobs
+        );
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 15
+[capture]
+fps = 120
+"
+            ),
+            Reload::Restart
+        );
+        assert_eq!(
+            changed_keys(
+                base,
+                "[clips]
+pre_roll = 20
+[grade]
+sharpen = 0.2
+"
+            ),
+            ["clips.pre_roll", "grade.sharpen"]
+        );
+        // A user game added: restart.
+        assert_eq!(
+            reload_kind(
+                base,
+                "[clips]
+pre_roll = 15
+[games.x]
+exes = [\"x.exe\"]
+"
+            ),
+            Reload::Restart
         );
     }
 

@@ -18,11 +18,12 @@ use crate::grader::Grader;
 pub struct Media {
     queue: Mutex<Queue>,
     file: PathBuf,
-    grader: Grader,
+    /// Grading and export settings; replaced when config.toml changes (from the next job).
+    grader: std::sync::RwLock<Grader>,
     jobs: Submitter,
-    when: ExportWhen,
-    presets: Vec<String>,
-    max_raw_gb: f64,
+    when: Mutex<ExportWhen>,
+    presets: Mutex<Vec<String>>,
+    max_raw_gb: Mutex<f64>,
     /// Exports may run now: always with `after_game`; after "Export pending now" with `manual`.
     exports_allowed: AtomicBool,
     /// A step is queued on the background runner.
@@ -54,11 +55,11 @@ impl Media {
         let m = Arc::new(Media {
             queue: Mutex::new(queue),
             file,
-            grader,
+            grader: std::sync::RwLock::new(grader),
             jobs,
-            when,
-            presets,
-            max_raw_gb,
+            when: Mutex::new(when),
+            presets: Mutex::new(presets),
+            max_raw_gb: Mutex::new(max_raw_gb),
             exports_allowed: AtomicBool::new(when == ExportWhen::AfterGame),
             scheduled: AtomicBool::new(false),
             on_failed: Box::new(on_failed),
@@ -68,6 +69,26 @@ impl Media {
             m.kick();
         }
         m
+    }
+
+    fn grader(&self) -> std::sync::RwLockReadGuard<'_, Grader> {
+        self.grader.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// New grading and export settings (config.toml saved): from the next job on.
+    pub fn reconfigure(&self, c: &retake_core::config::Config) {
+        {
+            let mut g = self.grader.write().unwrap_or_else(|e| e.into_inner());
+            g.grade = c.grade.clone();
+            g.blur = c.motion_blur.clone();
+        }
+        *self.when.lock().unwrap_or_else(|e| e.into_inner()) = c.export.when;
+        *self.presets.lock().unwrap_or_else(|e| e.into_inner()) = c.export.presets.clone();
+        *self.max_raw_gb.lock().unwrap_or_else(|e| e.into_inner()) = c.clips.max_raw_gb;
+        if c.export.when == ExportWhen::AfterGame {
+            self.exports_allowed.store(true, Ordering::Release);
+        }
+        tracing::info!("grading and export settings updated");
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -84,13 +105,18 @@ impl Media {
 
     /// A clip was saved: queue its grade and exports.
     pub fn clip_saved(self: &Arc<Self>, clip: &Path) {
-        let grade = self.grader.grade.mode == GradeMode::On;
-        if !grade && self.presets.is_empty() {
+        let grade = self.grader().grade.mode == GradeMode::On;
+        let presets = self
+            .presets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !grade && presets.is_empty() {
             return;
         }
         {
             let mut q = self.lock();
-            q.add_clip(clip, grade, &self.presets);
+            q.add_clip(clip, grade, &presets);
             self.save(&q);
         }
         self.kick();
@@ -144,7 +170,7 @@ impl Media {
                 b.queued = pending;
                 b.exporting = false;
             });
-            if self.when == ExportWhen::Manual {
+            if *self.when.lock().unwrap_or_else(|e| e.into_inner()) == ExportWhen::Manual {
                 self.exports_allowed.store(false, Ordering::Relaxed);
             }
             return;
@@ -159,7 +185,7 @@ impl Media {
             Err(format!("{} no longer exists", job.clip.display()))
         } else {
             match &job.task {
-                Task::Grade => self.grader.grade(&job.clip).map(|out| {
+                Task::Grade => self.grader().grade(&job.clip).map(|out| {
                     tracing::info!(clip = %job.clip.display(), graded = %out.display(), secs = started.elapsed().as_secs_f32(), "clip graded");
                     crate::status::event(format!(
                         "Graded  {}",
@@ -168,7 +194,7 @@ impl Media {
                     self.enforce_raw_limit();
                 }),
                 Task::Export(p) => match Preset::parse(p.strip_suffix("+blur").unwrap_or(p)) {
-                    Some(preset) => self.grader.export(&job.clip, preset, p.ends_with("+blur")).map(|out| {
+                    Some(preset) => self.grader().export(&job.clip, preset, p.ends_with("+blur")).map(|out| {
                         tracing::info!(clip = %job.clip.display(), export = %out.display(), secs = started.elapsed().as_secs_f32(), "clip exported");
                     }),
                     None => Err(anyhow::anyhow!("unknown preset {p}")),
@@ -202,11 +228,13 @@ impl Media {
     /// With `clips.max_raw_gb` set: delete the oldest raw clips that already have a graded
     /// version until raw clips fit. Never an ungraded clip.
     fn enforce_raw_limit(&self) {
-        if self.max_raw_gb <= 0.0 {
+        let max_raw_gb = *self.max_raw_gb.lock().unwrap_or_else(|e| e.into_inner());
+        if max_raw_gb <= 0.0 {
             return;
         }
-        let raw = self.grader.out_dir.join("raw");
-        let suffix = &self.grader.grade.suffix;
+        let grader = self.grader();
+        let raw = grader.out_dir.join("raw");
+        let suffix = &grader.grade.suffix;
         let Ok(entries) = fs::read_dir(&raw) else {
             return;
         };
@@ -222,14 +250,14 @@ impl Media {
                 is_raw.then_some((modified, meta.len(), p))
             })
             .collect();
-        let limit = (self.max_raw_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let limit = (max_raw_gb * 1024.0 * 1024.0 * 1024.0) as u64;
         let mut total: u64 = clips.iter().map(|c| c.1).sum();
         clips.sort();
         for (_, len, p) in clips {
             if total <= limit {
                 break;
             }
-            let graded = self.grader.source_for_export(&p) != p;
+            let graded = grader.source_for_export(&p) != p;
             if graded && fs::remove_file(&p).is_ok() {
                 tracing::info!(clip = %p.display(), "raw clip removed (clips.max_raw_gb); its graded version stays");
                 total = total.saturating_sub(len);

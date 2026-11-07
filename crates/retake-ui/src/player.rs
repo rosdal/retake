@@ -12,7 +12,7 @@ use iced::widget::image::Handle;
 pub const WIDTH: u32 = 960;
 pub const FPS: u32 = 30;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Frame { at: f64, image: Handle },
     Ended,

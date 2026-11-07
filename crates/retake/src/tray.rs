@@ -55,6 +55,7 @@ const ICON_ID: u32 = 1;
 const TOOLTIP_TIMER: usize = 1;
 
 /// One hotkey to register; `label` is the config text, used in warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeySpec {
     pub label: String,
     pub key: Hotkey,
@@ -235,6 +236,40 @@ pub enum MediaAction {
     MontageCancel,
     /// Open the window (a second start of retake.exe).
     OpenWindow,
+    /// Register these hotkeys instead of the current ones (config.toml saved), same order.
+    Hotkeys(Vec<HotkeySpec>),
+}
+
+/// Swaps the registered hotkeys for `specs` (on the tray thread).
+fn reregister(specs: &[HotkeySpec]) {
+    let hwnd = SHOWN.with(|sh| sh.borrow().as_ref().map(|s| s.hwnd));
+    let Some(hwnd) = hwnd else { return };
+    let mut failed = Vec::new();
+    // SAFETY: our own window; ids are the hotkey indices registered at start.
+    unsafe {
+        for i in 0..8 {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(Some(hwnd), i);
+        }
+        for (i, h) in specs.iter().enumerate() {
+            let mods = HOT_KEY_MODIFIERS(h.key.modifiers) | MOD_NOREPEAT;
+            match RegisterHotKey(Some(hwnd), i as i32, mods, h.key.vk) {
+                Ok(()) => tracing::info!(hotkey = %h.label, "hotkey registered"),
+                Err(e) => {
+                    tracing::warn!(hotkey = %h.label, "RegisterHotKey failed: {e}");
+                    failed.push(h.label.as_str());
+                }
+            }
+        }
+    }
+    let problem = hotkey_problem(&failed);
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.problem = problem;
+        }
+    });
+    if let Some(s) = LAST_STATUS.get() {
+        set_status(s);
+    }
 }
 
 static NOTIFIER: Mutex<Option<TrayNotifier>> = Mutex::new(None);
@@ -566,10 +601,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let queued: Vec<MediaAction> =
                 std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
             for a in queued {
-                if a == MediaAction::OpenWindow {
-                    open_window();
-                } else {
-                    dispatch(a);
+                match a {
+                    MediaAction::OpenWindow => open_window(),
+                    MediaAction::Hotkeys(specs) => reregister(&specs),
+                    other => dispatch(other),
                 }
             }
             LRESULT(0)
@@ -774,6 +809,12 @@ fn run_loop(hotkeys: &[HotkeySpec], on_ready: impl FnOnce(TrayNotifier)) -> Resu
     // SAFETY: standard message loop on the thread that owns the window.
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // The plain window: Tab moves between controls, Esc closes it.
+            if let Some(w) = crate::ui::window()
+                && windows::Win32::UI::WindowsAndMessaging::IsDialogMessageW(w, &msg).as_bool()
+            {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

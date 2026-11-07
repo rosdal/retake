@@ -237,6 +237,15 @@ fn set_text(h: HWND, s: &str) {
 }
 
 /// Shows the window (creating it the first time) and brings it to the front.
+/// The plain window, once created (for dialog-style keyboard handling in the tray loop).
+pub fn window() -> Option<HWND> {
+    UI.with(|u| {
+        u.try_borrow()
+            .ok()
+            .and_then(|u| u.as_ref().map(|ui| ui.hwnd))
+    })
+}
+
 pub fn show() {
     let exists = UI.with(|u| u.borrow().is_some());
     if !exists {
@@ -1585,6 +1594,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         fill_project_clips(ui, None);
                     }
                 });
+            }
+            LRESULT(0)
+        }
+        // Esc (IDCANCEL from the dialog manager) closes the window like the X does.
+        WM_COMMAND if (wparam.0 & 0xFFFF) == 2 => {
+            // SAFETY: our own window.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = KillTimer(Some(hwnd), TIMER);
             }
             LRESULT(0)
         }

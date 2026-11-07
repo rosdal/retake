@@ -183,7 +183,7 @@ pub fn run(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
 
 fn analyse(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
     use retake_core::games::Method;
-    if s.min_play == MinPlay::Off {
+    if crate::live::get().map_or(s.min_play, |l| l.min_play) == MinPlay::Off {
         return Ok(Vec::new());
     }
     let Some(game) = s.rules.game_by_id(&info.game) else {
@@ -280,7 +280,11 @@ fn analyse_events(
             s,
             &job,
             &rec,
-            round_clips(&kills, 5, s.min_play),
+            round_clips(
+                &kills,
+                5,
+                crate::live::get().map_or(s.min_play, |l| l.min_play),
+            ),
             &extra,
         ));
     }
@@ -323,7 +327,7 @@ fn analyse_feed(
             s,
             &job,
             &rec,
-            round_clips(&g, 5, s.min_play),
+            round_clips(&g, 5, crate::live::get().map_or(s.min_play, |l| l.min_play)),
             &extra,
         ));
     }
@@ -425,7 +429,11 @@ fn analyse_siege(s: &Setup, info: &SessionInfo) -> Result<Vec<PathBuf>> {
                     "some of your kills couldn't be found in the recording"
                 );
             }
-            for clip in round_clips(&mine, round.enemies, s.min_play) {
+            for clip in round_clips(
+                &mine,
+                round.enemies,
+                crate::live::get().map_or(s.min_play, |l| l.min_play),
+            ) {
                 let rec = Recording {
                     info,
                     video: &video,

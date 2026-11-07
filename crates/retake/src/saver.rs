@@ -429,6 +429,10 @@ fn run(s: SaverSetup, rx: Receiver<SaverMsg>, stop: &AtomicBool) {
     let mux = |v: &Path, a: &Path, out: &Path| run_mux(&s.ffmpeg, &s.job, v, a, out);
     loop {
         let (presses, shutdown) = take_messages(&rx, Duration::from_millis(100));
+        // Pre/post roll can change while Retake runs (config saved).
+        if let Some(l) = crate::live::get() {
+            sched.set_rolls(l.pre_roll, l.post_roll);
+        }
         if shutdown || stop.load(Ordering::Relaxed) {
             break;
         }

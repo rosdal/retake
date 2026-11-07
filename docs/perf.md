@@ -110,3 +110,14 @@ RX 7900 XTX (driver 32.0.32015.7029), Ryzen 7 7800X3D, 32 GB DDR5-6000, Windows 
 | hevc-balanced | 13.6 | 0.5 | 63.9 | 145.2 | 0.5 | 0.0 | 143.1 | 64.4 |
 
 Earlier the same night, with audio inside the recording ffmpeg, the FPS deltas were the same (−0.4/−0.5%) but ffmpeg only captured ~70 fps (the audio stalled it). Before that, with Discord's overlay on the game, Retake cost 55–80%; see the stand-in route above.
+
+## Grading speed
+
+Target (roadmap v0.7): grading a 20 s 1440p120 clip takes under ~15 s including analysis.
+
+| Date | Clip | Time | Notes |
+|---|---|---|---|
+| 2026-11-07 | 20.0 s, 2560×1440, 120 fps, HEVC (recorded with Retake's AMF settings) | **14.0 s** | `retake grade`: keyframe analysis, 33³ LUT in 16-bit planar RGB, CAS on luma, HEVC Main10 QP 14. Passes |
+| 2026-11-07 | 20.5 s, 1920×1080, 60 fps | 3.7 s | decode 1.1 s, LUT pass 2.3 s, encode overlaps |
+
+A 240 fps clip has twice the frames and takes about twice as long; grading runs only after the game closes, so it never costs FPS.
