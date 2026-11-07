@@ -67,7 +67,8 @@ impl ClipDirs {
     }
 
     /// Creates both folders and removes what an earlier run left behind: its work folders in
-    /// `tmp/` (named by job number) and half-written `.mkv.part` files in `raw/`. Nothing else
+    /// `tmp/` (named by job number) and half-written `.mkv.part` and `.grading.mkv` files in
+    /// `raw/`. Nothing else
     /// is touched, since `out_dir` may be a folder the user also keeps other files in. A leftover
     /// that can't be removed (a file held open) is logged, not fatal.
     pub fn prepare(&self) -> io::Result<()> {
@@ -87,9 +88,9 @@ impl ClipDirs {
                 fs::read_dir(&self.raw)?
                     .flatten()
                     .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.ends_with(".mkv.part"))
+                        e.file_name().to_str().is_some_and(|n| {
+                            n.ends_with(".mkv.part") || n.ends_with(".grading.mkv")
+                        })
                     })
                     .map(|e| (e.path(), false)),
             );

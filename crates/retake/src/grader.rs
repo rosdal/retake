@@ -3,10 +3,9 @@
 //! `clips/tmp/` first and only renamed into place once ffprobe has checked it.
 
 use std::fs;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::child::ChildJob;
 use anyhow::{Context, Result, bail};
 use retake_core::autoconf::Encoder;
 use retake_core::config::{BUILTIN_LOOK, Grade, GradeOutput, MotionBlur};
@@ -14,7 +13,6 @@ use retake_core::export::{ExportSetup, Preset, Weighting, export_args, export_na
 use retake_core::grade::{
     Cube, Histogram, Params, SIEGE_HUD, Stats, builtin_look, compose, correction,
 };
-use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW};
 
 /// Analysis frames are keyframes, scaled to 640 px wide.
 const ANALYSIS_WIDTH: u32 = 640;
@@ -44,14 +42,15 @@ fn ffprobe(ffmpeg: &Path) -> PathBuf {
     ffmpeg.with_file_name("ffprobe.exe")
 }
 
+/// The job grading and export tools run in: they die with Retake, like the recorder's ffmpeg.
+fn job() -> &'static ChildJob {
+    static JOB: std::sync::OnceLock<ChildJob> = std::sync::OnceLock::new();
+    JOB.get_or_init(|| ChildJob::new().expect("creating the grading job object"))
+}
+
 /// Runs a tool to completion at below-normal priority with no window; fails on a non-zero exit.
 fn run(exe: &Path, args: &[String]) -> Result<Vec<u8>> {
-    let out = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW.0 | BELOW_NORMAL_PRIORITY_CLASS.0)
-        .output()
-        .with_context(|| format!("running {}", exe.display()))?;
+    let out = job().run_output(exe, args)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let last: Vec<&str> = err.lines().rev().take(3).collect();
