@@ -1,5 +1,6 @@
 //! Pure, platform-independent logic for Retake. No Windows APIs here.
 pub mod audio;
+pub mod autoclip;
 pub mod autoconf;
 pub mod buffer;
 pub mod clip;
@@ -15,6 +16,7 @@ pub mod hotkey;
 pub mod progress;
 pub mod queue;
 pub mod quiet;
+pub mod replay;
 pub mod segments;
 pub mod siege_settings;
 pub mod sync;
