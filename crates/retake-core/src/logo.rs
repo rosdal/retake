@@ -68,7 +68,13 @@ pub fn rgba(size: u32, dot: [u8; 3], background: bool) -> Vec<u8> {
                 }
             }
             let a = alpha / (SS * SS) as f32;
-            let px_col = |k: usize| if alpha > 0.0 { (acc[k] / alpha) as u8 } else { 0 };
+            let px_col = |k: usize| {
+                if alpha > 0.0 {
+                    (acc[k] / alpha) as u8
+                } else {
+                    0
+                }
+            };
             out.extend_from_slice(&[px_col(0), px_col(1), px_col(2), (a * 255.0).round() as u8]);
         }
     }

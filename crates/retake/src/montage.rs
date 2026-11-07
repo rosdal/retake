@@ -151,13 +151,7 @@ pub fn render(
     let mut a = analysis(ffmpeg, dir, &p)?;
     if let Some(bpm) = p.bpm {
         // A BPM override re-spaces the beats from the first detected one.
-        let first = a.beats.first().copied().unwrap_or(0.0);
-        let period = 60.0 / bpm;
-        let n = ((a.duration - first) / period) as usize;
-        a.beats = (0..n).map(|i| first + i as f64 * period).collect();
-        a.bars = (0..a.beats.len()).step_by(4).collect();
-        a.bpm = bpm;
-        a.drop_bar = a.drop_bar.min(a.bars.len().saturating_sub(1));
+        a = a.respaced(bpm);
     }
     let placed = arrange(&p, &a);
     if placed.is_empty() {

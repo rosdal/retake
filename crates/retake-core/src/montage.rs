@@ -189,6 +189,15 @@ impl Project {
     /// Takes a fresh candidate list but keeps everything set by hand: manual clips keep their
     /// place, role and in/out; clips the user excluded stay excluded; new candidates are added
     /// at the end.
+    /// Adds one clip by hand (from the window's "Add to montage"), at the end.
+    pub fn add_clip(&mut self, c: &LibClip) {
+        if !self.clips.iter().any(|p| p.file == c.path) {
+            let mut pc = proj_clip(c);
+            pc.manual = true;
+            self.clips.push(pc);
+        }
+    }
+
     pub fn merge_candidates(&mut self, fresh: &[LibClip]) {
         for c in fresh {
             if !self.clips.iter().any(|p| p.file == c.path) {

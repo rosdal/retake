@@ -23,6 +23,20 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// The analysis with beats re-spaced at `bpm` from the first detected beat (a BPM override
+    /// for a wrong detection).
+    pub fn respaced(&self, bpm: f64) -> Analysis {
+        let mut a = self.clone();
+        let first = a.beats.first().copied().unwrap_or(0.0);
+        let period = 60.0 / bpm.max(1.0);
+        let n = ((a.duration - first) / period).max(0.0) as usize;
+        a.beats = (0..n).map(|i| first + i as f64 * period).collect();
+        a.bars = (0..a.beats.len()).step_by(4).collect();
+        a.bpm = bpm;
+        a.drop_bar = a.drop_bar.min(a.bars.len().saturating_sub(1));
+        a
+    }
+
     /// Time of the drop (its bar's first beat).
     pub fn drop_time(&self) -> f64 {
         self.bars

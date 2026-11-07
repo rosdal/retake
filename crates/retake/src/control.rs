@@ -174,6 +174,7 @@ pub fn action_of(c: Command, clips: &Path) -> Option<MediaAction> {
         Command::SaveFull => MediaAction::SaveFull,
         Command::Export { clip, preset } => MediaAction::Export(clip, preset),
         Command::Regrade { clip } => MediaAction::Regrade(clip),
+        Command::Trim { clip, from, to } => MediaAction::Trim(clip, from, to),
         Command::Star { clip, on } => MediaAction::Star(clip, on),
         Command::Delete { clip } => MediaAction::Delete(clip),
         Command::Rescan => MediaAction::Montage(Job::Rescan),

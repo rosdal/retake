@@ -5,6 +5,14 @@ targets = ["x86_64-pc-windows-msvc"]
 [advisories]
 version = 2
 yanked = "deny"
+# "Unmaintained" notices (no known vulnerability) for crates the window (retake-ui) gets
+# through iced 0.13. They only ever handle Retake's own bundled fonts and macros at build
+# time; revisit when moving to a newer iced.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste: build-time macro crate via iced, unmaintained only" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser via iced's text stack: parses only Retake's bundled fonts" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz via iced's text stack: shapes only Retake's own UI text" },
+]
 
 [licenses]
 version = 2

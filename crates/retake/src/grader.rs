@@ -308,7 +308,9 @@ impl Grader {
     }
 
     /// Exports `clip` with `preset` into `clips/graded/`.
-    pub fn export(&self, clip: &Path, preset: Preset) -> Result<PathBuf> {
+    /// `force_blur` adds motion blur even when the config doesn't ask for it ("Export with
+    /// blur" in the window).
+    pub fn export(&self, clip: &Path, preset: Preset, force_blur: bool) -> Result<PathBuf> {
         let src = self.source_for_export(clip);
         let p = probe(&self.ffmpeg, &src)?;
         let stem = clip
@@ -321,7 +323,7 @@ impl Grader {
         let out = dir.join(export_name(&stem, preset));
         let part = out.with_extension(format!("part.{}", preset.ext()));
         let b = &self.blur;
-        let blur = (b.enabled && b.apply_to.iter().any(|x| x == preset.name()))
+        let blur = (force_blur || b.enabled && b.apply_to.iter().any(|x| x == preset.name()))
             .then(|| Weighting::parse(&b.weighting).map(|w| (b.output_fps, b.amount, w)))
             .flatten();
         let setup = ExportSetup {

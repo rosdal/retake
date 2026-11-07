@@ -27,6 +27,12 @@ pub enum Command {
     Regrade {
         clip: PathBuf,
     },
+    /// Keep `from..to` seconds as a new clip.
+    Trim {
+        clip: PathBuf,
+        from: f64,
+        to: f64,
+    },
     Star {
         clip: PathBuf,
         on: bool,
@@ -78,6 +84,7 @@ impl Command {
         match self {
             Command::Export { clip, .. }
             | Command::Regrade { clip }
+            | Command::Trim { clip, .. }
             | Command::Star { clip, .. }
             | Command::Delete { clip } => inside(clip),
             Command::MontageRender { dir, .. } => inside(dir),

@@ -10,7 +10,19 @@ name = "retake-ui"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "=0.13.1", default-features = false, features = ["tiny-skia", "image", "canvas", "advanced"] }
+# CPU rendering (tiny-skia): no GPU work and a small footprint while the window is open.
+iced = { version = "=0.13.1", default-features = false, features = ["tiny-skia", "image", "canvas", "tokio", "advanced", "lazy"] }
+image = { version = "0.24", default-features = false, features = ["jpeg"] }
+retake-core = { path = "../retake-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.145"
+toml_edit = "0.23"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_Security", "Win32_System_Time"] }
+
+[build-dependencies]
+embed-resource = "3"
+retake-core = { path = "../retake-core" }
 
 [lints]
 workspace = true

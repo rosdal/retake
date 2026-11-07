@@ -36,6 +36,7 @@ mod sync_check;
 mod sysinfo;
 mod thumbs;
 mod tray;
+mod trim;
 mod ui;
 mod window;
 
@@ -220,7 +221,7 @@ fn grade_main(words: &[String]) -> ExitCode {
             }
             for &p in &presets {
                 let t = std::time::Instant::now();
-                let out = g.export(clip, p)?;
+                let out = g.export(clip, p, false)?;
                 println!(
                     "exported {} -> {} in {:.1} s",
                     p.name(),
@@ -247,6 +248,43 @@ fn main() -> ExitCode {
     }
     if words.first().is_some_and(|w| w == "grade") {
         return grade_main(&words[1..]);
+    }
+    if words.first().is_some_and(|w| w == "thumbs") {
+        // `retake.exe thumbs`: makes the window's thumbnails for every clip now.
+        attach_console();
+        let r = (|| -> Result<usize> {
+            let exe = std::env::current_exe()?;
+            let dir = exe.parent().unwrap_or(Path::new("."));
+            let pick_root = || drive::fixed_drives().first().map(|d| d.root.clone());
+            let config = config::load_file(&dir.join("config.toml"), &pick_root)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ff = ffmpeg::locate(dir)?;
+            let clips = &config.clips.out_dir;
+            let mut n = 0;
+            for e in std::fs::read_dir(clips.join("raw"))?.flatten() {
+                let p = e.path();
+                let stem = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                if p.extension().is_some_and(|x| x == "mkv") && !stem.ends_with("_graded") {
+                    thumbs::make(&ff, clips, &p)?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })();
+        return match r {
+            Ok(n) => {
+                println!("thumbnails for {n} clips");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("thumbs: {e:#}");
+                ExitCode::from(1)
+            }
+        };
     }
     if words.first().is_some_and(|w| w == "montage") {
         attach_console();
@@ -762,6 +800,7 @@ fn main() -> ExitCode {
             config.clips.out_dir.clone(),
             montage::looks_of(&config),
         );
+        let trim_jobs = jobs.clone();
         tray::set_media_handler(move |a| match a {
             tray::MediaAction::ExportNow => media.export_now(),
             tray::MediaAction::Regrade(p) => media.regrade(&p),
@@ -811,6 +850,27 @@ fn main() -> ExitCode {
                 }
             }
             tray::MediaAction::OpenLite => ui::show(),
+            tray::MediaAction::Trim(clip, from, to) => {
+                let (ff, lib, jobs, clips) = (
+                    montage_ffmpeg.clone(),
+                    montage_library.clone(),
+                    trim_jobs.clone(),
+                    montage_clips.clone(),
+                );
+                std::thread::spawn(move || match trim::trim(&ff, &clip, from, to) {
+                    Ok(out) => {
+                        if let Some(l) = &lib {
+                            let _ = l.add(&ff, &out);
+                        }
+                        thumbs::queue(&jobs, &ff, &clips, &out);
+                        status::event(format!(
+                            "Trimmed  {}",
+                            out.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                    Err(e) => notify::toast(&format!("Couldn't trim the clip: {e:#}")),
+                });
+            }
             tray::MediaAction::CopyDiagnostics => match diagnostics::copy(&diag_config) {
                 Ok(()) => notify::toast("Diagnostics copied to the clipboard."),
                 Err(e) => notify::toast(&format!("Couldn't copy diagnostics: {e:#}")),

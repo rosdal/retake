@@ -229,6 +229,8 @@ pub enum MediaAction {
     Delete(PathBuf),
     /// Open the plain window.
     OpenLite,
+    /// Keep a range of a clip as a new clip.
+    Trim(PathBuf, f64, f64),
 }
 
 /// Opens the styled window, or the plain one if it isn't installed.
@@ -794,7 +796,11 @@ mod tests {
         let p = hotkey_problem(&["F9"]).unwrap();
         assert_eq!(p, "Hotkey F9 unavailable — another app may be using it");
         let (rgb, tip) = look(TrayStatus::Recording, Some(&p));
-        assert_eq!(rgb, retake_core::logo::ACCENT, "recording must stay visible");
+        assert_eq!(
+            rgb,
+            retake_core::logo::ACCENT,
+            "recording must stay visible"
+        );
         assert_eq!(tip, format!("Retake — recording\n{p}"));
         let (rgb, tip) = look(TrayStatus::Idle, Some(&p));
         assert_eq!(rgb, retake_core::logo::WARNING, "idle shows the warning");

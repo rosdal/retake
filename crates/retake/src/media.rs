@@ -167,8 +167,8 @@ impl Media {
                     ));
                     self.enforce_raw_limit();
                 }),
-                Task::Export(p) => match Preset::parse(p) {
-                    Some(preset) => self.grader.export(&job.clip, preset).map(|out| {
+                Task::Export(p) => match Preset::parse(p.strip_suffix("+blur").unwrap_or(p)) {
+                    Some(preset) => self.grader.export(&job.clip, preset, p.ends_with("+blur")).map(|out| {
                         tracing::info!(clip = %job.clip.display(), export = %out.display(), secs = started.elapsed().as_secs_f32(), "clip exported");
                     }),
                     None => Err(anyhow::anyhow!("unknown preset {p}")),
