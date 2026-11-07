@@ -26,6 +26,8 @@ pub struct Grader {
     pub blur: MotionBlur,
     /// `clips/` (holds `raw/`, `tmp/`, `graded/`).
     pub out_dir: PathBuf,
+    /// Game profiles: a clip's HUD rectangles and vertical crop come from its game.
+    pub rules: retake_core::games::Rules,
 }
 
 /// Facts about a clip from ffprobe.
@@ -117,6 +119,32 @@ pub fn probe(ffmpeg: &Path, clip: &Path) -> Result<Probe> {
 }
 
 impl Grader {
+    /// The clip's game, from its sidecar.
+    fn game(&self, clip: &Path) -> Option<retake_core::games::Game> {
+        let id = crate::library::game_of(clip)?;
+        self.rules.game_by_id(&id)
+    }
+
+    /// The HUD rectangles left out of a clip's measurements: its game's (`[games.<id>] hud`),
+    /// Siege's built-in ones for Siege (and clips from before games were recorded), else none.
+    fn hud(&self, clip: &Path) -> Vec<retake_core::grade::Rect> {
+        let game = self.game(clip);
+        match game {
+            Some(g) if !g.hud.is_empty() => g
+                .hud
+                .iter()
+                .map(|r| retake_core::grade::Rect {
+                    x: r.0 as f32,
+                    y: r.1 as f32,
+                    w: r.2 as f32,
+                    h: r.3 as f32,
+                })
+                .collect(),
+            Some(g) if g.id != "siege" => Vec::new(),
+            _ => SIEGE_HUD.to_vec(),
+        }
+    }
+
     fn params(&self) -> Params {
         let g = &self.grade;
         Params {
@@ -169,7 +197,8 @@ impl Grader {
         ];
         let raw = run(&self.ffmpeg, &args)?;
         let frame = (w * h * 3) as usize;
-        let mask: &[_] = if self.grade.hud_mask { &SIEGE_HUD } else { &[] };
+        let hud = self.hud(clip);
+        let mask: &[_] = if self.grade.hud_mask { &hud } else { &[] };
         let mut hist = Histogram::default();
         for f in raw.chunks_exact(frame) {
             hist.add_rgb24(f, w as usize, h as usize, mask);
@@ -198,11 +227,8 @@ impl Grader {
         fs::write(&cube, lut.write(&stem)).context("writing the clip LUT")?;
         // Next to the clip, so publishing is a rename on the same drive (atomic).
         let work = clip.with_file_name(format!("{stem}.grading.mkv"));
-        let protect: &[_] = if self.grade.hud_protect {
-            &SIEGE_HUD
-        } else {
-            &[]
-        };
+        let hud = self.hud(clip);
+        let protect: &[_] = if self.grade.hud_protect { &hud } else { &[] };
         let args = grade_args(
             clip,
             &cube,
@@ -304,6 +330,7 @@ impl Grader {
             audio_tracks: p.audio_tracks,
             blur,
             sharpen: self.grade.sharpen,
+            crop_center: self.game(clip).map_or(0.5, |g| g.crop_center),
         };
         let args = export_args(preset, &src, &setup, &part);
         if let Err(e) = run(&self.ffmpeg, &args) {

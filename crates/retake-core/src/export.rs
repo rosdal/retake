@@ -295,6 +295,18 @@ pub struct ExportSetup {
     /// Motion blur, if enabled for this preset: (output fps, amount, weighting).
     pub blur: Option<(u32, f64, Weighting)>,
     pub sharpen: f32,
+    /// Centre of the 9:16 crop as a fraction of the width (0.5 = middle).
+    pub crop_center: f64,
+}
+
+/// The 9:16 crop of a wider frame around `center` (a fraction of the width).
+pub fn vertical_crop(center: f64) -> String {
+    if (center - 0.5).abs() < 1e-6 {
+        "crop=ih*9/16:ih".to_owned()
+    } else {
+        // x keeps the crop inside the frame wherever the centre is.
+        format!("crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*{center:.4}-ih*9/32))':0")
+    }
 }
 
 /// The export command line for `preset` from `input` (usually the graded clip).
@@ -351,7 +363,9 @@ pub fn export_args(preset: Preset, input: &Path, x: &ExportSetup, output: &Path)
                 None => v.push_str("fps=60"),
             }
             if preset == Preset::Vertical {
-                v.push_str(",crop=ih*9/16:ih,scale=1080:1920:flags=lanczos");
+                v.push(',');
+                v.push_str(&vertical_crop(x.crop_center));
+                v.push_str(",scale=1080:1920:flags=lanczos");
             } else {
                 v.push_str(",scale=-2:1080:flags=lanczos");
             }
@@ -439,6 +453,7 @@ mod tests {
             audio_tracks: 2,
             blur: None,
             sharpen: 0.35,
+            crop_center: 0.5,
         }
     }
 
@@ -475,6 +490,15 @@ mod tests {
         );
         assert!(a8.windows(2).any(|w| w == ["-profile:v", "main"]));
         assert!(!a8.iter().any(|x| x.contains("cas=")));
+    }
+
+    #[test]
+    fn off_centre_vertical_crops_stay_in_the_frame() {
+        assert_eq!(vertical_crop(0.5), "crop=ih*9/16:ih");
+        assert_eq!(
+            vertical_crop(0.3),
+            "crop=ih*9/16:ih:'max(0,min(iw-ih*9/16,iw*0.3000-ih*9/32))':0"
+        );
     }
 
     #[test]

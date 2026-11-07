@@ -203,6 +203,7 @@ fn grade_main(words: &[String]) -> ExitCode {
             grade: config.grade.clone(),
             blur: config.motion_blur.clone(),
             out_dir: config.clips.out_dir.clone(),
+            rules: retake_core::games::Rules::from_config(&config),
         };
         for clip in &clips {
             let t = std::time::Instant::now();
@@ -567,6 +568,7 @@ fn main() -> ExitCode {
         grade: config.grade.clone(),
         blur: config.motion_blur.clone(),
         out_dir: config.clips.out_dir.clone(),
+        rules: retake_core::games::Rules::from_config(&config),
     };
     if let Err(e) = grader.look() {
         return fatal(&format!("grade.look: {e:#}"));
@@ -706,6 +708,13 @@ fn main() -> ExitCode {
                 notifier.clip_saved(p.to_path_buf());
                 if cue {
                     sound::play_saved();
+                }
+                // Manual clips record their game too (grading after the match needs it).
+                let side = p.with_extension("json");
+                if !side.exists()
+                    && let Some(g) = current_game::get()
+                {
+                    let _ = std::fs::write(&side, serde_json::json!({ "game": g.id }).to_string());
                 }
                 saved_media.clip_saved(p);
                 if let Some(lib) = &saved_library {

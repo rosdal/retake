@@ -52,7 +52,7 @@ fn kills_for(clip: &Path, duration: f64) -> Vec<f64> {
 }
 
 /// The game recorded in a clip's sidecar (`"game"` at the top or under `autoclip`).
-fn game_of(clip: &Path) -> Option<String> {
+pub fn game_of(clip: &Path) -> Option<String> {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(clip.with_extension("json")).ok()?).ok()?;
     v.get("game")
