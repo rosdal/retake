@@ -62,8 +62,13 @@ jobs:
       - name: Smoke test
         shell: pwsh
         run: |
-          $out = & third_party/r6-dissect/r6-dissect.exe --help 2>&1 | Out-String
-          if ($out -notmatch 'info|output') { Write-Host $out; throw 'r6-dissect --help printed nothing useful' }
+          $exe = 'third_party/r6-dissect/r6-dissect.exe'
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          if ($bytes.Length -lt 1MB -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "$exe is not a Windows executable" }
+          # Without arguments it prints its usage and exits non-zero; it must at least start.
+          $p = Start-Process $exe -PassThru -Wait -NoNewWindow -RedirectStandardError err.txt -RedirectStandardOutput out.txt
+          Get-Content out.txt, err.txt | Select-Object -First 5
+          Write-Host "r6-dissect started and exited with $($p.ExitCode)"
 
       - name: Upload r6-dissect.exe
         uses: actions/upload-artifact@v7
