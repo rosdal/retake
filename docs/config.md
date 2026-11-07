@@ -24,6 +24,8 @@ Per-game changes. `<id>` is a built-in game (`siege`, `cs2`, `valorant`, `lol`, 
 | `feed` | `[x, y, w, h]` | Kill-feed region as fractions of the frame |
 | `hud` | list of `[x, y, w, h]` | HUD areas left out of grading measurements |
 | `crop_center` | 0–1 | Centre of the 9:16 crop (ultrawide, off-centre HUDs) |
+| `fps` | 60, 120, 144, 165, 240 | Capture frame rate for this game (instead of `[capture] fps`) |
+| `preset` | `"speed"`, `"balanced"`, `"quality"` | Encoder preset for this game |
 
 How automatic clips find kills, per game: Siege reads its Match Replays after the match; CS2 uses Valve's Game State Integration (Retake writes `gamestate_integration_retake.cfg` into CS2's cfg folder while CS2 is closed); League uses Riot's Live Client Data API; other kill-feed games scan the kill feed in Retake's own recording after the match.
 

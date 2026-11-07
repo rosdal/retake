@@ -20,6 +20,8 @@ any_fullscreen = false
 # feed     = [0.70, 0.04, 0.29, 0.22]   # kill-feed region as fractions [x, y, w, h]
 # hud      = [[0.0, 0.0, 0.25, 0.08]]   # HUD areas left out of grading statistics
 # crop_center = 0.5          # centre of the 9:16 crop (ultrawide / off-centre HUDs)
+# fps      = 120             # this game's capture frame rate
+# preset   = "balanced"      # this game's encoder preset
 
 [capture]
 # Monitor index for ddagrab, or "auto": the monitor Siege's window is on

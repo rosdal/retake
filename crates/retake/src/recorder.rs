@@ -578,14 +578,20 @@ impl Loop {
             Err(e) => tracing::warn!("listing monitors: {e:#}"),
         }
         let cap = &self.s.capture;
+        // A game's own capture settings ([games.<id>] fps / preset) win over the global ones.
+        let game = crate::current_game::get();
+        let game_fps = game
+            .as_ref()
+            .and_then(|g| g.fps)
+            .map_or(cap.fps, Auto::Value);
         // Only "auto" follows the game, so only then are its windows looked up.
         let gm = (cap.output == Auto::Auto)
             .then(|| game_monitor(&self.game_pids))
             .flatten();
         let MonitorChoice { output, fps, check } =
-            pick_monitor(cap.output, cap.fps, &self.outputs, gm).unwrap_or(MonitorChoice {
+            pick_monitor(cap.output, game_fps, &self.outputs, gm).unwrap_or(MonitorChoice {
                 output: 0,
-                fps: pick_fps(cap.fps, 0),
+                fps: pick_fps(game_fps, 0),
                 check: Err("no monitors found on the primary GPU".into()),
             });
         // CPU encoding is for testing: at most 60 fps, and always a warning.
@@ -621,7 +627,7 @@ impl Loop {
             fps,
             encoder: self.s.encoder,
             codec: cap.codec,
-            preset: cap.preset,
+            preset: game.as_ref().and_then(|g| g.preset).unwrap_or(cap.preset),
             qp_i: cap.qp_i,
             qp_p: cap.qp_p,
             buffer_dir: cap.buffer_dir.clone(),

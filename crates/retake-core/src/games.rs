@@ -261,6 +261,10 @@ pub struct Override {
     pub hud: Vec<[f64; 4]>,
     /// The 9:16 crop's centre as a fraction of the width (ultrawide, off-centre HUDs).
     pub crop_center: Option<f64>,
+    /// Capture frame rate for this game (60, 120, 144, 165 or 240).
+    pub fps: Option<u32>,
+    /// Encoder preset for this game.
+    pub preset: Option<crate::config::Preset>,
 }
 
 /// A detected game with the user's overrides applied.
@@ -276,6 +280,8 @@ pub struct Game {
     pub look: Option<String>,
     pub hud: Vec<Rect>,
     pub crop_center: f64,
+    pub fps: Option<u32>,
+    pub preset: Option<crate::config::Preset>,
 }
 
 fn rect(r: [f64; 4]) -> Rect {
@@ -305,6 +311,8 @@ pub fn resolve(p: &Profile, id: &str, o: Option<&Override>, global_strict: bool)
         look: o.look,
         hud: o.hud.into_iter().map(rect).collect(),
         crop_center: o.crop_center.unwrap_or(0.5).clamp(0.0, 1.0),
+        fps: o.fps.filter(|f| crate::config::ALLOWED_FPS.contains(f)),
+        preset: o.preset,
     }
 }
 
@@ -637,6 +645,38 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("League of Legends") && w[0].contains("Vanguard"));
         assert!(r.knows("cs2.exe") && !r.knows("notepad.exe"));
+    }
+
+    #[test]
+    fn per_game_capture_settings() {
+        let mut o = none();
+        o.insert(
+            "cs2".into(),
+            Override {
+                fps: Some(240),
+                preset: Some(crate::config::Preset::Quality),
+                ..Default::default()
+            },
+        );
+        let g = detect(["cs2.exe"], true, &[], &o, false).unwrap();
+        assert_eq!(
+            (g.fps, g.preset),
+            (Some(240), Some(crate::config::Preset::Quality))
+        );
+        o.get_mut("cs2").unwrap().fps = Some(97);
+        assert_eq!(
+            detect(["cs2.exe"], true, &[], &o, false).unwrap().fps,
+            None,
+            "not an allowed rate"
+        );
+        let c = crate::config::load_str(
+            "[games.cs2]
+fps = 120
+preset = \"balanced\"
+",
+        )
+        .unwrap();
+        assert_eq!(c.games["cs2"].fps, Some(120));
     }
 
     #[test]
